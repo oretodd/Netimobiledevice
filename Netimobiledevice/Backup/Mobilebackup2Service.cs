@@ -431,17 +431,19 @@ public sealed class Mobilebackup2Service(LockdownServiceProvider lockdown, ILogg
             finally {
                 // Send CancelBackup to cleanly terminate the backup session on the device side.
                 // On successful completion the device has already closed its end of the connection,
-                // so the write will throw SocketError 10053 (WSAECONNABORTED). Swallow that here —
-                // the backup itself succeeded and propagating this exception would incorrectly mark
-                // it as failed.
+                // so the write may throw SocketError 10053 (WSAECONNABORTED) or hang indefinitely
+                // on a half-closed SSL socket. Use a 5-second timeout to prevent hanging forever.
                 try {
+                    using var cancelBackupCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+                    cancelBackupCts.CancelAfter(TimeSpan.FromSeconds(5));
                     DictionaryNode message = new DictionaryNode() {
                         { "MessageName", new StringNode("CancelBackup") },
                         { "TargetIdentifier", new StringNode(Lockdown.Udid) }
                     };
-                    await dl.SendProcessMessage(message, cancellationToken).ConfigureAwait(false);
+                    await dl.SendProcessMessage(message, cancelBackupCts.Token).ConfigureAwait(false);
                 }
                 catch (IOException) { }
+                catch (OperationCanceledException) { }
             }
         }
         finally {
