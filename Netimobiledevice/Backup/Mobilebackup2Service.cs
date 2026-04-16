@@ -362,7 +362,8 @@ public sealed class Mobilebackup2Service(LockdownServiceProvider lockdown, ILogg
         string deviceDirectory = Path.Combine(backupDirectory, Lockdown.Udid);
         Directory.CreateDirectory(deviceDirectory);
 
-        using (DeviceLinkService dl = await GetDeviceLink(backupDirectory, ignoreTransferErrors, performBackupSizeCheck, _internalCts.Token).ConfigureAwait(false)) {
+        DeviceLinkService dl = await GetDeviceLink(backupDirectory, ignoreTransferErrors, performBackupSizeCheck, _internalCts.Token).ConfigureAwait(false);
+        try {
             try {
                 dl.BeforeReceivingFile += DeviceLink_BeforeReceivingFile;
                 dl.Completed += DeviceLink_Completed;
@@ -428,12 +429,24 @@ public sealed class Mobilebackup2Service(LockdownServiceProvider lockdown, ILogg
                 }
             }
             finally {
-                DictionaryNode message = new DictionaryNode() {
-                    { "MessageName", new StringNode("CancelBackup") },
-                    { "TargetIdentifier", new StringNode(Lockdown.Udid) }
-                };
-                await dl.SendProcessMessage(message, cancellationToken).ConfigureAwait(false);
+                // Send CancelBackup to cleanly terminate the backup session on the device side.
+                // On successful completion the device has already closed its end of the connection,
+                // so the write will throw SocketError 10053 (WSAECONNABORTED). Swallow that here —
+                // the backup itself succeeded and propagating this exception would incorrectly mark
+                // it as failed.
+                try {
+                    DictionaryNode message = new DictionaryNode() {
+                        { "MessageName", new StringNode("CancelBackup") },
+                        { "TargetIdentifier", new StringNode(Lockdown.Udid) }
+                    };
+                    await dl.SendProcessMessage(message, cancellationToken).ConfigureAwait(false);
+                }
+                catch (IOException) { }
             }
+        }
+        finally {
+            // Dispose may also throw if the socket was closed by the device on successful completion.
+            try { dl.Dispose(); } catch (IOException) { }
         }
     }
 

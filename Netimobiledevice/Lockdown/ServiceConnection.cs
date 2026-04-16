@@ -78,6 +78,7 @@ public class ServiceConnection : IDisposable {
             throw new NoDeviceConnectedException();
         }
         Socket sock = targetDevice.Connect(port, usbmuxAddress: usbmuxAddress, logger);
+        EnableTcpKeepAlive(sock);
         return new ServiceConnection(sock, logger ?? NullLogger.Instance, targetDevice);
     }
 
@@ -90,7 +91,20 @@ public class ServiceConnection : IDisposable {
             throw new NoDeviceConnectedException();
         }
         Socket sock = await targetDevice.ConnectAsync(port, usbmuxAddress: usbmuxAddress, logger).ConfigureAwait(false);
+        EnableTcpKeepAlive(sock);
         return new ServiceConnection(sock, logger ?? NullLogger.Instance, targetDevice);
+    }
+
+    /// <summary>
+    /// Enables TCP keep-alive on the socket with a 30-second idle time and 10-second probe interval.
+    /// This prevents the Apple Mobile Device service from aborting the connection during long silent
+    /// phases (e.g. the Mobilebackup2 "Moving" phase) where no application data is exchanged.
+    /// </summary>
+    private static void EnableTcpKeepAlive(Socket sock) {
+        sock.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.KeepAlive, true);
+        sock.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.TcpKeepAliveTime, 30);    // idle seconds before first probe
+        sock.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.TcpKeepAliveInterval, 10); // seconds between probes
+        sock.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.TcpKeepAliveRetryCount, 3); // probes before giving up
     }
 
     private bool UserCertificateValidationCallback(object sender, X509Certificate? certificate, X509Chain? chain, SslPolicyErrors sslPolicyErrors) {
