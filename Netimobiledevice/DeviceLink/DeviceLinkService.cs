@@ -7,6 +7,7 @@ using Netimobiledevice.Plist;
 using System;
 using System.Collections.Generic;
 using System.ComponentModel;
+using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Text;
@@ -31,7 +32,23 @@ internal sealed class DeviceLinkService : IDisposable
     private readonly bool _ignoreTransferErrors;
     private readonly bool _performBackupSizeCheck;
     private FileStream? _fileStream;
+    private bool _discarding;
     private CancellationTokenSource _internalCancellationTokenSource;
+
+    // Throughput instrumentation — accumulates time spent in the USB receive call vs. the disk
+    // write call during UploadFiles. Used to diagnose whether backup speed is USB-bound or
+    // disk-bound. Read/reset via GetAndResetThroughputStats().
+    private long _rxBytes;
+    private long _rxTicks;
+    private long _wxBytes;
+    private long _wxTicks;
+
+    /// <summary>
+    /// Optional delegate to classify whether a file should be discarded (bytes drained but not
+    /// written to disk). When null, all files are written normally. When set, called once per
+    /// file at the start of the first chunk using the device-side path. Returns true = discard.
+    /// </summary>
+    public Func<string, bool>? ShouldDiscardFile { get; set; }
 
     private Dictionary<string, Func<ArrayNode, CancellationToken, Task>> DeviceLinkHandlers { get; }
     /// <summary>
@@ -608,12 +625,38 @@ internal sealed class DeviceLinkService : IDisposable
                 if (backupFile.LocalPath.Contains("Status.plist") && File.Exists(backupFile.LocalPath)) {
                     File.Delete(backupFile.LocalPath);
                 }
-                _fileStream ??= File.OpenWrite(backupFile.LocalPath);
-                _fileStream.Seek(0, SeekOrigin.End);
+
+                // Classify once per file (at first chunk). If discarding, skip File.OpenWrite
+                // and drain all chunks without writing. _fileStream stays null for discarded files.
+                if (_fileStream == null && !_discarding) {
+                    _discarding = ShouldDiscardFile?.Invoke(backupFile.DevicePath) ?? false;
+                    if (!_discarding) {
+                        _fileStream = File.OpenWrite(backupFile.LocalPath);
+                        _fileStream.Seek(0, SeekOrigin.End);
+                    }
+                }
+                else if (_fileStream != null) {
+                    _fileStream.Seek(0, SeekOrigin.End);
+                }
 
                 while (size > 0 && code == ResultCode.FileData) {
+                    // Instrumentation: time the USB receive and disk write separately so the
+                    // caller can diagnose whether the backup is USB-bound or disk-bound. We
+                    // measure only the buffer-sized chunk transfers here (the dominant path);
+                    // metadata ReadInt32/ReadCode calls are excluded as they are negligible.
+                    long rxStart = Stopwatch.GetTimestamp();
                     byte[] buffer = await _service.ReceiveAsync(size, cancellationToken).ConfigureAwait(false);
-                    await _fileStream.WriteAsync(buffer, cancellationToken).ConfigureAwait(false);
+                    long rxElapsed = Stopwatch.GetTimestamp() - rxStart;
+                    Interlocked.Add(ref _rxBytes, buffer.Length);
+                    Interlocked.Add(ref _rxTicks, rxElapsed);
+
+                    if (!_discarding) {
+                        long wxStart = Stopwatch.GetTimestamp();
+                        await _fileStream!.WriteAsync(buffer, cancellationToken).ConfigureAwait(false);
+                        long wxElapsed = Stopwatch.GetTimestamp() - wxStart;
+                        Interlocked.Add(ref _wxBytes, buffer.Length);
+                        Interlocked.Add(ref _wxTicks, wxElapsed);
+                    }
 
                     backupFile.FileSize += buffer.Length;
                     OnFileReceiving(backupFile, buffer);
@@ -629,11 +672,18 @@ internal sealed class DeviceLinkService : IDisposable
 
                     _logger.LogWarning("Failed to fully upload {localPath}. Device file name {devicePath}. Reason: {msg}", backupFile.LocalPath, backupFile.DevicePath, errorMessage);
                     OnFileTransferError(backupFile, $"{code}: {msg} [ExpectedSize: {backupFile.ExpectedFileSize}, ActualReceived: {backupFile.FileSize} ]");
+                    _discarding = false;
 
                     continue;
                 }
 
                 if (code == ResultCode.Success) {
+                    if (_discarding) {
+                        // Create zero-byte stub so Manifest.db references and subsequent incremental
+                        // backup logic (File.Exists check) remain consistent.
+                        using (File.Create(backupFile.LocalPath)) { }
+                        _discarding = false;
+                    }
                     OnFileReceived(backupFile);
                 }
             }
@@ -650,6 +700,22 @@ internal sealed class DeviceLinkService : IDisposable
         }
     }
 
+
+    /// <summary>
+    /// Returns cumulative receive/write throughput counters and resets them to zero. Intended
+    /// for diagnostic logging at the end of a backup session to determine whether transfer time
+    /// is dominated by USB receive or disk write.
+    /// </summary>
+    public (long rxBytes, TimeSpan rxTime, long wxBytes, TimeSpan wxTime) GetAndResetThroughputStats()
+    {
+        long rxBytes = Interlocked.Exchange(ref _rxBytes, 0);
+        long rxTicks = Interlocked.Exchange(ref _rxTicks, 0);
+        long wxBytes = Interlocked.Exchange(ref _wxBytes, 0);
+        long wxTicks = Interlocked.Exchange(ref _wxTicks, 0);
+        var rxTime = TimeSpan.FromSeconds((double) rxTicks / Stopwatch.Frequency);
+        var wxTime = TimeSpan.FromSeconds((double) wxTicks / Stopwatch.Frequency);
+        return (rxBytes, rxTime, wxBytes, wxTime);
+    }
 
     public void Dispose()
     {

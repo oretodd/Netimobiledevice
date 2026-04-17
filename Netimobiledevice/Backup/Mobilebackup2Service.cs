@@ -32,6 +32,13 @@ public sealed class Mobilebackup2Service(LockdownServiceProvider lockdown, ILogg
     private bool _passcodeRequired;
 
     /// <summary>
+    /// Cumulative throughput stats from the last Backup() invocation. Populated just before
+    /// the DeviceLinkService is disposed, so the caller can log them from the caller's own
+    /// logger after Backup returns. Null if Backup was never called.
+    /// </summary>
+    public (long RxBytes, TimeSpan RxTime, long WxBytes, TimeSpan WxTime)? LastBackupThroughputStats { get; private set; }
+
+    /// <summary>
     /// iTunes files to be inserted into the Info.plist file.
     /// </summary>
     private static readonly string[] iTunesFiles = [
@@ -88,6 +95,13 @@ public sealed class Mobilebackup2Service(LockdownServiceProvider lockdown, ILogg
     /// Event raised for signaling different kinds of the backup status.
     /// </summary>
     public event EventHandler<StatusEventArgs>? Status;
+
+    /// <summary>
+    /// Optional delegate to classify whether a backup file should be discarded (bytes drained
+    /// but not written to disk). Set before calling <see cref="Backup"/> to enable zero-disk-write
+    /// optimization. When null, all files are written normally.
+    /// </summary>
+    public Func<string, bool>? ShouldDiscardFile { get; set; }
 
     private static bool BackupExists(string backupDirectory, string identifier)
     {
@@ -314,6 +328,7 @@ public sealed class Mobilebackup2Service(LockdownServiceProvider lockdown, ILogg
     private async Task<DeviceLinkService> GetDeviceLink(string backupDirectory, bool ignoreTransferErrors, bool performBackupSizeCheck, CancellationToken cancellationToken)
     {
         DeviceLinkService dl = new DeviceLinkService(this.Service, backupDirectory, this.Lockdown.OsVersion, ignoreTransferErrors, performBackupSizeCheck, Logger);
+        dl.ShouldDiscardFile = this.ShouldDiscardFile;
         await dl.VersionExchange(MOBILEBACKUP2_VERSION_MAJOR, MOBILEBACKUP2_VERSION_MINOR, cancellationToken).ConfigureAwait(false);
         await VersionExchange(dl, cancellationToken).ConfigureAwait(false);
         return dl;
@@ -444,6 +459,11 @@ public sealed class Mobilebackup2Service(LockdownServiceProvider lockdown, ILogg
                 }
                 catch (IOException) { }
                 catch (OperationCanceledException) { }
+
+                // Capture throughput stats before dl's using-scope disposes it. Exposed to the
+                // caller via LastBackupThroughputStats so they can log under their own category.
+                // Runs regardless of CancelBackup outcome so stats are never lost.
+                LastBackupThroughputStats = dl.GetAndResetThroughputStats();
             }
         }
         finally {
