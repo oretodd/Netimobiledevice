@@ -362,7 +362,8 @@ public sealed class Mobilebackup2Service(LockdownServiceProvider lockdown, ILogg
         string deviceDirectory = Path.Combine(backupDirectory, Lockdown.Udid);
         Directory.CreateDirectory(deviceDirectory);
 
-        using (DeviceLinkService dl = await GetDeviceLink(backupDirectory, ignoreTransferErrors, performBackupSizeCheck, _internalCts.Token).ConfigureAwait(false)) {
+        DeviceLinkService dl = await GetDeviceLink(backupDirectory, ignoreTransferErrors, performBackupSizeCheck, _internalCts.Token).ConfigureAwait(false);
+        try {
             try {
                 dl.BeforeReceivingFile += DeviceLink_BeforeReceivingFile;
                 dl.Completed += DeviceLink_Completed;
@@ -428,12 +429,26 @@ public sealed class Mobilebackup2Service(LockdownServiceProvider lockdown, ILogg
                 }
             }
             finally {
-                DictionaryNode message = new DictionaryNode() {
-                    { "MessageName", new StringNode("CancelBackup") },
-                    { "TargetIdentifier", new StringNode(Lockdown.Udid) }
-                };
-                await dl.SendProcessMessage(message, cancellationToken).ConfigureAwait(false);
+                // Send CancelBackup to cleanly terminate the backup session on the device side.
+                // On successful completion the device has already closed its end of the connection,
+                // so the write may throw SocketError 10053 (WSAECONNABORTED) or hang indefinitely
+                // on a half-closed SSL socket. Use a 5-second timeout to prevent hanging forever.
+                try {
+                    using var cancelBackupCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+                    cancelBackupCts.CancelAfter(TimeSpan.FromSeconds(5));
+                    DictionaryNode message = new DictionaryNode() {
+                        { "MessageName", new StringNode("CancelBackup") },
+                        { "TargetIdentifier", new StringNode(Lockdown.Udid) }
+                    };
+                    await dl.SendProcessMessage(message, cancelBackupCts.Token).ConfigureAwait(false);
+                }
+                catch (IOException) { }
+                catch (OperationCanceledException) { }
             }
+        }
+        finally {
+            // Dispose may also throw if the socket was closed by the device on successful completion.
+            try { dl.Dispose(); } catch (IOException) { }
         }
     }
 
