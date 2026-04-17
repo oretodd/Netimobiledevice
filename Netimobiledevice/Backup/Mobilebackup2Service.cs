@@ -89,6 +89,13 @@ public sealed class Mobilebackup2Service(LockdownServiceProvider lockdown, ILogg
     /// </summary>
     public event EventHandler<StatusEventArgs>? Status;
 
+    /// <summary>
+    /// Optional delegate to classify whether a backup file should be discarded (bytes drained
+    /// but not written to disk). Set before calling <see cref="Backup"/> to enable zero-disk-write
+    /// optimization. When null, all files are written normally.
+    /// </summary>
+    public Func<string, bool>? ShouldDiscardFile { get; set; }
+
     private static bool BackupExists(string backupDirectory, string identifier)
     {
         string deviceDirectory = Path.Combine(backupDirectory, identifier);
@@ -314,6 +321,7 @@ public sealed class Mobilebackup2Service(LockdownServiceProvider lockdown, ILogg
     private async Task<DeviceLinkService> GetDeviceLink(string backupDirectory, bool ignoreTransferErrors, bool performBackupSizeCheck, CancellationToken cancellationToken)
     {
         DeviceLinkService dl = new DeviceLinkService(this.Service, backupDirectory, this.Lockdown.OsVersion, ignoreTransferErrors, performBackupSizeCheck, Logger);
+        dl.ShouldDiscardFile = this.ShouldDiscardFile;
         await dl.VersionExchange(MOBILEBACKUP2_VERSION_MAJOR, MOBILEBACKUP2_VERSION_MINOR, cancellationToken).ConfigureAwait(false);
         await VersionExchange(dl, cancellationToken).ConfigureAwait(false);
         return dl;

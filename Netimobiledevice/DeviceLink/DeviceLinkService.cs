@@ -31,7 +31,15 @@ internal sealed class DeviceLinkService : IDisposable
     private readonly bool _ignoreTransferErrors;
     private readonly bool _performBackupSizeCheck;
     private FileStream? _fileStream;
+    private bool _discarding;
     private CancellationTokenSource _internalCancellationTokenSource;
+
+    /// <summary>
+    /// Optional delegate to classify whether a file should be discarded (bytes drained but not
+    /// written to disk). When null, all files are written normally. When set, called once per
+    /// file at the start of the first chunk using the device-side path. Returns true = discard.
+    /// </summary>
+    public Func<string, bool>? ShouldDiscardFile { get; set; }
 
     private Dictionary<string, Func<ArrayNode, CancellationToken, Task>> DeviceLinkHandlers { get; }
     /// <summary>
@@ -608,12 +616,25 @@ internal sealed class DeviceLinkService : IDisposable
                 if (backupFile.LocalPath.Contains("Status.plist") && File.Exists(backupFile.LocalPath)) {
                     File.Delete(backupFile.LocalPath);
                 }
-                _fileStream ??= File.OpenWrite(backupFile.LocalPath);
-                _fileStream.Seek(0, SeekOrigin.End);
+
+                // Classify once per file (at first chunk). If discarding, skip File.OpenWrite
+                // and drain all chunks without writing. _fileStream stays null for discarded files.
+                if (_fileStream == null && !_discarding) {
+                    _discarding = ShouldDiscardFile?.Invoke(backupFile.DevicePath) ?? false;
+                    if (!_discarding) {
+                        _fileStream = File.OpenWrite(backupFile.LocalPath);
+                        _fileStream.Seek(0, SeekOrigin.End);
+                    }
+                }
+                else if (_fileStream != null) {
+                    _fileStream.Seek(0, SeekOrigin.End);
+                }
 
                 while (size > 0 && code == ResultCode.FileData) {
                     byte[] buffer = await _service.ReceiveAsync(size, cancellationToken).ConfigureAwait(false);
-                    await _fileStream.WriteAsync(buffer, cancellationToken).ConfigureAwait(false);
+                    if (!_discarding) {
+                        await _fileStream!.WriteAsync(buffer, cancellationToken).ConfigureAwait(false);
+                    }
 
                     backupFile.FileSize += buffer.Length;
                     OnFileReceiving(backupFile, buffer);
@@ -629,11 +650,18 @@ internal sealed class DeviceLinkService : IDisposable
 
                     _logger.LogWarning("Failed to fully upload {localPath}. Device file name {devicePath}. Reason: {msg}", backupFile.LocalPath, backupFile.DevicePath, errorMessage);
                     OnFileTransferError(backupFile, $"{code}: {msg} [ExpectedSize: {backupFile.ExpectedFileSize}, ActualReceived: {backupFile.FileSize} ]");
+                    _discarding = false;
 
                     continue;
                 }
 
                 if (code == ResultCode.Success) {
+                    if (_discarding) {
+                        // Create zero-byte stub so Manifest.db references and subsequent incremental
+                        // backup logic (File.Exists check) remain consistent.
+                        using (File.Create(backupFile.LocalPath)) { }
+                        _discarding = false;
+                    }
                     OnFileReceived(backupFile);
                 }
             }
