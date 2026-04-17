@@ -32,6 +32,13 @@ public sealed class Mobilebackup2Service(LockdownServiceProvider lockdown, ILogg
     private bool _passcodeRequired;
 
     /// <summary>
+    /// Cumulative throughput stats from the last Backup() invocation. Populated just before
+    /// the DeviceLinkService is disposed, so the caller can log them from the caller's own
+    /// logger after Backup returns. Null if Backup was never called.
+    /// </summary>
+    public (long RxBytes, TimeSpan RxTime, long WxBytes, TimeSpan WxTime)? LastBackupThroughputStats { get; private set; }
+
+    /// <summary>
     /// iTunes files to be inserted into the Info.plist file.
     /// </summary>
     private static readonly string[] iTunesFiles = [
@@ -441,6 +448,10 @@ public sealed class Mobilebackup2Service(LockdownServiceProvider lockdown, ILogg
                     { "TargetIdentifier", new StringNode(Lockdown.Udid) }
                 };
                 await dl.SendProcessMessage(message, cancellationToken).ConfigureAwait(false);
+
+                // Capture throughput stats before dl's using-scope disposes it. Exposed to the
+                // caller via LastBackupThroughputStats so they can log under their own category.
+                LastBackupThroughputStats = dl.GetAndResetThroughputStats();
             }
         }
     }
