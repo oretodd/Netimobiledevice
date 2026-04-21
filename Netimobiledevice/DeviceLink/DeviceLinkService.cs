@@ -344,29 +344,58 @@ internal sealed class DeviceLinkService : IDisposable
     /// <returns>The number of items moved.</returns>
     private async Task MoveItems(ArrayNode msg, CancellationToken cancellationToken)
     {
-        foreach (KeyValuePair<string, PropertyNode> move in msg[1].AsDictionaryNode()) {
+        // [DISK-DIAG] Per-invocation counters — see SoliMessage issue #912.
+        // These tell us whether device-driven MoveItems is responsible for the
+        // mid-backup D: free-space oscillation observed in PerfMon.
+        var moves = msg[1].AsDictionaryNode();
+        int moveCount = 0;
+        int destOverwriteCount = 0;
+        long destOverwriteBytes = 0;
+        int movesApplied = 0;
+        _logger.LogInformation("[DISK-DIAG] MoveItems invoked: {Count} moves requested by device", moves.Count);
+
+        foreach (KeyValuePair<string, PropertyNode> move in moves) {
             if (cancellationToken.IsCancellationRequested) {
                 break;
             }
+            moveCount++;
 
             string newPath = move.Value.AsStringNode().Value;
             if (!string.IsNullOrEmpty(newPath)) {
                 FileInfo newFile = new FileInfo(Path.Combine(_rootPath, newPath));
                 if (newFile.Exists) {
+                    // [DISK-DIAG] Destination exists — device wants us to overwrite.
+                    // Capture size so we know how many bytes are being released here.
+                    long overwrittenBytes = 0;
                     if (newFile.Attributes.HasFlag(FileAttributes.Directory)) {
+                        try {
+                            overwrittenBytes = new DirectoryInfo(newFile.FullName)
+                                .EnumerateFiles("*", SearchOption.AllDirectories)
+                                .Sum(f => { try { return f.Length; } catch { return 0L; } });
+                        }
+                        catch { /* size probe is best-effort */ }
                         new DirectoryInfo(newFile.FullName).Delete(true);
                     }
                     else {
+                        try { overwrittenBytes = newFile.Length; } catch { /* best-effort */ }
                         newFile.Delete();
                     }
+                    destOverwriteCount++;
+                    destOverwriteBytes += overwrittenBytes;
+                    _logger.LogInformation("[DISK-DIAG] MoveItems overwrite: dest={NewPath} existed ({Bytes} bytes) — deleted before rename",
+                        newPath, overwrittenBytes);
                 }
 
                 FileInfo oldFile = new FileInfo(Path.Combine(_rootPath, move.Key));
                 if (oldFile.Exists) {
                     oldFile.MoveTo(newFile.FullName);
+                    movesApplied++;
                 }
             }
         }
+
+        _logger.LogInformation("[DISK-DIAG] MoveItems complete: {MoveCount} moves requested, {Applied} applied, {OverwriteCount} destinations overwritten, {OverwriteBytes} bytes released via overwrite",
+            moveCount, movesApplied, destOverwriteCount, destOverwriteBytes);
 
         if (!cancellationToken.IsCancellationRequested) {
             await SendStatusReport(0, string.Empty, cancellationToken: cancellationToken).ConfigureAwait(false);
@@ -507,7 +536,17 @@ internal sealed class DeviceLinkService : IDisposable
     /// <returns>The number of items removed.</returns>
     private async Task RemoveItems(ArrayNode message, CancellationToken cancellationToken)
     {
+        // [DISK-DIAG] Per-invocation counters — see SoliMessage issue #912.
+        // These tell us whether device-driven RemoveItems is responsible for the
+        // mid-backup D: free-space recovery observed in PerfMon during long backups.
         ArrayNode removes = message[1].AsArrayNode();
+        int filesDeleted = 0;
+        long fileBytesReleased = 0;
+        int dirsDeleted = 0;
+        long dirBytesReleased = 0;
+        int notFoundCount = 0;
+        _logger.LogInformation("[DISK-DIAG] RemoveItems invoked: {Count} paths requested by device", removes.Count);
+
         foreach (StringNode filename in removes.Cast<StringNode>()) {
             if (cancellationToken.IsCancellationRequested) {
                 break;
@@ -519,10 +558,29 @@ internal sealed class DeviceLinkService : IDisposable
             else {
                 string path = Path.Combine(_rootPath, filename.Value);
                 if (File.Exists(path)) {
+                    long size = 0;
+                    try { size = new FileInfo(path).Length; } catch { /* best-effort */ }
                     File.Delete(path);
+                    filesDeleted++;
+                    fileBytesReleased += size;
+                    _logger.LogInformation("[DISK-DIAG] RemoveItems file: {Path} ({Bytes} bytes)", filename.Value, size);
                 }
                 else if (Directory.Exists(path)) {
+                    long size = 0;
+                    try {
+                        size = new DirectoryInfo(path)
+                            .EnumerateFiles("*", SearchOption.AllDirectories)
+                            .Sum(f => { try { return f.Length; } catch { return 0L; } });
+                    }
+                    catch { /* best-effort */ }
                     Directory.Delete(path, true);
+                    dirsDeleted++;
+                    dirBytesReleased += size;
+                    _logger.LogInformation("[DISK-DIAG] RemoveItems dir: {Path} ({Bytes} bytes)", filename.Value, size);
+                }
+                else {
+                    notFoundCount++;
+                    _logger.LogDebug("[DISK-DIAG] RemoveItems target not found: {Path}", filename.Value);
                 }
             }
 
@@ -530,6 +588,9 @@ internal sealed class DeviceLinkService : IDisposable
                 await SendStatusReport(0, string.Empty, cancellationToken: cancellationToken).ConfigureAwait(false);
             }
         }
+
+        _logger.LogInformation("[DISK-DIAG] RemoveItems complete: {FilesDeleted} files ({FileBytes} bytes), {DirsDeleted} dirs ({DirBytes} bytes), {NotFound} not found. Total released: {TotalBytes} bytes",
+            filesDeleted, fileBytesReleased, dirsDeleted, dirBytesReleased, notFoundCount, fileBytesReleased + dirBytesReleased);
     }
 
     /// <summary>
