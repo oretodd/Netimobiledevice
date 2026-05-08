@@ -78,7 +78,10 @@ public class ServiceConnection : IDisposable {
             throw new NoDeviceConnectedException();
         }
         Socket sock = targetDevice.Connect(port, usbmuxAddress: usbmuxAddress, logger);
-        EnableTcpKeepAlive(sock);
+        sock.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.KeepAlive, true);
+        sock.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.TcpKeepAliveTime, 30);
+        sock.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.TcpKeepAliveInterval, 10);
+        sock.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.TcpKeepAliveRetryCount, 3);
         return new ServiceConnection(sock, logger ?? NullLogger.Instance, targetDevice);
     }
 
@@ -91,20 +94,11 @@ public class ServiceConnection : IDisposable {
             throw new NoDeviceConnectedException();
         }
         Socket sock = await targetDevice.ConnectAsync(port, usbmuxAddress: usbmuxAddress, logger).ConfigureAwait(false);
-        EnableTcpKeepAlive(sock);
-        return new ServiceConnection(sock, logger ?? NullLogger.Instance, targetDevice);
-    }
-
-    /// <summary>
-    /// Enables TCP keep-alive on the socket with a 30-second idle time and 10-second probe interval.
-    /// This prevents the Apple Mobile Device service from aborting the connection during long silent
-    /// phases (e.g. the Mobilebackup2 "Moving" phase) where no application data is exchanged.
-    /// </summary>
-    private static void EnableTcpKeepAlive(Socket sock) {
         sock.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.KeepAlive, true);
-        sock.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.TcpKeepAliveTime, 30);    // idle seconds before first probe
-        sock.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.TcpKeepAliveInterval, 10); // seconds between probes
-        sock.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.TcpKeepAliveRetryCount, 3); // probes before giving up
+        sock.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.TcpKeepAliveTime, 30);
+        sock.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.TcpKeepAliveInterval, 10);
+        sock.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.TcpKeepAliveRetryCount, 3);
+        return new ServiceConnection(sock, logger ?? NullLogger.Instance, targetDevice);
     }
 
     private bool UserCertificateValidationCallback(object sender, X509Certificate? certificate, X509Chain? chain, SslPolicyErrors sslPolicyErrors) {
@@ -167,18 +161,20 @@ public class ServiceConnection : IDisposable {
             if (Stream.ReadTimeout != -1) {
                 CancellationTokenSource localTaskComplete = new CancellationTokenSource(Stream.ReadTimeout);
                 CancellationTokenSource linkedCancellationTokenSource = CancellationTokenSource.CreateLinkedTokenSource(localTaskComplete.Token, cancellationToken);
-                try {
-                    bytesRead = await Stream.ReadAsync(buffer.AsMemory(totalBytesRead, readSize), linkedCancellationTokenSource.Token).ConfigureAwait(false);
-                    if (bytesRead == 0) {
-                        _logger.LogError("Read zero bytes so the connection has been broken");
-                        break;
+                using (linkedCancellationTokenSource) {
+                    try {
+                        bytesRead = await Stream.ReadAsync(buffer.AsMemory(totalBytesRead, readSize), linkedCancellationTokenSource.Token).ConfigureAwait(false);
+                        if (bytesRead == 0) {
+                            _logger.LogError("Read zero bytes so the connection has been broken");
+                            break;
+                        }
                     }
-                }
-                catch (OperationCanceledException) {
-                    if (localTaskComplete.IsCancellationRequested) {
-                        throw new TimeoutException("Timeout waiting for message from service");
+                    catch (OperationCanceledException) {
+                        if (localTaskComplete.IsCancellationRequested) {
+                            throw new TimeoutException("Timeout waiting for message from service");
+                        }
+                        throw;
                     }
-                    throw;
                 }
             }
             else {

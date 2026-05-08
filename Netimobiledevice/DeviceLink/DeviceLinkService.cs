@@ -18,8 +18,7 @@ namespace Netimobiledevice.DeviceLink;
 
 public delegate void SendFileErrorEventHandler(DictionaryNode errorNode, string fileName);
 
-internal sealed class DeviceLinkService : IDisposable
-{
+internal sealed class DeviceLinkService : IDisposable {
     private const int BULK_OPERATION_ERROR = -13;
     private const uint FILE_TRANSFER_TERMINATOR = 0x00;
     // Set the default timeout to be 5 minutes
@@ -99,8 +98,7 @@ internal sealed class DeviceLinkService : IDisposable
     /// </summary>
     public event SendFileErrorEventHandler? SendFileError;
 
-    public DeviceLinkService(ServiceConnection service, string backupDirectory, Version iosVersion, bool ignoreTransferErrors = true, bool performBackupSizeCheck = true, ILogger? logger = null)
-    {
+    public DeviceLinkService(ServiceConnection service, string backupDirectory, Version iosVersion, bool ignoreTransferErrors = true, bool performBackupSizeCheck = true, ILogger? logger = null) {
         _service = service;
         _rootPath = backupDirectory;
         _iosVersion = iosVersion;
@@ -128,8 +126,7 @@ internal sealed class DeviceLinkService : IDisposable
         };
     }
 
-    private void CloseFileStream()
-    {
+    private void CloseFileStream() {
         try {
             _fileStream?.Flush();
         }
@@ -145,8 +142,7 @@ internal sealed class DeviceLinkService : IDisposable
     /// </summary>
     /// <param name="msg">The message received from the device.</param>
     /// <returns>Always 0.</returns>
-    private async Task ContentsOfDirectory(ArrayNode msg, CancellationToken cancellationToken)
-    {
+    private async Task ContentsOfDirectory(ArrayNode msg, CancellationToken cancellationToken) {
         string path = Path.Combine(_rootPath, msg[1].AsStringNode().Value);
         DictionaryNode dirList = [];
         DirectoryInfo dir = new DirectoryInfo(path);
@@ -174,8 +170,7 @@ internal sealed class DeviceLinkService : IDisposable
     /// </summary>
     /// <param name="msg">The message received from the device.</param>
     /// <returns>The errno result of the operation.</returns>
-    private async Task CopyItem(ArrayNode msg, CancellationToken cancellationToken)
-    {
+    private async Task CopyItem(ArrayNode msg, CancellationToken cancellationToken) {
         FileInfo source = new FileInfo(Path.Combine(_rootPath, msg[1].AsStringNode().Value));
         FileInfo dest = new FileInfo(Path.Combine(_rootPath, msg[2].AsStringNode().Value));
         if (source.Attributes.HasFlag(FileAttributes.Directory)) {
@@ -192,8 +187,7 @@ internal sealed class DeviceLinkService : IDisposable
     /// </summary>
     /// <param name="msg">The message received from the device.</param>
     /// <returns>The errno result of the operation.</returns>
-    private async Task CreateDirectory(ArrayNode msg, CancellationToken cancellationToken)
-    {
+    private async Task CreateDirectory(ArrayNode msg, CancellationToken cancellationToken) {
         string newDirPath = Path.Combine(_rootPath, msg[1].AsStringNode().Value);
         Directory.CreateDirectory(newDirPath);
         await SendStatusReport(0, string.Empty, cancellationToken: cancellationToken).ConfigureAwait(false);
@@ -203,8 +197,7 @@ internal sealed class DeviceLinkService : IDisposable
     /// Creates a dictionary plist instance of the required error report for the device.
     /// </summary>
     /// <param name="errorNo">The errno code.</param>
-    private static DictionaryNode CreateErrorReport(ErrNo errorNo)
-    {
+    private static DictionaryNode CreateErrorReport(ErrNo errorNo) {
         string errMsg;
         int errCode = -(int) errorNo;
 
@@ -227,8 +220,7 @@ internal sealed class DeviceLinkService : IDisposable
         return dict;
     }
 
-    private void Disconnect()
-    {
+    private void Disconnect() {
         ArrayNode message = [
             new StringNode("DLMessageDisconnect"),
             new StringNode("___EmptyParameterString___")
@@ -241,8 +233,7 @@ internal sealed class DeviceLinkService : IDisposable
         }
     }
 
-    private async Task DisconnectAsync(ArrayNode msg, CancellationToken cancellationToken)
-    {
+    private async Task DisconnectAsync(ArrayNode msg, CancellationToken cancellationToken) {
         ArrayNode message = [
             new StringNode("DLMessageDisconnect"),
             new StringNode("___EmptyParameterString___")
@@ -259,8 +250,7 @@ internal sealed class DeviceLinkService : IDisposable
     /// Manages the DownloadFiles device message.
     /// </summary>
     /// <param name="msg">The message received from the device.</param>
-    private async Task DownloadFiles(ArrayNode msg, CancellationToken cancellationToken)
-    {
+    private async Task DownloadFiles(ArrayNode msg, CancellationToken cancellationToken) {
         DictionaryNode errList = [];
         ArrayNode files = msg[1].AsArrayNode();
         foreach (StringNode filename in files.Cast<StringNode>()) {
@@ -314,8 +304,7 @@ internal sealed class DeviceLinkService : IDisposable
     /// <param name="msg">The message received from the device.</param>
     /// <param name="respectFreeSpaceValue">Whether the device should abide by the freeSpace value passed or ignore it</param>
     /// <returns>0 on success, -1 on error.</returns>
-    private async Task GetFreeDiskSpace(ArrayNode msg, CancellationToken cancellationToken)
-    {
+    private async Task GetFreeDiskSpace(ArrayNode msg, CancellationToken cancellationToken) {
         IntegerNode spaceItem = new IntegerNode(long.MaxValue);
         if (_performBackupSizeCheck) {
             long freeSpace = 0;
@@ -342,8 +331,7 @@ internal sealed class DeviceLinkService : IDisposable
     /// </summary>
     /// <param name="msg">The message received from the device.</param>
     /// <returns>The number of items moved.</returns>
-    private async Task MoveItems(ArrayNode msg, CancellationToken cancellationToken)
-    {
+    private async Task MoveItems(ArrayNode msg, CancellationToken cancellationToken) {
         // [DISK-DIAG] Per-invocation counters — see SoliMessage issue #912.
         // These tell us whether device-driven MoveItems is responsible for the
         // mid-backup D: free-space oscillation observed in PerfMon.
@@ -402,8 +390,7 @@ internal sealed class DeviceLinkService : IDisposable
         }
     }
 
-    private void OnSendFileError(DictionaryNode errorReport, string fileName)
-    {
+    private void OnSendFileError(DictionaryNode errorReport, string fileName) {
         SendFileError?.Invoke(errorReport, fileName);
     }
 
@@ -411,8 +398,7 @@ internal sealed class DeviceLinkService : IDisposable
     /// Event handler called after a file has been received from the device.
     /// </summary>
     /// <param name="file">The file received.</param>
-    private void OnFileReceived(BackupFile file)
-    {
+    private void OnFileReceived(BackupFile file) {
         if (_fileStream != null && Path.GetFileName(_fileStream.Name) == Path.GetFileName(file.LocalPath)) {
             try {
                 CloseFileStream();
@@ -433,8 +419,7 @@ internal sealed class DeviceLinkService : IDisposable
     /// </summary>
     /// <param name="file">The file received.</param>
     /// <param name="fileData">The file contents received</param>
-    private void OnFileReceiving(BackupFile file, byte[] fileData)
-    {
+    private void OnFileReceiving(BackupFile file, byte[] fileData) {
         if (string.Equals("Status.plist", Path.GetFileName(file.LocalPath), StringComparison.OrdinalIgnoreCase)) {
             try {
                 DictionaryNode statusPlist = PropertyList.LoadFromByteArray(fileData).AsDictionaryNode();
@@ -452,8 +437,7 @@ internal sealed class DeviceLinkService : IDisposable
     /// Event handler called after a file transfer failed due to a device error.
     /// </summary>
     /// <param name="file">The file whose tranfer failed.</param>
-    private void OnFileTransferError(BackupFile file, string details)
-    {
+    private void OnFileTransferError(BackupFile file, string details) {
         CloseFileStream();
         FailedFiles.Add(file);
         if (!_ignoreTransferErrors) {
@@ -467,15 +451,13 @@ internal sealed class DeviceLinkService : IDisposable
     /// Event handler called each time the backup service sends a status report.
     /// </summary>
     /// <param name="status">The status report sent from the backup service.</param>
-    private void OnStatusReceived(BackupStatus status)
-    {
+    private void OnStatusReceived(BackupStatus status) {
         string snapshotState = $"{status.SnapshotState}";
         Status?.Invoke(this, new StatusEventArgs(snapshotState, status));
         _logger.LogDebug("OnStatus: {message}", snapshotState);
     }
 
-    private async Task<ResultCode> ReadCode(CancellationToken cancellationToken)
-    {
+    private async Task<ResultCode> ReadCode(CancellationToken cancellationToken) {
         byte[] buffer = await _service.ReceiveAsync(1, cancellationToken).ConfigureAwait(false);
         byte code = buffer[0];
         if (!Enum.IsDefined(typeof(ResultCode), code)) {
@@ -488,8 +470,7 @@ internal sealed class DeviceLinkService : IDisposable
     /// Reads an Int32 value from the backup service.
     /// </summary>
     /// <returns>The Int32 value read.</returns>
-    private async Task<int> ReadInt32(CancellationToken cancellationToken)
-    {
+    private async Task<int> ReadInt32(CancellationToken cancellationToken) {
         byte[] buffer = await _service.ReceiveAsync(sizeof(int), cancellationToken).ConfigureAwait(false);
         if (buffer.Length > 0) {
             return EndianBitConverter.BigEndian.ToInt32(buffer, 0);
@@ -501,8 +482,7 @@ internal sealed class DeviceLinkService : IDisposable
     /// Reads the information of the next file that the backup service will send.
     /// </summary>
     /// <returns>Returns the file information of the next file to download, or null if there are no more files to download.</returns>
-    private async Task<BackupFile?> ReceiveBackupFile(CancellationToken cancellationToken)
-    {
+    private async Task<BackupFile?> ReceiveBackupFile(CancellationToken cancellationToken) {
         string devicePath = await ReceiveFilename(cancellationToken).ConfigureAwait(false);
         if (string.IsNullOrEmpty(devicePath)) {
             return null;
@@ -518,8 +498,7 @@ internal sealed class DeviceLinkService : IDisposable
     /// Reads a filename from the backup service stream.
     /// </summary>>
     /// <returns>The filename read from the backup stream, or NULL if there are no more files.</returns>
-    private async Task<string> ReceiveFilename(CancellationToken cancellationToken)
-    {
+    private async Task<string> ReceiveFilename(CancellationToken cancellationToken) {
         int len = await ReadInt32(cancellationToken).ConfigureAwait(false);
         if (len == 0) {
             // A zero length means no more files to receive.
@@ -534,8 +513,7 @@ internal sealed class DeviceLinkService : IDisposable
     /// </summary>
     /// <param name="msg">The message received from the device.</param>
     /// <returns>The number of items removed.</returns>
-    private async Task RemoveItems(ArrayNode message, CancellationToken cancellationToken)
-    {
+    private async Task RemoveItems(ArrayNode message, CancellationToken cancellationToken) {
         // [DISK-DIAG] Per-invocation counters — see SoliMessage issue #912.
         // These tell us whether device-driven RemoveItems is responsible for the
         // mid-backup D: free-space recovery observed in PerfMon during long backups.
@@ -597,8 +575,7 @@ internal sealed class DeviceLinkService : IDisposable
     /// Sends the specified error report to the backup service.
     /// </summary>
     /// <param name="error">The error report to send.</param>
-    public async Task SendError(DictionaryNode errorReport, CancellationToken cancellationToken)
-    {
+    public async Task SendError(DictionaryNode errorReport, CancellationToken cancellationToken) {
         byte[] errBytes = Encoding.UTF8.GetBytes(errorReport["DLFileErrorString"].AsStringNode().Value);
         List<byte> buffer = [
             (byte) ResultCode.LocalError, .. errBytes
@@ -610,14 +587,12 @@ internal sealed class DeviceLinkService : IDisposable
     /// Sends a filename to the backup service stream.
     /// </summary>
     /// <param name="filename">The filename to send.</param>
-    private async Task SendPath(string filename, CancellationToken cancellationToken)
-    {
+    private async Task SendPath(string filename, CancellationToken cancellationToken) {
         byte[] path = Encoding.UTF8.GetBytes(filename);
         await SendPrefixed(path, path.Length, cancellationToken).ConfigureAwait(false);
     }
 
-    private async Task SendPrefixed(byte[] data, int length, CancellationToken cancellationToken)
-    {
+    private async Task SendPrefixed(byte[] data, int length, CancellationToken cancellationToken) {
         await _service.SendAsync(EndianBitConverter.BigEndian.GetBytes(length), cancellationToken).ConfigureAwait(false);
         await _service.SendAsync(data, cancellationToken).ConfigureAwait(false);
     }
@@ -628,8 +603,7 @@ internal sealed class DeviceLinkService : IDisposable
     /// <param name="errorCode">The error code to send (as errno value).</param>
     /// <param name="errorMessage">The error message to send.</param>
     /// <param name="errorList">A PropertyNode with additional value(s).</param>
-    private async Task SendStatusReport(int errorCode, string? errorMessage = null, PropertyNode? errorList = null, CancellationToken cancellationToken = default)
-    {
+    private async Task SendStatusReport(int errorCode, string? errorMessage = null, PropertyNode? errorList = null, CancellationToken cancellationToken = default) {
         ArrayNode array = [
             new StringNode("DLMessageStatusResponse"),
             new IntegerNode(errorCode),
@@ -645,8 +619,7 @@ internal sealed class DeviceLinkService : IDisposable
     /// </summary>
     /// <param name="msg">The message received containing the progress information.</param>
     /// <param name="index">The index of the element in the array that contains the progress value.</param>
-    private void UpdateProgressForMessage(RealNode progressNode)
-    {
+    private void UpdateProgressForMessage(RealNode progressNode) {
         if (progressNode.Value > 0.0) {
             Progress?.Invoke(this, new ProgressChangedEventArgs((int) progressNode.Value, BytesRead));
         }
@@ -657,8 +630,7 @@ internal sealed class DeviceLinkService : IDisposable
     /// </summary>
     /// <param name="msg">The message received from the device.</param>
     /// <returns>The number of files processed.</returns>
-    private async Task UploadFiles(ArrayNode msg, CancellationToken cancellationToken)
-    {
+    private async Task UploadFiles(ArrayNode msg, CancellationToken cancellationToken) {
         long startTicks = DateTime.UtcNow.Ticks;
 
         long backupTotalSize = (long) msg[3].AsIntegerNode().Value;
@@ -767,8 +739,7 @@ internal sealed class DeviceLinkService : IDisposable
     /// for diagnostic logging at the end of a backup session to determine whether transfer time
     /// is dominated by USB receive or disk write.
     /// </summary>
-    public (long rxBytes, TimeSpan rxTime, long wxBytes, TimeSpan wxTime) GetAndResetThroughputStats()
-    {
+    public (long rxBytes, TimeSpan rxTime, long wxBytes, TimeSpan wxTime) GetAndResetThroughputStats() {
         long rxBytes = Interlocked.Exchange(ref _rxBytes, 0);
         long rxTicks = Interlocked.Exchange(ref _rxTicks, 0);
         long wxBytes = Interlocked.Exchange(ref _wxBytes, 0);
@@ -778,15 +749,14 @@ internal sealed class DeviceLinkService : IDisposable
         return (rxBytes, rxTime, wxBytes, wxTime);
     }
 
-    public void Dispose()
-    {
+    public void Dispose() {
         Disconnect();
         _service.Close();
+        _internalCancellationTokenSource.Dispose();
         GC.SuppressFinalize(this);
     }
 
-    public async Task<ResultCode> DlLoop(CancellationToken cancellationToken = default)
-    {
+    public async Task<ResultCode> DlLoop(CancellationToken cancellationToken = default) {
         Started?.Invoke(this, new BackupStartedEventArgs(this._iosVersion));
         FailedFiles.Clear();
 
@@ -826,8 +796,7 @@ internal sealed class DeviceLinkService : IDisposable
         return ResultCode.Skipped;
     }
 
-    public async Task<ArrayNode> ReceiveMessage(CancellationToken cancellationToken)
-    {
+    public async Task<ArrayNode> ReceiveMessage(CancellationToken cancellationToken) {
         PropertyNode? message = await _service.ReceivePlistAsync(cancellationToken).ConfigureAwait(false);
         if (message == null) {
             return [];
@@ -835,8 +804,7 @@ internal sealed class DeviceLinkService : IDisposable
         return message.AsArrayNode();
     }
 
-    public async Task SendProcessMessage(PropertyNode message, CancellationToken cancellationToken)
-    {
+    public async Task SendProcessMessage(PropertyNode message, CancellationToken cancellationToken) {
         await _service.SendPlistAsync(
             new ArrayNode() {
                 new StringNode("DLMessageProcessMessage"),
@@ -854,8 +822,7 @@ internal sealed class DeviceLinkService : IDisposable
     /// </summary>
     /// <param name="versionMajor">The major version number to check.</param>
     /// <param name="versionMinor">The minor version number to check.</param>
-    public async Task VersionExchange(ulong versionMajor, ulong versionMinor, CancellationToken cancellationToken)
-    {
+    public async Task VersionExchange(ulong versionMajor, ulong versionMinor, CancellationToken cancellationToken) {
         // Get DLMessageVersionExchange from device
         ArrayNode versionExchangeMessage = await ReceiveMessage(cancellationToken);
         string dlMessage = versionExchangeMessage[0].AsStringNode().Value;
