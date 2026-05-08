@@ -161,18 +161,20 @@ public class ServiceConnection : IDisposable {
             if (Stream.ReadTimeout != -1) {
                 CancellationTokenSource localTaskComplete = new CancellationTokenSource(Stream.ReadTimeout);
                 CancellationTokenSource linkedCancellationTokenSource = CancellationTokenSource.CreateLinkedTokenSource(localTaskComplete.Token, cancellationToken);
-                try {
-                    bytesRead = await Stream.ReadAsync(buffer.AsMemory(totalBytesRead, readSize), linkedCancellationTokenSource.Token).ConfigureAwait(false);
-                    if (bytesRead == 0) {
-                        _logger.LogError("Read zero bytes so the connection has been broken");
-                        break;
+                using (linkedCancellationTokenSource) {
+                    try {
+                        bytesRead = await Stream.ReadAsync(buffer.AsMemory(totalBytesRead, readSize), linkedCancellationTokenSource.Token).ConfigureAwait(false);
+                        if (bytesRead == 0) {
+                            _logger.LogError("Read zero bytes so the connection has been broken");
+                            break;
+                        }
                     }
-                }
-                catch (OperationCanceledException) {
-                    if (localTaskComplete.IsCancellationRequested) {
-                        throw new TimeoutException("Timeout waiting for message from service");
+                    catch (OperationCanceledException) {
+                        if (localTaskComplete.IsCancellationRequested) {
+                            throw new TimeoutException("Timeout waiting for message from service");
+                        }
+                        throw;
                     }
-                    throw;
                 }
             }
             else {
