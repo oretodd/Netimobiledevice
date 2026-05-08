@@ -9,8 +9,10 @@
 		<IsTrimmable>True</IsTrimmable>
 		<Nullable>Enable</Nullable>
 		<TargetFrameworks>net9.0</TargetFrameworks>
-		<!-- Suppress warnings in this third-party fork; we only fix bugs, not upstream code quality -->
-		<NoWarn>$(NoWarn);CS0169;CS0414;CS0649;CS8602;CS8603;CS8618;IL2026</NoWarn>
+		<!-- Suppress warnings in this third-party fork; we only fix bugs, not upstream code quality.
+		     CA1416: TunTapDevice wraps NetWintun (Windows-only TUN/TAP driver) and is unreachable on
+		     non-Windows platforms by design — the analyzer's "all platforms" assumption is wrong here. -->
+		<NoWarn>$(NoWarn);CS0169;CS0414;CS0649;CS8602;CS8603;CS8618;IL2026;CA1416</NoWarn>
 	</PropertyGroup>
 
 	<PropertyGroup>
