@@ -21,8 +21,11 @@ public delegate void SendFileErrorEventHandler(DictionaryNode errorNode, string 
 internal sealed class DeviceLinkService : IDisposable {
     private const int BULK_OPERATION_ERROR = -13;
     private const uint FILE_TRANSFER_TERMINATOR = 0x00;
-    // Set the default timeout to be 5 minutes
-    private const int SERVICE_TIMEOUT = 5 * 60 * 1000;
+    // ScribeHold fork: bumped 5 → 10 minutes. iOS's "build incremental diff" prep window on
+    // large devices (iPhone 16 Pro Max heavy users, iOS 26.x) regularly takes 5–6 minutes
+    // between passcode-accepted and the first PROGRESS-TICK. The original 5-minute value was
+    // on the wrong side of that variance and produced spurious TimeoutException failures.
+    private const int SERVICE_READ_TIMEOUT_MS = 10 * 60 * 1000;
 
     private readonly ServiceConnection _service;
     private readonly string _rootPath;
@@ -109,7 +112,7 @@ internal sealed class DeviceLinkService : IDisposable {
         _internalCancellationTokenSource = new CancellationTokenSource();
 
         // Adjust the timeout to be long enough to handle device with a large amount of data
-        _service.SetTimeout(SERVICE_TIMEOUT);
+        _service.SetTimeout(SERVICE_READ_TIMEOUT_MS);
 
         DeviceLinkHandlers = new Dictionary<string, Func<ArrayNode, CancellationToken, Task>>() {
             { DeviceLinkMessage.ContentsOfDirectory, ContentsOfDirectory },
