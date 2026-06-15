@@ -79,9 +79,13 @@ public class ServiceConnection : IDisposable {
         }
         Socket sock = targetDevice.Connect(port, usbmuxAddress: usbmuxAddress, logger);
         sock.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.KeepAlive, true);
-        sock.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.TcpKeepAliveTime, 30);
-        sock.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.TcpKeepAliveInterval, 10);
-        sock.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.TcpKeepAliveRetryCount, 3);
+        // Keepalive budget must outlast the multi-minute heads-down bursts usbmuxd produces while
+        // servicing the multiplexed device data channel — otherwise the local TCP stack aborts a
+        // healthy relay socket and the bulk read throws IOException(SocketException 10053/10054).
+        // Budget ~= 120 + 10*30 = ~7 min, kept under DeviceLinkService's 10-min read timeout. (#1857)
+        sock.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.TcpKeepAliveTime, 120);
+        sock.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.TcpKeepAliveInterval, 30);
+        sock.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.TcpKeepAliveRetryCount, 10);
         return new ServiceConnection(sock, logger ?? NullLogger.Instance, targetDevice);
     }
 
@@ -95,9 +99,13 @@ public class ServiceConnection : IDisposable {
         }
         Socket sock = await targetDevice.ConnectAsync(port, usbmuxAddress: usbmuxAddress, logger).ConfigureAwait(false);
         sock.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.KeepAlive, true);
-        sock.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.TcpKeepAliveTime, 30);
-        sock.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.TcpKeepAliveInterval, 10);
-        sock.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.TcpKeepAliveRetryCount, 3);
+        // Keepalive budget must outlast the multi-minute heads-down bursts usbmuxd produces while
+        // servicing the multiplexed device data channel — otherwise the local TCP stack aborts a
+        // healthy relay socket and the bulk read throws IOException(SocketException 10053/10054).
+        // Budget ~= 120 + 10*30 = ~7 min, kept under DeviceLinkService's 10-min read timeout. (#1857)
+        sock.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.TcpKeepAliveTime, 120);
+        sock.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.TcpKeepAliveInterval, 30);
+        sock.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.TcpKeepAliveRetryCount, 10);
         return new ServiceConnection(sock, logger ?? NullLogger.Instance, targetDevice);
     }
 
