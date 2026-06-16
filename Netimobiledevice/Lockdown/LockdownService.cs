@@ -109,7 +109,7 @@ public abstract class LockdownService : IDisposable {
             recordsLoaded++;
         }
 
-        List<ServiceInstance> advertisements = await BonjourService.BrowseMobdev2Async(timeout).ConfigureAwait(false);
+        List<ServiceInstance> advertisements = await BonjourService.BrowseMobdev2Async(timeout, logger).ConfigureAwait(false);
         // One summary line per sweep makes the failure mode diagnosable: 0 advertisements => nothing
         // is broadcasting mobdev2 on the LAN; advertisements > matched => paired records are missing
         // the WiFiMACAddress key (or the keys disagree). recordsSkippedNoMac surfaces Apple-written
@@ -137,19 +137,36 @@ public abstract class LockdownService : IDisposable {
             }
 
             advertisementsMatched++;
+            // A matched advertisement with NO addresses means the SRV/A resolution did not complete
+            // within the browse window — the device is advertising and paired, but we have no IP to
+            // connect to. Surface that explicitly; it is otherwise an invisible dead-end.
+            if (answer.Addresses.Count == 0) {
+                logger.LogInformation(
+                    "mobdev2 advertisement {Instance} matched a pair record but resolved no IP address (SRV/A not received in time)",
+                    answer.Instance);
+            }
+
             foreach (Address address in answer.Addresses) {
                 TcpLockdownClient lockdown;
                 try {
                     lockdown = MobileDevice.CreateUsingTcp(hostname: address.Ip, autopair: false, pairRecord: record);
                 }
-                catch (Exception) {
+                catch (Exception ex) {
+                    // The TCP lockdown connect/handshake to a matched, advertised device failed. This was
+                    // previously swallowed silently, hiding a "matched but cannot connect" failure mode
+                    // (wrong port, unreachable IP, handshake reject) behind a zero-device sweep.
+                    logger.LogInformation(ex, "mobdev2 device {Instance} at {Endpoint} matched but TCP lockdown connect failed",
+                        answer.Instance, address.Ip);
                     continue;
                 }
 
                 if (onlyPaired && !lockdown.IsPaired) {
+                    logger.LogDebug("mobdev2 device {Instance} at {Endpoint} connected but is not paired; skipping",
+                        answer.Instance, address.Ip);
                     lockdown.Close();
                     continue;
                 }
+                logger.LogDebug("mobdev2 device {Instance} reachable at {Endpoint}", answer.Instance, address.Ip);
                 yield return (address.Ip, lockdown);
             }
         }

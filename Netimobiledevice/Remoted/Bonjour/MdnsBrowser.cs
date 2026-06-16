@@ -1,4 +1,6 @@
-﻿using System;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
+using System;
 using System.Collections.Generic;
 using System.Net;
 using System.Net.NetworkInformation;
@@ -16,18 +18,67 @@ internal class MdnsBrowser {
     private readonly UdpClient _clientV4;
     private readonly UdpClient _clientV6;
     private readonly NetworkInterface[] _interfaces;
+    private readonly ILogger _logger;
 
-    public MdnsBrowser() {
+    public MdnsBrowser(ILogger? logger = null) {
+        _logger = logger ?? NullLogger.Instance;
         _interfaces = [.. NetworkInterface.GetAllNetworkInterfaces()];
         _clientV4 = BindUdpV4();
         _clientV6 = BindUdpV6();
     }
 
-    private static UdpClient BindUdpV4() {
+    private UdpClient BindUdpV4() {
         UdpClient client = new UdpClient(AddressFamily.InterNetwork);
         client.Client.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
         client.Client.Bind(new IPEndPoint(IPAddress.Any, MdnsPort));
-        client.JoinMulticastGroup(IPAddress.Parse(MdnsMulticastV4));
+
+        // Join the mDNS multicast group on EVERY IPv4-capable interface, not just the system default.
+        // The single-argument JoinMulticastGroup overload joins only on the default multicast interface,
+        // so on a multi-NIC machine an iOS device advertising on a non-default adapter is never received
+        // (the silent zero-result sweep of ScribeHold #1914). Mirror the per-interface loop the IPv6
+        // path already uses. A device only needs to be reachable on ONE interface, so a failed join on
+        // an interface that has no IPv4 / is down is logged at Trace and skipped, not fatal.
+        IPAddress multicastV4 = IPAddress.Parse(MdnsMulticastV4);
+        int joined = 0;
+        foreach (NetworkInterface ni in _interfaces) {
+            if (ni.OperationalStatus != OperationalStatus.Up || !ni.SupportsMulticast) {
+                continue;
+            }
+
+            foreach (UnicastIPAddressInformation uni in ni.GetIPProperties().UnicastAddresses) {
+                if (uni.Address.AddressFamily != AddressFamily.InterNetwork) {
+                    continue;
+                }
+
+                try {
+                    client.Client.SetSocketOption(
+                        SocketOptionLevel.IP,
+                        SocketOptionName.AddMembership,
+                        new MulticastOption(multicastV4, uni.Address));
+                    joined++;
+                    _logger.LogDebug("mDNS IPv4 multicast join OK on {Interface} ({LocalIp})", ni.Name, uni.Address);
+                }
+                catch (Exception ex) {
+                    _logger.LogTrace(ex, "mDNS IPv4 multicast join skipped on {Interface} ({LocalIp})", ni.Name, uni.Address);
+                }
+            }
+        }
+
+        if (joined == 0) {
+            // No per-interface join succeeded — fall back to the default-interface join so a
+            // single-NIC machine still works, and surface that the per-interface fan-out found nothing.
+            _logger.LogWarning("mDNS IPv4 multicast: no per-interface join succeeded; falling back to default interface");
+            try {
+                client.JoinMulticastGroup(multicastV4);
+            }
+            catch (Exception ex) {
+                _logger.LogWarning(ex, "mDNS IPv4 multicast default-interface join failed");
+            }
+        }
+        else {
+            _logger.LogDebug("mDNS IPv4 multicast joined on {Count} interface address(es)", joined);
+        }
+
         return client;
     }
 
@@ -36,21 +87,26 @@ internal class MdnsBrowser {
         client.Client.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
         client.Client.Bind(new IPEndPoint(IPAddress.IPv6Any, MdnsPort));
 
+        IPAddress multicastV6 = IPAddress.Parse(MdnsMulticastV6);
+        int joined = 0;
         for (int i = 0; i < _interfaces.Length; i++) {
-            try { 
-                client.JoinMulticastGroup(i, IPAddress.Parse(MdnsMulticastV6)); 
+            try {
+                client.JoinMulticastGroup(i, multicastV6);
+                joined++;
             }
-            catch {
-                // Catch any errors that might occurs and skip onto the next one
+            catch (Exception ex) {
+                // Interface may have no IPv6 / be down — skip onto the next one.
+                _logger.LogTrace(ex, "mDNS IPv6 multicast join skipped on interface index {Index}", i);
                 continue;
             }
         }
 
+        _logger.LogDebug("mDNS IPv6 multicast joined on {Count} interface index(es)", joined);
         return client;
     }
 
     private void ParseMdnsMessage(
-        byte[] data, 
+        byte[] data,
         HashSet<string> ptrTargets,
         Dictionary<string, List<Service>> srvMap,
         Dictionary<string, Dictionary<string, string>> txtMap,
@@ -77,8 +133,8 @@ internal class MdnsBrowser {
     }
 
     private int ParseRR(
-        byte[] data, 
-        int offset, 
+        byte[] data,
+        int offset,
         HashSet<string> ptrTargets,
         Dictionary<string, List<Service>> srvMap,
         Dictionary<string, Dictionary<string, string>> txtMap,
@@ -133,8 +189,14 @@ internal class MdnsBrowser {
                  (rtype == DnsHelpers.QTYPE_AAAA && rdlen == 16)) {
             IPAddress ip = new IPAddress(rdata);
             string iface = PickInterfaceForIp(ip);
-            if (iface == null) {
-                return offset;
+            if (string.IsNullOrEmpty(iface)) {
+                // No local interface is on the same subnet (IPv4) / link (IPv6) as this address, so we
+                // cannot reach it. Record under an empty interface anyway for IPv4 (globally routable),
+                // but drop unscoped IPv6 link-local — it is unusable without a zone index.
+                if (ip.AddressFamily == AddressFamily.InterNetworkV6 && ip.IsIPv6LinkLocal) {
+                    _logger.LogDebug("mDNS A/AAAA {Ip} for {Name} dropped: no local interface on its link", ip, name);
+                    return offset;
+                }
             }
 
             if (!hostAddrs.ContainsKey(name)) {
@@ -187,13 +249,22 @@ internal class MdnsBrowser {
 
         byte[] query = DnsHelpers.BuildQuery(serviceType, DnsHelpers.QTYPE_PTR);
         await SendQuery(query).ConfigureAwait(false);
+        _logger.LogDebug("mDNS PTR query sent for {ServiceType} (timeout {Timeout}ms)", serviceType, timeout);
 
         HashSet<string> ptrTargets = [];
         Dictionary<string, List<Service>> srvMap = [];
         Dictionary<string, Dictionary<string, string>> txtMap = [];
         Dictionary<string, List<Address>> hostAddrs = [];
+        int packetsReceived = 0;
+        int parseFailures = 0;
 
-        DateTime endTime = DateTime.UtcNow.AddSeconds(timeout);
+        // timeout is MILLISECONDS (DEFAULT_BONJOUR_TIMEOUT is 2000ms = 2s on Windows, 1000ms elsewhere).
+        // This was previously AddSeconds(timeout), which turned the 2000ms default into a 2000-SECOND
+        // (~33 min) browse on Windows — so the very first WiFi discovery sweep never returned, the 5s
+        // poll timer could not tick again, and the detector logged "Starting" then went silent with
+        // zero sightings (ScribeHold #1914). Treating the value as the milliseconds it has always been
+        // named makes a sweep the intended ~2s.
+        DateTime endTime = DateTime.UtcNow.AddMilliseconds(timeout);
         while (DateTime.UtcNow < endTime) {
             List<Task<UdpReceiveResult>> tasks = [];
             if (_clientV4.Available > 0) {
@@ -210,15 +281,24 @@ internal class MdnsBrowser {
             Task<UdpReceiveResult> completed = await Task.WhenAny(tasks).ConfigureAwait(false);
             UdpReceiveResult result = completed.Result;
             byte[] data = result.Buffer;
+            packetsReceived++;
+            _logger.LogTrace("mDNS packet #{Index} received: {Bytes} bytes from {Source}",
+                packetsReceived, data.Length, result.RemoteEndPoint);
 
-            try { 
+            try {
                 ParseMdnsMessage(data, ptrTargets, srvMap, txtMap, hostAddrs);
             }
-            catch {
-                // Ignore any exception that happen.
+            catch (Exception ex) {
+                // A single malformed packet must not abort the browse, but it was previously swallowed
+                // silently — count and log it so a parse-side failure is distinguishable from "no packets".
+                parseFailures++;
+                _logger.LogDebug(ex, "mDNS packet #{Index} from {Source} failed to parse", packetsReceived, result.RemoteEndPoint);
             }
         }
 
+        // Single-arg DropMulticastGroup does not symmetrically drop the per-interface IPv4 memberships
+        // added above, but that is not a leak: both sockets are Close()d immediately, so the OS reclaims
+        // every membership with the socket. The Drop calls are kept as a best-effort tidy-up.
         _clientV4.DropMulticastGroup(IPAddress.Parse(MdnsMulticastV4));
         _clientV6.DropMulticastGroup(IPAddress.Parse(MdnsMulticastV6));
         _clientV4.Close();
@@ -239,6 +319,15 @@ internal class MdnsBrowser {
                 services.Add(si);
             }
         }
+
+        // One summary line per browse: packets in, raw record counts, and resolved service instances.
+        // This is what turns a silent zero-result sweep into a diagnosable one — we can now tell
+        // "no packets arrived" (browser/interface/firewall) from "packets arrived but no PTR/SRV"
+        // (wrong service type / parse) from "resolved instances but no addresses" (A records missed).
+        _logger.LogInformation(
+            "mDNS browse {ServiceType}: {Packets} packet(s) received, {ParseFailures} parse failure(s), " +
+            "{PtrTargets} PTR target(s), {SrvNames} SRV name(s), {Instances} resolved instance(s)",
+            serviceType, packetsReceived, parseFailures, ptrTargets.Count, srvMap.Count, services.Count);
 
         return services;
     }

@@ -1,3 +1,4 @@
+using Microsoft.Extensions.Logging;
 using System.Collections.Generic;
 using System.Threading.Tasks;
 
@@ -19,23 +20,23 @@ public static class BonjourService {
     public const int DEFAULT_BONJOUR_TIMEOUT = 1000;
 #endif
 
-    public static async Task<List<ServiceInstance>> BrowseMobdev2Async(int timeout = DEFAULT_BONJOUR_TIMEOUT) {
-        MdnsBrowser mdnsBrowser = new();
+    public static async Task<List<ServiceInstance>> BrowseMobdev2Async(int timeout = DEFAULT_BONJOUR_TIMEOUT, ILogger? logger = null) {
+        MdnsBrowser mdnsBrowser = new(logger);
         return await mdnsBrowser.BrowseService(MOBDEV2_SERVICE_NAME, timeout).ConfigureAwait(false);
     }
 
-    public static async Task<List<ServiceInstance>> BrowseRemotedAsync(int timeout = DEFAULT_BONJOUR_TIMEOUT) {
-        MdnsBrowser mdnsBrowser = new();
+    public static async Task<List<ServiceInstance>> BrowseRemotedAsync(int timeout = DEFAULT_BONJOUR_TIMEOUT, ILogger? logger = null) {
+        MdnsBrowser mdnsBrowser = new(logger);
         return await mdnsBrowser.BrowseService(REMOTED_SERVICE_NAME, timeout).ConfigureAwait(false);
     }
 
-    public static async Task<List<ServiceInstance>> BrowseRemotePairingAsync(int timeout = DEFAULT_BONJOUR_TIMEOUT) {
-        MdnsBrowser mdnsBrowser = new();
+    public static async Task<List<ServiceInstance>> BrowseRemotePairingAsync(int timeout = DEFAULT_BONJOUR_TIMEOUT, ILogger? logger = null) {
+        MdnsBrowser mdnsBrowser = new(logger);
         return await mdnsBrowser.BrowseService(REMOTEPAIRING_SERVICE_NAME, timeout).ConfigureAwait(false);
     }
 
-    public static async Task<List<ServiceInstance>> BrowseRemotePairingManual(int timeout = DEFAULT_BONJOUR_TIMEOUT) {
-        MdnsBrowser mdnsBrowser = new();
+    public static async Task<List<ServiceInstance>> BrowseRemotePairingManual(int timeout = DEFAULT_BONJOUR_TIMEOUT, ILogger? logger = null) {
+        MdnsBrowser mdnsBrowser = new(logger);
         return await mdnsBrowser.BrowseService(REMOTEPAIRING_MANUAL_PAIRING_SERVICE_NAME, timeout).ConfigureAwait(false);
     }
 }
