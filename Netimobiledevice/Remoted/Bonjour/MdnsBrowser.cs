@@ -6,6 +6,7 @@ using System.Net;
 using System.Net.NetworkInformation;
 using System.Net.Sockets;
 using System.Text;
+using System.Threading;
 using System.Threading.Tasks;
 
 namespace Netimobiledevice.Remoted.Bonjour;
@@ -189,28 +190,33 @@ internal class MdnsBrowser {
                  (rtype == DnsHelpers.QTYPE_AAAA && rdlen == 16)) {
             IPAddress ip = new IPAddress(rdata);
             string iface = PickInterfaceForIp(ip);
-            if (string.IsNullOrEmpty(iface)) {
-                // No local interface is on the same subnet (IPv4) / link (IPv6) as this address, so we
-                // cannot reach it. Record under an empty interface anyway for IPv4 (globally routable),
-                // but drop unscoped IPv6 link-local — it is unusable without a zone index.
-                if (ip.AddressFamily == AddressFamily.InterNetworkV6 && ip.IsIPv6LinkLocal) {
-                    _logger.LogDebug("mDNS A/AAAA {Ip} for {Name} dropped: no local interface on its link", ip, name);
-                    return offset;
-                }
-            }
 
+            // ALWAYS record the address — including IPv6 link-local (fe80::). Real iOS devices advertise
+            // mobdev2 with ONLY an IPv6 link-local AAAA record (verified via dns-sd, #1914), so dropping
+            // link-local would resolve every such device to zero connectable addresses. The zone index is
+            // carried by Address.FullIp ("fe80::...%iface"); PickInterfaceForIp supplies the matching
+            // local interface so the scope is correct. An empty iface is still recorded (best effort)
+            // rather than discarded — discarding here is exactly what broke WiFi discovery.
             if (!hostAddrs.ContainsKey(name)) {
                 hostAddrs[name] = [];
             }
             List<Address> existing = hostAddrs[name];
             if (!existing.Exists(a => a.Ip == ip.ToString())) {
                 existing.Add(new Address(ip.ToString(), iface));
+                _logger.LogDebug("mDNS {Type} {Ip} for {Name} on interface '{Interface}'",
+                    ip.AddressFamily == AddressFamily.InterNetworkV6 ? "AAAA" : "A", ip, name, iface);
             }
         }
 
         return offset;
     }
 
+    /// <summary>
+    /// Finds the local interface that can reach <paramref name="ip"/> and returns the zone token to use
+    /// in a scoped address. For IPv6 this is the interface INDEX (the zone Windows requires in
+    /// "fe80::...%index"); for IPv4 it is the interface name (informational — IPv4 has no zone).
+    /// Returns empty if no local interface matches.
+    /// </summary>
     private string PickInterfaceForIp(IPAddress ip) {
         foreach (NetworkInterface ni in _interfaces) {
             IPInterfaceProperties props = ni.GetIPProperties();
@@ -226,9 +232,16 @@ internal class MdnsBrowser {
                         return ni.Name;
                     }
                 }
-                else {
-                    if (ip.IsIPv6LinkLocal) {
-                        return ni.Name;
+                else if (ip.IsIPv6LinkLocal) {
+                    // The zone for a link-local IPv6 address is the interface index, and the device's
+                    // advertised link-local is reachable on any interface that itself has a link-local
+                    // address. Return the index so Address.FullIp produces a Windows-valid "fe80::...%N".
+                    try {
+                        return ni.GetIPProperties().GetIPv6Properties().Index
+                            .ToString(System.Globalization.CultureInfo.InvariantCulture);
+                    }
+                    catch {
+                        // Interface has no IPv6 properties — keep scanning.
                     }
                 }
             }
@@ -264,36 +277,69 @@ internal class MdnsBrowser {
         // poll timer could not tick again, and the detector logged "Starting" then went silent with
         // zero sightings (ScribeHold #1914). Treating the value as the milliseconds it has always been
         // named makes a sweep the intended ~2s.
-        DateTime endTime = DateTime.UtcNow.AddMilliseconds(timeout);
-        while (DateTime.UtcNow < endTime) {
-            List<Task<UdpReceiveResult>> tasks = [];
-            if (_clientV4.Available > 0) {
-                tasks.Add(_clientV4.ReceiveAsync());
-            }
-            if (_clientV6.Available > 0) {
-                tasks.Add(_clientV6.ReceiveAsync());
-            }
-            if (tasks.Count == 0) {
-                await Task.Delay(50);
-                continue;
-            }
+        TimeSpan window = TimeSpan.FromMilliseconds(timeout);
 
-            Task<UdpReceiveResult> completed = await Task.WhenAny(tasks).ConfigureAwait(false);
-            UdpReceiveResult result = completed.Result;
-            byte[] data = result.Buffer;
-            packetsReceived++;
-            _logger.LogTrace("mDNS packet #{Index} received: {Bytes} bytes from {Source}",
-                packetsReceived, data.Length, result.RemoteEndPoint);
+        // Continuously-pending receive on each socket, awaited against a single overall deadline.
+        //
+        // The previous loop only issued ReceiveAsync() when UdpClient.Available > 0 at poll time and
+        // otherwise slept 50ms. mDNS responses arrive within a few ms of the query, so the response
+        // routinely landed during a sleep and only ONE buffered datagram was drained per 50ms tick —
+        // on a real device this surfaced as "1 packet received, 0 PTR" while `dns-sd` (which keeps a
+        // receive outstanding) saw the advert fine (ScribeHold #1914). Keeping a pending ReceiveAsync
+        // on each socket means every datagram is taken the instant it arrives, for the whole window.
+        using var deadline = new CancellationTokenSource(window);
+        Task<UdpReceiveResult>? recvV4 = null;
+        Task<UdpReceiveResult>? recvV6 = null;
+        try {
+            while (!deadline.IsCancellationRequested) {
+                recvV4 ??= _clientV4.ReceiveAsync(deadline.Token).AsTask();
+                recvV6 ??= _clientV6.ReceiveAsync(deadline.Token).AsTask();
 
-            try {
-                ParseMdnsMessage(data, ptrTargets, srvMap, txtMap, hostAddrs);
+                Task<UdpReceiveResult> completed = await Task.WhenAny(recvV4, recvV6).ConfigureAwait(false);
+
+                UdpReceiveResult result;
+                try {
+                    result = await completed.ConfigureAwait(false);
+                }
+                catch (OperationCanceledException) {
+                    break; // window elapsed
+                }
+                catch (Exception ex) {
+                    // Socket-level read error on one stack — log, clear that pending task, keep listening
+                    // on the other for the rest of the window.
+                    if (completed == recvV4) { recvV4 = null; } else { recvV6 = null; }
+                    _logger.LogDebug(ex, "mDNS receive error; continuing to listen");
+                    continue;
+                }
+
+                // Re-arm the socket whose receive just completed; leave the other pending.
+                if (completed == recvV4) { recvV4 = null; } else { recvV6 = null; }
+
+                byte[] data = result.Buffer;
+                packetsReceived++;
+                // Debug (not Trace) so the per-packet source is visible at the service's default Debug
+                // level: a sweep reporting "0 advertisements" is otherwise indistinguishable between
+                // "the only packets came from unrelated mDNS responders" and "our target's advert
+                // arrived but was not parsed". The source IP tells which device/subnet answered (#1914).
+                _logger.LogDebug("mDNS packet #{Index} received: {Bytes} bytes from {Source}",
+                    packetsReceived, data.Length, result.RemoteEndPoint);
+
+                try {
+                    ParseMdnsMessage(data, ptrTargets, srvMap, txtMap, hostAddrs);
+                }
+                catch (Exception ex) {
+                    // A single malformed packet must not abort the browse, but it was previously swallowed
+                    // silently — count and log it so a parse-side failure is distinguishable from "no packets".
+                    parseFailures++;
+                    _logger.LogDebug(ex, "mDNS packet #{Index} from {Source} failed to parse", packetsReceived, result.RemoteEndPoint);
+                }
             }
-            catch (Exception ex) {
-                // A single malformed packet must not abort the browse, but it was previously swallowed
-                // silently — count and log it so a parse-side failure is distinguishable from "no packets".
-                parseFailures++;
-                _logger.LogDebug(ex, "mDNS packet #{Index} from {Source} failed to parse", packetsReceived, result.RemoteEndPoint);
-            }
+        }
+        finally {
+            // Observe any still-pending receive's cancellation so it doesn't surface as an unobserved
+            // task exception when the sockets close below.
+            await ObserveCancelled(recvV4).ConfigureAwait(false);
+            await ObserveCancelled(recvV6).ConfigureAwait(false);
         }
 
         // Single-arg DropMulticastGroup does not symmetrically drop the per-interface IPv4 memberships
@@ -332,14 +378,41 @@ internal class MdnsBrowser {
         return services;
     }
 
+    /// <summary>
+    /// Awaits a possibly-null pending receive task, swallowing the cancellation/socket-closed exception
+    /// it throws when the browse window ends. Prevents an unobserved-task exception when the sockets close.
+    /// </summary>
+    private static async Task ObserveCancelled(Task<UdpReceiveResult>? pending) {
+        if (pending is null) {
+            return;
+        }
+        try {
+            await pending.ConfigureAwait(false);
+        }
+        catch {
+            // Expected: the receive was cancelled by the deadline or the socket was closed.
+        }
+    }
+
     public async Task SendQuery(byte[] query) {
-        await _clientV4.SendAsync(query, query.Length, new IPEndPoint(IPAddress.Parse(MdnsMulticastV4), MdnsPort));
+        var v4Target = new IPEndPoint(IPAddress.Parse(MdnsMulticastV4), MdnsPort);
+        await _clientV4.SendAsync(query, query.Length, v4Target).ConfigureAwait(false);
+
+        // Send the IPv6 query once PER interface index, setting the multicast egress interface each time.
+        // The previous loop sent N copies but never varied the outgoing interface (MulticastInterface
+        // socket option), so every copy left via the default interface and the query never reached a
+        // device whose link-local advert lives on a non-default NIC (e.g. Wi-Fi). iOS devices advertise
+        // mobdev2 on IPv6 link-local, so reaching the right interface is what makes them discoverable.
+        var v6Target = new IPEndPoint(IPAddress.Parse(MdnsMulticastV6), MdnsPort);
         for (int i = 0; i < _interfaces.Length; i++) {
             try {
-                await _clientV6.SendAsync(query, query.Length, new IPEndPoint(IPAddress.Parse(MdnsMulticastV6), MdnsPort));
+                // IPv6 MulticastInterface takes the interface INDEX in host order (unlike the IPv4
+                // option, which takes a network-order address). i is the index we joined the group on.
+                _clientV6.Client.SetSocketOption(SocketOptionLevel.IPv6, SocketOptionName.MulticastInterface, i);
+                await _clientV6.SendAsync(query, query.Length, v6Target).ConfigureAwait(false);
             }
             catch {
-                // Catch any errors that might occurs and skip onto the next one
+                // Interface may have no IPv6 / be down — skip onto the next one.
                 continue;
             }
         }

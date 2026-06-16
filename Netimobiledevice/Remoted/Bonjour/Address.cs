@@ -11,7 +11,10 @@ public class Address(string ip, string @interface) {
 
     public string FullIp {
         get {
-            if (Interface != null && Ip.StartsWith("fe80:", StringComparison.OrdinalIgnoreCase)) {
+            // A link-local IPv6 address (fe80::) is unroutable without a zone index, so append "%<zone>".
+            // Guard against an empty zone — "fe80::...%" is invalid and worse than the bare address
+            // (ScribeHold #1914). Interface carries the zone token (the interface index on Windows).
+            if (!string.IsNullOrEmpty(Interface) && Ip.StartsWith("fe80:", StringComparison.OrdinalIgnoreCase)) {
                 return $"{Ip}%{Interface}";
             }
             return Ip;
