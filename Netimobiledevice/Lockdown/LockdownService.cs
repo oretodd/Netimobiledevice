@@ -147,27 +147,33 @@ public abstract class LockdownService : IDisposable {
             }
 
             foreach (Address address in answer.Addresses) {
+                // Use FullIp, not Ip: iOS advertises mobdev2 on an IPv6 LINK-LOCAL address (fe80::...),
+                // which is unroutable without its zone index. Address.FullIp appends "%<interface>" for
+                // fe80: addresses so the socket can scope it; connecting to the bare Ip fails with an
+                // invalid-argument / no-route error (ScribeHold #1914). The zone-scoped endpoint is also
+                // what we yield, so the backup path reconnects to the same scoped address.
+                string endpoint = address.FullIp;
                 TcpLockdownClient lockdown;
                 try {
-                    lockdown = MobileDevice.CreateUsingTcp(hostname: address.Ip, autopair: false, pairRecord: record);
+                    lockdown = MobileDevice.CreateUsingTcp(hostname: endpoint, autopair: false, pairRecord: record);
                 }
                 catch (Exception ex) {
                     // The TCP lockdown connect/handshake to a matched, advertised device failed. This was
                     // previously swallowed silently, hiding a "matched but cannot connect" failure mode
                     // (wrong port, unreachable IP, handshake reject) behind a zero-device sweep.
                     logger.LogInformation(ex, "mobdev2 device {Instance} at {Endpoint} matched but TCP lockdown connect failed",
-                        answer.Instance, address.Ip);
+                        answer.Instance, endpoint);
                     continue;
                 }
 
                 if (onlyPaired && !lockdown.IsPaired) {
                     logger.LogDebug("mobdev2 device {Instance} at {Endpoint} connected but is not paired; skipping",
-                        answer.Instance, address.Ip);
+                        answer.Instance, endpoint);
                     lockdown.Close();
                     continue;
                 }
-                logger.LogDebug("mobdev2 device {Instance} reachable at {Endpoint}", answer.Instance, address.Ip);
-                yield return (address.Ip, lockdown);
+                logger.LogDebug("mobdev2 device {Instance} reachable at {Endpoint}", answer.Instance, endpoint);
+                yield return (endpoint, lockdown);
             }
         }
 
