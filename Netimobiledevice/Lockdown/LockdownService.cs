@@ -65,8 +65,11 @@ public abstract class LockdownService : IDisposable {
         string? udid = null,
         string? pairRecordsPath = null,
         bool onlyPaired = false,
-        int timeout = BonjourService.DEFAULT_BONJOUR_TIMEOUT
+        int timeout = BonjourService.DEFAULT_BONJOUR_TIMEOUT,
+        ILogger? logger = null
     ) {
+        logger ??= NullLogger.Instance;
+
         Dictionary<string, DictionaryNode> records = [];
         DirectoryInfo pairRecordsDirectory = new DirectoryInfo(pairRecordsPath ?? "");
         foreach (FileInfo file in pairRecordsDirectory.GetFiles("*.plist")) {
@@ -81,18 +84,32 @@ public abstract class LockdownService : IDisposable {
             }
 
             DictionaryNode record = PropertyList.LoadFromByteArray(File.ReadAllBytes(file.FullName)).AsDictionaryNode();
-            string wiFiMACAddress = record["WiFiMACAddress"].AsStringNode().Value;
-            records.Add(wiFiMACAddress, record);
+
+            // A pair record without a WiFiMACAddress cannot be matched to a mobdev2 advertisement
+            // (the Bonjour instance name is keyed on the device's WiFi MAC). Skip it rather than
+            // throwing KeyNotFoundException — only this one keyless record is dropped; every record
+            // that DOES carry the key still resolves normally.
+            if (!record.TryGetValue("WiFiMACAddress", out PropertyNode? wiFiMACAddressNode)) {
+                logger.LogDebug("Skipping pair record {RecordUdid}: no WiFiMACAddress key present", recordUdid);
+                continue;
+            }
+
+            records[wiFiMACAddressNode.AsStringNode().Value] = record;
         }
 
         foreach (ServiceInstance answer in await BonjourService.BrowseMobdev2Async(timeout).ConfigureAwait(false)) {
             if (!answer.Instance.Contains('@')) {
                 continue;
             }
-            string wifiMacAddress = answer.Instance.Split('@', 1)[0];
-            DictionaryNode record = records[wifiMacAddress];
+            // The mobdev2 instance name is "<wifiMacAddress>@<host>". Split on '@' and take the MAC;
+            // Split('@')[0] (no count limit) is required — a count of 1 would return the whole string.
+            string wifiMacAddress = answer.Instance.Split('@')[0];
 
-            if (onlyPaired && record == null) {
+            // No on-disk pair record matched this advertisement's WiFi MAC. Treat absence as
+            // "not a paired device we know" and skip the advertisement instead of indexing the
+            // dictionary (which would throw KeyNotFoundException). Honours onlyPaired for free.
+            if (!records.TryGetValue(wifiMacAddress, out DictionaryNode? record)) {
+                logger.LogDebug("Skipping mobdev2 advertisement {Instance}: no matching pair record", answer.Instance);
                 continue;
             }
 
