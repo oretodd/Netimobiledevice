@@ -70,6 +70,16 @@ public abstract class LockdownService : IDisposable {
     ) {
         logger ??= NullLogger.Instance;
 
+        // Per-sweep diagnostic counters. A zero-result sweep was previously silent, so "nothing is
+        // advertising on the LAN" was indistinguishable from "everything advertising was skipped".
+        // These are logged as a single summary line after the browse so the cause of a 0-device sweep
+        // is visible in the log (ScribeHold #1905).
+        int recordsLoaded = 0;
+        int recordsSkippedNoMac = 0;
+        int advertisementsSeen = 0;
+        int advertisementsMatched = 0;
+        int advertisementsUnmatched = 0;
+
         Dictionary<string, DictionaryNode> records = [];
         DirectoryInfo pairRecordsDirectory = new DirectoryInfo(pairRecordsPath ?? "");
         foreach (FileInfo file in pairRecordsDirectory.GetFiles("*.plist")) {
@@ -90,17 +100,29 @@ public abstract class LockdownService : IDisposable {
             // throwing KeyNotFoundException — only this one keyless record is dropped; every record
             // that DOES carry the key still resolves normally.
             if (!record.TryGetValue("WiFiMACAddress", out PropertyNode? wiFiMACAddressNode)) {
+                recordsSkippedNoMac++;
                 logger.LogDebug("Skipping pair record {RecordUdid}: no WiFiMACAddress key present", recordUdid);
                 continue;
             }
 
             records[wiFiMACAddressNode.AsStringNode().Value] = record;
+            recordsLoaded++;
         }
 
-        foreach (ServiceInstance answer in await BonjourService.BrowseMobdev2Async(timeout).ConfigureAwait(false)) {
+        List<ServiceInstance> advertisements = await BonjourService.BrowseMobdev2Async(timeout).ConfigureAwait(false);
+        // One summary line per sweep makes the failure mode diagnosable: 0 advertisements => nothing
+        // is broadcasting mobdev2 on the LAN; advertisements > matched => paired records are missing
+        // the WiFiMACAddress key (or the keys disagree). recordsSkippedNoMac surfaces Apple-written
+        // records that carry no WiFi MAC and so can never match (ScribeHold #1905).
+        logger.LogInformation(
+            "mobdev2 sweep: {RecordsLoaded} matchable pair record(s), {RecordsSkippedNoMac} skipped (no WiFiMACAddress), {AdvertisementsSeen} advertisement(s) browsed",
+            recordsLoaded, recordsSkippedNoMac, advertisements.Count);
+
+        foreach (ServiceInstance answer in advertisements) {
             if (!answer.Instance.Contains('@')) {
                 continue;
             }
+            advertisementsSeen++;
             // The mobdev2 instance name is "<wifiMacAddress>@<host>". Split on '@' and take the MAC;
             // Split('@')[0] (no count limit) is required — a count of 1 would return the whole string.
             string wifiMacAddress = answer.Instance.Split('@')[0];
@@ -109,10 +131,12 @@ public abstract class LockdownService : IDisposable {
             // "not a paired device we know" and skip the advertisement instead of indexing the
             // dictionary (which would throw KeyNotFoundException). Honours onlyPaired for free.
             if (!records.TryGetValue(wifiMacAddress, out DictionaryNode? record)) {
+                advertisementsUnmatched++;
                 logger.LogDebug("Skipping mobdev2 advertisement {Instance}: no matching pair record", answer.Instance);
                 continue;
             }
 
+            advertisementsMatched++;
             foreach (Address address in answer.Addresses) {
                 TcpLockdownClient lockdown;
                 try {
@@ -129,5 +153,12 @@ public abstract class LockdownService : IDisposable {
                 yield return (address.Ip, lockdown);
             }
         }
+
+        // Outcome summary: how the browsed advertisements resolved. matched=0 with seen>0 is the
+        // tell-tale of the WiFiMACAddress mismatch — paired devices ARE advertising but no on-disk
+        // record's WiFi MAC matches them (ScribeHold #1905).
+        logger.LogInformation(
+            "mobdev2 sweep result: {AdvertisementsMatched} matched, {AdvertisementsUnmatched} unmatched of {AdvertisementsSeen} advertisement(s)",
+            advertisementsMatched, advertisementsUnmatched, advertisementsSeen);
     }
 }
