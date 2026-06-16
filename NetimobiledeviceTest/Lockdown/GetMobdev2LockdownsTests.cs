@@ -123,4 +123,33 @@ public class GetMobdev2LockdownsTests
             Directory.Delete(dir, recursive: true);
         }
     }
+
+    [TestMethod]
+    public async Task Sweep_EmitsMdnsBrowseSummary_MakingTheBonjourLayerObservable()
+    {
+        // ScribeHold #1914: the mDNS browser layer (MdnsBrowser/BonjourService) was previously SILENT —
+        // a zero-result sweep could not be distinguished from "the browse never ran". The logger now
+        // flows GetMobdev2Lockdowns -> BonjourService.BrowseMobdev2Async -> MdnsBrowser, which emits a
+        // per-browse summary (packets received, parse failures, PTR/SRV counts, resolved instances).
+        // On a device-free CI host the browse resolves nothing, but the summary line MUST still appear —
+        // that is exactly what proves the Bonjour chain is now observable end-to-end.
+        string dir = Directory.CreateTempSubdirectory("nimd-1914-").FullName;
+        CapturingLogger logger = new();
+        try {
+            WriteRecord(dir, "00008110-AAAA1111BBBB2222", withWiFiMac: true);
+
+            await DrainAsync(dir, logger);
+
+            bool hasBrowseSummary = logger.Messages.Exists(m =>
+                m.Contains("mDNS browse") &&
+                m.Contains("_apple-mobdev2._tcp.local.") &&
+                m.Contains("packet(s) received"));
+            Assert.IsTrue(hasBrowseSummary,
+                "Expected an mDNS browse summary line proving the Bonjour layer is instrumented. Messages: "
+                + string.Join(" | ", logger.Messages));
+        }
+        finally {
+            Directory.Delete(dir, recursive: true);
+        }
+    }
 }
