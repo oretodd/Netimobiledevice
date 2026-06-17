@@ -139,17 +139,26 @@ internal class MdnsBrowser : IDisposable {
         if (offset + rdlen > data.Length) {
             return offset;
         }
+        // Record the rdata's START OFFSET within the FULL packet before copying it out. PTR/SRV targets use
+        // DNS name compression (RFC 1035 §4.1.4) whose pointers reference offsets in the WHOLE message, not
+        // within the isolated rdata slice — so the target MUST be decoded against `data` from rdataStart,
+        // never against a copied `rdata` array. Decoding from the slice loses the compression pointer and
+        // yields a bare "." target that never resolves (verified on real devices, VPN on: every SRV came
+        // back as ".:32498" until this was fixed). The `rdata` copy is still used for TXT/A/AAAA, whose
+        // rdata is self-contained (no compression).
+        int rdataStart = offset;
         byte[] rdata = new byte[rdlen];
         Array.Copy(data, offset, rdata, 0, rdlen);
         offset += rdlen;
 
         if (rtype == DnsHelpers.QTYPE_PTR) {
-            (string? target, int _) = DnsHelpers.DecodeName(rdata, 0);
+            (string? target, int _) = DnsHelpers.DecodeName(data, rdataStart);
             sink.AddPtr(name, target, ttl);
         }
         else if (rtype == DnsHelpers.QTYPE_SRV && rdlen >= 6) {
             ushort port = (ushort) ((rdata[4] << 8) | rdata[5]);
-            (string? target, int _) = DnsHelpers.DecodeName(rdata, 6);
+            // Priority(2)+Weight(2)+Port(2) precede the target name at rdataStart+6 in the full packet.
+            (string? target, int _) = DnsHelpers.DecodeName(data, rdataStart + 6);
             sink.AddSrv(name, new Service(target, port), ttl);
         }
         else if (rtype == DnsHelpers.QTYPE_TXT) {
