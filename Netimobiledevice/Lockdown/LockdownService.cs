@@ -80,7 +80,12 @@ public abstract class LockdownService : IDisposable {
         int advertisementsMatched = 0;
         int advertisementsUnmatched = 0;
 
-        Dictionary<string, DictionaryNode> records = [];
+        // Two views of the on-disk pair records: MAC -> UDID (the fast advertisement match) and UDID ->
+        // record (every loadable record, the source of truth used by both paths and the identity-probe
+        // fallback). A record is kept in recordsByUdid even when it has no WiFiMACAddress, because the
+        // fallback can still identify the device by connecting with it — the MAC key is only the fast index.
+        Dictionary<string, string> macToUdid = new(StringComparer.OrdinalIgnoreCase);
+        Dictionary<string, DictionaryNode> recordsByUdid = [];
         DirectoryInfo pairRecordsDirectory = new DirectoryInfo(pairRecordsPath ?? "");
         foreach (FileInfo file in pairRecordsDirectory.GetFiles("*.plist")) {
             if (file.Name.StartsWith("remote_", StringComparison.InvariantCulture)) {
@@ -94,20 +99,25 @@ public abstract class LockdownService : IDisposable {
             }
 
             DictionaryNode record = PropertyList.LoadFromByteArray(File.ReadAllBytes(file.FullName)).AsDictionaryNode();
+            recordsByUdid[recordUdid] = record;
 
-            // A pair record without a WiFiMACAddress cannot be matched to a mobdev2 advertisement
-            // (the Bonjour instance name is keyed on the device's WiFi MAC). Skip it rather than
-            // throwing KeyNotFoundException — only this one keyless record is dropped; every record
-            // that DOES carry the key still resolves normally.
+            // A pair record without a WiFiMACAddress cannot be matched to a mobdev2 advertisement by the
+            // FAST path (the Bonjour instance name is keyed on the device's WiFi MAC). It is still kept in
+            // recordsByUdid for the identity-probe fallback. Skip only the MAC-index insert rather than
+            // throwing KeyNotFoundException.
             if (!record.TryGetValue("WiFiMACAddress", out PropertyNode? wiFiMACAddressNode)) {
                 recordsSkippedNoMac++;
-                logger.LogDebug("Skipping pair record {RecordUdid}: no WiFiMACAddress key present", recordUdid);
+                logger.LogDebug("Pair record {RecordUdid}: no WiFiMACAddress key (fast match skipped; eligible for identity-probe fallback)", recordUdid);
                 continue;
             }
 
-            records[wiFiMACAddressNode.AsStringNode().Value] = record;
+            macToUdid[wiFiMACAddressNode.AsStringNode().Value] = recordUdid;
             recordsLoaded++;
         }
+
+        // UDIDs already resolved this sweep (via fast MAC match or the identity probe), so the probe does
+        // not re-test a record that the fast path already consumed and a device is not yielded twice.
+        HashSet<string> resolvedUdids = new(StringComparer.OrdinalIgnoreCase);
 
         List<ServiceInstance> advertisements = await BonjourService.BrowseMobdev2Async(timeout, logger).ConfigureAwait(false);
         // One summary line per sweep makes the failure mode diagnosable: 0 advertisements => nothing
@@ -127,66 +137,66 @@ public abstract class LockdownService : IDisposable {
             // Split('@')[0] (no count limit) is required — a count of 1 would return the whole string.
             string wifiMacAddress = answer.Instance.Split('@')[0];
 
-            // No on-disk pair record matched this advertisement's WiFi MAC. Treat absence as
-            // "not a paired device we know" and skip the advertisement instead of indexing the
-            // dictionary (which would throw KeyNotFoundException). Honours onlyPaired for free.
-            if (!records.TryGetValue(wifiMacAddress, out DictionaryNode? record)) {
-                advertisementsUnmatched++;
-                logger.LogDebug("Skipping mobdev2 advertisement {Instance}: no matching pair record", answer.Instance);
+            // IPv4-first candidate endpoints for this advertisement (see OrderIpv4First). On a Wi-Fi NIC
+            // with no IPv6 route every fe80::/fd8d:: connect throws WSAENETUNREACH; ordering IPv4 first
+            // makes the routable A record (192.168.68.x) the first attempt (#1923).
+            List<Address> ordered = OrderIpv4First(answer.Addresses);
+
+            if (macToUdid.TryGetValue(wifiMacAddress, out string? matchedUdid)
+                && recordsByUdid.TryGetValue(matchedUdid, out DictionaryNode? record)) {
+                // FAST PATH: the advertisement's WiFi MAC matches an on-disk pair record's WiFiMACAddress.
+                advertisementsMatched++;
+                if (answer.Addresses.Count == 0) {
+                    logger.LogInformation(
+                        "mobdev2 advertisement {Instance} matched a pair record but resolved no IP address (SRV/A not received in time)",
+                        answer.Instance);
+                }
+                logger.LogDebug("mobdev2 device {Instance} connect candidates (IPv4-first): [{Candidates}]",
+                    answer.Instance, string.Join(", ", ordered.ConvertAll(a => a.FullIp)));
+
+                (string Endpoint, TcpLockdownClient Client)? hit = TryConnectWithRecord(ordered, record, matchedUdid, answer.Instance, onlyPaired, logger);
+                if (hit is { } h) {
+                    resolvedUdids.Add(matchedUdid);
+                    yield return (h.Endpoint, h.Client);
+                }
                 continue;
             }
 
-            advertisementsMatched++;
-            // A matched advertisement with NO addresses means the SRV/A resolution did not complete
-            // within the browse window — the device is advertising and paired, but we have no IP to
-            // connect to. Surface that explicitly; it is otherwise an invisible dead-end.
-            if (answer.Addresses.Count == 0) {
-                logger.LogInformation(
-                    "mobdev2 advertisement {Instance} matched a pair record but resolved no IP address (SRV/A not received in time)",
-                    answer.Instance);
+            // FALLBACK: no record's WiFiMACAddress matches this advertisement. This is the normal case for
+            // an iOS device using PRIVATE WI-FI ADDRESS (MAC randomization): the device advertises mobdev2
+            // with its randomized per-network Wi-Fi MAC, while the pair record stores the HARDWARE MAC
+            // (read over lockdown as WiFiAddress), so the two never match (verified on a real device:
+            // toddfone advertises ce:dd:a6:... but its pair record's WiFiMACAddress is 58:66:6d:... — #1923).
+            // The device IS paired; we just cannot identify it by MAC. Identify it instead by PROBING: try
+            // each not-yet-resolved pair record against the advertised IPv4 endpoint — the record whose
+            // lockdown handshake succeeds (no GetProhibited) is this device. MAC-free, works over Wi-Fi.
+            advertisementsUnmatched++;
+            if (ordered.Count == 0) {
+                logger.LogDebug("mobdev2 advertisement {Instance}: no pair record matched the MAC and no address to identity-probe", answer.Instance);
+                continue;
             }
+            logger.LogInformation(
+                "mobdev2 advertisement {Instance}: WiFi MAC matched no pair record (likely iOS Private Wi-Fi Address); identity-probing {Count} pair record(s) against the advertised endpoint",
+                answer.Instance, recordsByUdid.Count);
 
-            // Try the device's IPv4 (A-record) address FIRST, then IPv6. On a Wi-Fi NIC with no working
-            // IPv6 route (the owner's machine — #1923) every IPv6 connect to the device's fe80::/fd8d::
-            // AAAA address fails immediately with WSAENETUNREACH (10051), and the routable IPv4 A record
-            // (192.168.68.x — the prototype proved the device answers IPv4 on Wi-Fi and a lockdown connect
-            // to 192.168.68.88:62078 succeeds) was never reached / tried last. Ordering IPv4 first makes the
-            // routable address the first attempt; IPv6 remains a fallback for hosts that DO have IPv6 on the
-            // mDNS interface. A stable ordered copy is logged so a "no IPv4 candidate" case is visible.
-            List<Address> ordered = OrderIpv4First(answer.Addresses);
-            logger.LogDebug("mobdev2 device {Instance} connect candidates (IPv4-first): [{Candidates}]",
-                answer.Instance, string.Join(", ", ordered.ConvertAll(a => a.FullIp)));
-
-            foreach (Address address in ordered) {
-                // Use FullIp, not Ip: iOS advertises mobdev2 on an IPv6 LINK-LOCAL address (fe80::...),
-                // which is unroutable without its zone index. Address.FullIp appends "%<interface>" for
-                // fe80: addresses so the socket can scope it; connecting to the bare Ip fails with an
-                // invalid-argument / no-route error (ScribeHold #1914). The zone-scoped endpoint is also
-                // what we yield, so the backup path reconnects to the same scoped address. (IPv4 A records
-                // have no zone, so FullIp returns the bare routable address — what we want.)
-                string endpoint = address.FullIp;
-                TcpLockdownClient lockdown;
-                try {
-                    lockdown = MobileDevice.CreateUsingTcp(hostname: endpoint, autopair: false, pairRecord: record);
+            (string Endpoint, TcpLockdownClient Client)? probed = null;
+            foreach ((string candidateUdid, DictionaryNode candidateRecord) in recordsByUdid) {
+                if (resolvedUdids.Contains(candidateUdid)) {
+                    continue; // already yielded this device this sweep
                 }
-                catch (Exception ex) {
-                    // The TCP lockdown connect/handshake to a matched, advertised device failed (e.g. an
-                    // IPv6 candidate on a NIC with no IPv6 route => WSAENETUNREACH). KEEP TRYING the
-                    // remaining candidates — the next one may be the routable IPv4 address — instead of
-                    // letting the first failure abort the device (#1923).
-                    logger.LogInformation(ex, "mobdev2 device {Instance} at {Endpoint} matched but TCP lockdown connect failed; trying next candidate",
-                        answer.Instance, endpoint);
-                    continue;
+                probed = TryConnectWithRecord(ordered, candidateRecord, candidateUdid, answer.Instance, onlyPaired, logger);
+                if (probed is { } p) {
+                    resolvedUdids.Add(candidateUdid);
+                    advertisementsMatched++;
+                    logger.LogInformation(
+                        "mobdev2 advertisement {Instance} identity-probed to pair record {Udid} at {Endpoint} (Private Wi-Fi Address match)",
+                        answer.Instance, candidateUdid, p.Endpoint);
+                    yield return (p.Endpoint, p.Client);
+                    break;
                 }
-
-                if (onlyPaired && !lockdown.IsPaired) {
-                    logger.LogDebug("mobdev2 device {Instance} at {Endpoint} connected but is not paired; skipping",
-                        answer.Instance, endpoint);
-                    lockdown.Close();
-                    continue;
-                }
-                logger.LogDebug("mobdev2 device {Instance} reachable at {Endpoint}", answer.Instance, endpoint);
-                yield return (endpoint, lockdown);
+            }
+            if (probed is null) {
+                logger.LogDebug("mobdev2 advertisement {Instance}: identity probe matched no pair record", answer.Instance);
             }
         }
 
@@ -205,6 +215,72 @@ public abstract class LockdownService : IDisposable {
     /// IPv4 vs IPv6 is decided by the presence of ':' in the address string (IPv6 contains colons; an
     /// IPv4 dotted-quad does not), avoiding an IPAddress.Parse of the already-zone-scoped FullIp.
     /// </summary>
+    /// <summary>
+    /// Try to open a lockdown connection to <paramref name="orderedAddresses"/> (IPv4-first) using
+    /// <paramref name="record"/> as the pair record (autopair disabled), and VERIFY the connected device's
+    /// UDID matches <paramref name="expectedUdid"/>. Returns the first endpoint that connects, verifies, and
+    /// (if <paramref name="onlyPaired"/>) is paired; null if none succeed. Used by both the fast MAC-match
+    /// path and the identity-probe fallback.
+    /// <para>
+    /// The UDID verification is ESSENTIAL for the identity probe: with <c>autopair:false</c> the lockdown
+    /// CONSTRUCTOR succeeds for any reachable device regardless of which pair record is supplied (the
+    /// pairing is only exercised by a session-requiring call). The discriminator is a session-gated read:
+    /// <c>GetValue("UniqueDeviceID")</c> returns the real UDID only when the record is valid for THAT device
+    /// and throws <c>GetProhibited</c> for a foreign record (verified on a real device — #1923). So probing
+    /// record R against an advertised endpoint must read the UDID and confirm it equals R's UDID; a bare
+    /// successful construct is NOT proof of identity.
+    /// </para>
+    /// A per-address/per-record failure (WSAENETUNREACH on IPv6, GetProhibited on a foreign record, or a
+    /// UDID mismatch) is logged and the next candidate is tried — never aborts the sweep.
+    /// </summary>
+    private static (string Endpoint, TcpLockdownClient Client)? TryConnectWithRecord(
+        List<Address> orderedAddresses, DictionaryNode record, string expectedUdid, string instance, bool onlyPaired, ILogger logger) {
+        foreach (Address address in orderedAddresses) {
+            // FullIp scopes an fe80:: address with its zone (#1914); IPv4 A records return the bare IP.
+            string endpoint = address.FullIp;
+            TcpLockdownClient lockdown;
+            try {
+                lockdown = MobileDevice.CreateUsingTcp(hostname: endpoint, autopair: false, pairRecord: record);
+            }
+            catch (Exception ex) {
+                logger.LogInformation(ex, "mobdev2 device {Instance} at {Endpoint} lockdown connect failed; trying next candidate",
+                    instance, endpoint);
+                continue;
+            }
+
+            // Verify identity: a session-gated UDID read confirms the pair record is valid for THIS device.
+            // Throws GetProhibited for a foreign record; returns the device's UDID otherwise.
+            string actualUdid;
+            try {
+                actualUdid = lockdown.GetValue("UniqueDeviceID")?.AsStringNode().Value ?? string.Empty;
+            }
+            catch (Exception ex) {
+                logger.LogDebug(ex, "mobdev2 device {Instance} at {Endpoint}: pair record not valid for this device (identity read prohibited); trying next candidate",
+                    instance, endpoint);
+                lockdown.Close();
+                continue;
+            }
+
+            if (!string.IsNullOrEmpty(expectedUdid) &&
+                !string.Equals(actualUdid, expectedUdid, StringComparison.OrdinalIgnoreCase)) {
+                logger.LogDebug("mobdev2 device {Instance} at {Endpoint}: connected device UDID {Actual} != record UDID {Expected}; trying next candidate",
+                    instance, endpoint, actualUdid, expectedUdid);
+                lockdown.Close();
+                continue;
+            }
+
+            if (onlyPaired && !lockdown.IsPaired) {
+                logger.LogDebug("mobdev2 device {Instance} at {Endpoint} connected but is not paired; skipping",
+                    instance, endpoint);
+                lockdown.Close();
+                continue;
+            }
+            logger.LogDebug("mobdev2 device {Instance} reachable at {Endpoint}", instance, endpoint);
+            return (endpoint, lockdown);
+        }
+        return null;
+    }
+
     private static List<Address> OrderIpv4First(List<Address> addresses) {
         List<Address> v4 = [];
         List<Address> v6 = [];
