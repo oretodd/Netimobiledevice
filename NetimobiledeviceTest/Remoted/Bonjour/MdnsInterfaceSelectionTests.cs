@@ -7,27 +7,25 @@ using System.Net.Sockets;
 namespace NetimobiledeviceTest.Remoted.Bonjour;
 
 /// <summary>
-/// Regression guard for ScribeHold #1914 QA round 5: the mDNS browser joined / sent on the IPv6
-/// multicast group using the 0..N-1 ARRAY POSITION of each interface in
-/// <see cref="NetworkInterface.GetAllNetworkInterfaces"/>, not the interface's real OS index. On a
-/// host whose Wi-Fi adapter has a sparse index (e.g. 26 — the common case; OS indexes look like
-/// 1,5,10,19,26,32,38,62) the multicast group was NEVER joined on the Wi-Fi NIC, so the
-/// <c>_apple-mobdev2._tcp</c> adverts (which Apple devices send on IPv6 link-local on exactly that
-/// NIC) were never received and discovery resolved zero devices — while <c>dns-sd</c> on the same
-/// machine found them on if 26.
+/// Regression guard for the mDNS interface-selection saga (ScribeHold #1914 rounds 5/6 and #1917).
+///
 /// <para>
-/// The fix joins/sends on the real OS index from
-/// <c>NetworkInterface.GetIPProperties().GetIPv6Properties().Index</c>, and logs the actual joined
-/// index list so a real-device log can confirm the Wi-Fi index is among them.
+/// #1914 round 5: the browser joined/sent on the IPv6 multicast group using the 0..N-1 ARRAY POSITION
+/// of each interface, not its real OS index — on a host whose Wi-Fi adapter has a sparse index the group
+/// was never joined on the Wi-Fi NIC. #1914 round 6: the physical Wi-Fi NIC has no IPv6 stack at all, the
+/// device is reachable over IPv4, and the IPv4 query was sent only once on the OS default egress interface
+/// (a VPN/virtual adapter) so it never egressed the Wi-Fi NIC.
 /// </para>
+///
 /// <para>
-/// QA round 6 (the PRIME root cause): the IPv6 channel is a dead end on the owner's box because the
-/// physical Wi-Fi NIC has no IPv6 stack at all (<c>GetIPv6Properties()</c> throws). The device is
-/// actually reachable over IPv4 (its mobdev2 advert carries a routable A record on the Wi-Fi subnet),
-/// but <c>SendQuery</c> sent the IPv4 query only ONCE on the OS default multicast egress interface —
-/// a VPN/virtual adapter — so it never egressed the Wi-Fi NIC and the device never answered over IPv4.
-/// The fix sends the IPv4 query per joined interface (setting <c>IP_MULTICAST_IF</c> to each joined
-/// local address) and logs the joined IPv4 address list. These tests assert that fan-out.
+/// #1917 (this round): even with the per-NIC SEND fix, RECEIVE used a single <c>IPAddress.Any:5353</c>
+/// socket joined on every interface, so Windows delivered the group's datagrams via the winning (low-metric
+/// VPN/virtual) interface only and the Wi-Fi NIC's inbound adverts were dropped — every sweep saw "0
+/// advertisements" while the adverts were arriving on the Wi-Fi NIC. The fix binds ONE socket per interface
+/// (<see cref="MdnsInterfaceSocket"/>): IPv4 to the interface's own unicast address, IPv6 to IPv6Any + the
+/// real OS index. Each socket then receives ONLY its interface's datagrams and the arrival interface is
+/// exact. These tests assert the per-interface bind covers every multicast-capable NIC with the real OS
+/// index, so a real-device log can confirm the Wi-Fi NIC is among the bound sockets.
 /// </para>
 /// </summary>
 [TestClass]
@@ -44,7 +42,7 @@ public class MdnsInterfaceSelectionTests
 
     /// <summary>
     /// The set of REAL OS IPv6 interface indexes the host actually has, up + multicast-capable. These
-    /// are what a correct join must use. On a multi-NIC box these are sparse and frequently exceed the
+    /// are what a correct bind must use. On a multi-NIC box these are sparse and frequently exceed the
     /// interface COUNT, which is precisely why array-position indexing missed the Wi-Fi NIC.
     /// </summary>
     private static HashSet<int> RealIpv6Indexes()
@@ -64,35 +62,47 @@ public class MdnsInterfaceSelectionTests
         return indexes;
     }
 
-    private static List<int> ParseJoinedIndexes(IEnumerable<string> messages)
+    /// <summary>
+    /// Parse the single combined bind-summary line. Returns the IPv4 token list ("Name=Addr") and the IPv6
+    /// index list. Fails the test if the summary line was not emitted.
+    /// </summary>
+    private static (List<string> v4, List<int> v6) ParseBoundSummary(IEnumerable<string> messages)
     {
-        const string prefix = "mDNS IPv6 multicast joined on interface index(es): [";
+        const string prefix = "mDNS bound IPv4 socket(s) on: [";
         foreach (string m in messages) {
-            int start = m.IndexOf(prefix, StringComparison.Ordinal);
-            if (start < 0) {
+            if (m.IndexOf(prefix, StringComparison.Ordinal) < 0) {
                 continue;
             }
-            int open = m.IndexOf('[', start);
-            int close = m.IndexOf(']', open);
-            string inner = m.Substring(open + 1, close - open - 1).Trim();
-            if (inner.Length == 0) {
-                return [];
-            }
-            return [.. inner.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
-                .Select(int.Parse)];
+            // Format: "mDNS bound IPv4 socket(s) on: [<v4>]; IPv6 socket(s) on if: [<v6>]"
+            int firstOpen = m.IndexOf('[', StringComparison.Ordinal);
+            int firstClose = m.IndexOf(']', firstOpen);
+            int secondOpen = m.IndexOf('[', firstClose);
+            int secondClose = m.IndexOf(']', secondOpen);
+
+            string v4Inner = m.Substring(firstOpen + 1, firstClose - firstOpen - 1).Trim();
+            string v6Inner = m.Substring(secondOpen + 1, secondClose - secondOpen - 1).Trim();
+
+            List<string> v4 = v4Inner.Length == 0
+                ? []
+                : [.. v4Inner.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)];
+            List<int> v6 = v6Inner.Length == 0
+                ? []
+                : [.. v6Inner.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+                    .Select(int.Parse)];
+            return (v4, v6);
         }
-        Assert.Fail("No 'mDNS IPv6 multicast joined on interface index(es)' summary line was emitted. Messages: "
+        Assert.Fail("No 'mDNS bound IPv4 socket(s) on' summary line was emitted. Messages: "
             + string.Join(" | ", messages));
-        return [];
+        return ([], []);
     }
 
     [TestMethod]
-    public void Ctor_LogsJoinedIpv6InterfaceIndexes_AsRealOsIndexes_NotArrayPositions()
+    public void Ctor_BindsIpv6SocketsOnRealOsIndexes_NotArrayPositions()
     {
         CapturingLogger logger = new();
 
-        // Constructing the browser performs the multicast joins and logs the joined index list.
-        _ = new MdnsBrowser(logger);
+        // Constructing the browser binds the per-interface sockets and logs the bound summary.
+        using var browser = new MdnsBrowser(logger);
 
         HashSet<int> realIndexes = RealIpv6Indexes();
         if (realIndexes.Count == 0) {
@@ -100,21 +110,21 @@ public class MdnsInterfaceSelectionTests
             return;
         }
 
-        List<int> joined = ParseJoinedIndexes(logger.Messages);
-        Assert.IsTrue(joined.Count > 0, "Expected at least one joined IPv6 interface index on a host with IPv6 NICs.");
+        (_, List<int> boundV6) = ParseBoundSummary(logger.Messages);
+        Assert.IsTrue(boundV6.Count > 0, "Expected at least one bound IPv6 interface index on a host with IPv6 NICs.");
 
-        // Every joined index must be a REAL OS interface index. Array-position indexing (0..N-1) would
+        // Every bound index must be a REAL OS interface index. Array-position indexing (0..N-1) would
         // produce values that are not in the real-index set whenever the host has any sparse index — the
-        // exact #1914 failure. This is the load-bearing assertion.
-        foreach (int idx in joined) {
+        // #1914 round-5 failure. This is the load-bearing assertion.
+        foreach (int idx in boundV6) {
             Assert.IsTrue(realIndexes.Contains(idx),
-                $"Joined index {idx} is not a real OS IPv6 interface index ({string.Join(",", realIndexes)}). "
+                $"Bound IPv6 index {idx} is not a real OS IPv6 interface index ({string.Join(",", realIndexes)}). "
                 + "This is the #1914 array-position-vs-OS-index bug.");
         }
     }
 
     [TestMethod]
-    public void Ctor_DoesNotEmitDenseZeroBasedIndexSequence_WhenHostHasSparseIndexes()
+    public void Ctor_DoesNotBindDenseZeroBasedIndexSequence_WhenHostHasSparseIndexes()
     {
         // If the host has any sparse IPv6 index (max index >= interface count), a correct implementation
         // CANNOT have produced the dense 0,1,2,... sequence the old code used. This directly catches a
@@ -126,12 +136,12 @@ public class MdnsInterfaceSelectionTests
         }
 
         CapturingLogger logger = new();
-        _ = new MdnsBrowser(logger);
-        List<int> joined = ParseJoinedIndexes(logger.Messages);
+        using var browser = new MdnsBrowser(logger);
+        (_, List<int> boundV6) = ParseBoundSummary(logger.Messages);
 
-        List<int> denseSequence = [.. Enumerable.Range(0, joined.Count)];
-        CollectionAssert.AreNotEqual(denseSequence, joined,
-            "Joined indexes form the dense 0..N-1 sequence — the old array-position bug has regressed.");
+        List<int> denseSequence = [.. Enumerable.Range(0, boundV6.Count)];
+        CollectionAssert.AreNotEqual(denseSequence, boundV6,
+            "Bound indexes form the dense 0..N-1 sequence — the old array-position bug has regressed.");
     }
 
     [TestMethod]
@@ -154,7 +164,7 @@ public class MdnsInterfaceSelectionTests
 
     /// <summary>
     /// The set of local IPv4 unicast addresses on up + multicast-capable interfaces — what a correct
-    /// IPv4 join must collect (and what SendQuery must egress the query out of, one per address).
+    /// per-interface bind must cover (one receive/send socket bound to each).
     /// </summary>
     private static HashSet<string> RealIpv4Addresses()
     {
@@ -172,33 +182,13 @@ public class MdnsInterfaceSelectionTests
         return addrs;
     }
 
-    private static List<string> ParseJoinedIpv4Addresses(IEnumerable<string> messages)
-    {
-        const string prefix = "mDNS IPv4 multicast joined on address(es): [";
-        foreach (string m in messages) {
-            int start = m.IndexOf(prefix, StringComparison.Ordinal);
-            if (start < 0) {
-                continue;
-            }
-            int open = m.IndexOf('[', start);
-            int close = m.IndexOf(']', open);
-            string inner = m.Substring(open + 1, close - open - 1).Trim();
-            if (inner.Length == 0) {
-                return [];
-            }
-            return [.. inner.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)];
-        }
-        return [];
-    }
-
     [TestMethod]
-    public void Ctor_LogsJoinedIpv4Addresses_ForEveryMulticastCapableInterface()
+    public void Ctor_BindsOneIpv4SocketPerMulticastCapableInterface_CoveringEveryNic()
     {
-        // The PRIME #1914 fix: BindUdpV4 must collect EVERY joined IPv4 unicast address (not just join
-        // them on the default interface) so SendQuery can egress the query out of each — including the
-        // physical Wi-Fi NIC's LAN address. On a host with a VPN + virtual switches the OS default
-        // multicast interface is NOT the Wi-Fi NIC, so a single default-egress send never reached the
-        // device; the joined-address list is the evidence the fan-out covers the Wi-Fi NIC.
+        // The #1917 fix: bind ONE socket per interface so each receives ONLY its interface's datagrams,
+        // instead of a single ANY socket whose delivery a low-metric VPN can hijack. The bound-address
+        // list is the evidence the per-interface fan-out covers the physical Wi-Fi NIC's LAN address (and
+        // is not collapsed to a single default NIC).
         HashSet<string> realAddrs = RealIpv4Addresses();
         if (realAddrs.Count == 0) {
             Assert.Inconclusive("Host has no up, multicast-capable IPv4 interface — nothing to assert.");
@@ -206,52 +196,53 @@ public class MdnsInterfaceSelectionTests
         }
 
         CapturingLogger logger = new();
-        _ = new MdnsBrowser(logger);
+        using var browser = new MdnsBrowser(logger);
 
-        List<string> joined = ParseJoinedIpv4Addresses(logger.Messages);
-        Assert.IsTrue(joined.Count > 0,
-            "Expected the 'mDNS IPv4 multicast joined on address(es)' summary line listing the joined "
-            + "IPv4 addresses (the per-interface egress fix for #1914). Messages: "
+        (List<string> boundV4, _) = ParseBoundSummary(logger.Messages);
+        Assert.IsTrue(boundV4.Count > 0,
+            "Expected the bound-summary line to list at least one per-interface IPv4 socket (#1917). Messages: "
             + string.Join(" | ", logger.Messages));
 
-        // Every logged address must be a real local IPv4 unicast address — and on a multi-NIC host the
-        // list must contain more than one (proving the join is NOT collapsed to a single default NIC,
-        // the exact defect that stopped the query reaching the Wi-Fi subnet).
-        foreach (string a in joined) {
-            Assert.IsTrue(realAddrs.Contains(a),
-                $"Joined IPv4 address {a} is not a real local unicast address ({string.Join(",", realAddrs)}).");
+        // Every bound token is "Name=Addr"; the address must be a real local IPv4 unicast address.
+        foreach (string token in boundV4) {
+            int eq = token.LastIndexOf('=');
+            string addr = eq >= 0 ? token[(eq + 1)..] : token;
+            Assert.IsTrue(realAddrs.Contains(addr),
+                $"Bound IPv4 address {addr} is not a real local unicast address ({string.Join(",", realAddrs)}).");
         }
+
+        // On a multi-NIC host the per-interface bind MUST cover more than one address — proving the bind is
+        // not collapsed to a single (possibly VPN/virtual) interface, the exact #1917 receive defect.
         if (realAddrs.Count > 1) {
-            Assert.IsTrue(joined.Count > 1,
-                "Host has multiple IPv4 NICs but only one was joined — the query would egress a single "
-                + "(possibly VPN/virtual) interface and miss the Wi-Fi subnet (#1914).");
+            Assert.IsTrue(boundV4.Count > 1,
+                "Host has multiple IPv4 NICs but only one socket was bound — a single ANY socket's delivery "
+                + "can be hijacked by a low-metric VPN and miss the Wi-Fi subnet (#1917).");
         }
     }
 
     [TestMethod]
-    public async Task SendQuery_EgressesEveryJoinedIpv4Interface_WithoutThrowing()
+    public async Task SendQuery_EgressesEveryBoundInterface_WithoutThrowing()
     {
-        // Directly exercise the fixed egress path: SendQuery must set IP_MULTICAST_IF and send for each
-        // joined IPv4 address (and each joined IPv6 index) without throwing. Before the fix it sent once
-        // on the default interface only; the per-interface loop is what makes the Wi-Fi NIC actually
-        // carry the query. A successful multi-send here is the behavioral proof of the fan-out.
+        // Directly exercise the egress path: SendQuery must send the query out of each per-interface socket
+        // (each already has IP_MULTICAST_IF / IPV6_MULTICAST_IF pinned to its own interface) without
+        // throwing. A successful multi-send here is the behavioral proof of the per-interface fan-out.
         if (RealIpv4Addresses().Count == 0) {
             Assert.Inconclusive("Host has no up, multicast-capable IPv4 interface — cannot exercise SendQuery.");
             return;
         }
 
         CapturingLogger logger = new();
-        MdnsBrowser browser = new(logger);
+        using MdnsBrowser browser = new(logger);
 
         byte[] query = DnsHelpers.BuildQuery("_apple-mobdev2._tcp.local.", DnsHelpers.QTYPE_PTR);
 
-        // Must complete without throwing across all joined interfaces.
+        // Must complete without throwing across all bound interfaces.
         await browser.SendQuery(query);
 
         // No per-interface send should have been logged as skipped (skips are only logged when an
-        // interface went down between join and send — not expected in a single synchronous test run).
+        // interface went down between bind and send — not expected in a single synchronous test run).
         Assert.IsFalse(
-            logger.Messages.Exists(m => m.Contains("mDNS IPv4 query send skipped", StringComparison.Ordinal)),
-            "An IPv4 egress send was skipped unexpectedly: " + string.Join(" | ", logger.Messages));
+            logger.Messages.Exists(m => m.Contains("mDNS query send skipped", StringComparison.Ordinal)),
+            "An mDNS egress send was skipped unexpectedly: " + string.Join(" | ", logger.Messages));
     }
 }
