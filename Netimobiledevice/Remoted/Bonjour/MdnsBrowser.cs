@@ -24,14 +24,62 @@ internal class MdnsBrowser : IDisposable {
     // interface makes each receive ONLY the datagrams arriving on ITS interface, independent of any other
     // adapter's metric, and the arrival interface is then known exactly (it is the socket's interface) with
     // no source-IP/subnet heuristic. SendQuery fans the query out of each socket the same way.
-    private readonly List<MdnsInterfaceSocket> _sockets = [];
-    private readonly NetworkInterface[] _interfaces;
+    // The per-interface sockets, plus the interface snapshot they were built from. Both are REBUILT on a
+    // network change (NordLynx/Wi-Fi reconnect), so they are guarded by _socketsLock against the receive/
+    // send loop that iterates them on a background thread (ScribeHold #1923 self-heal). A monotonically
+    // increasing _socketGeneration tags each rebuild so the "first packet on if X" diagnostic fires once
+    // per interface PER generation (a dead-on-arrival join that later heals is then visible in the log).
+    private readonly object _socketsLock = new();
+    private List<MdnsInterfaceSocket> _sockets = [];
+    private NetworkInterface[] _interfaces;
+    private int _socketGeneration;
+    private readonly HashSet<string> _firstPacketLogged = [];
     private readonly ILogger _logger;
+
+    /// <summary>
+    /// Raised after the socket set has been rebuilt (e.g. on a network change), so a long-lived driver
+    /// such as <see cref="PersistentMdnsBrowser"/> can break out of its current receive window and
+    /// re-snapshot the new sockets immediately rather than waiting out the window on dead sockets.
+    /// </summary>
+    internal event Action? SocketsRebound;
 
     public MdnsBrowser(ILogger? logger = null) {
         _logger = logger ?? NullLogger.Instance;
         _interfaces = [.. NetworkInterface.GetAllNetworkInterfaces()];
-        BindInterfaceSockets();
+        lock (_socketsLock) {
+            BindInterfaceSockets();
+        }
+    }
+
+    /// <summary>
+    /// Tear down the current socket set and rebuild it from a FRESH <see cref="NetworkInterface"/> snapshot,
+    /// re-running the same per-interface bind/join logic. This is the self-heal for a multicast join that was
+    /// made while an interface (NordLynx/Wi-Fi) was mid-(re)connect and so stayed dead forever on that
+    /// interface (ScribeHold #1923): a one-time ctor snapshot never recovered. Thread-safe against the
+    /// receive/send loop via <see cref="_socketsLock"/>; raises <see cref="SocketsRebound"/> so the driver
+    /// re-snapshots immediately.
+    /// </summary>
+    public void RebindSockets() {
+        lock (_socketsLock) {
+            _logger.LogInformation("rebinding mDNS sockets due to network change (generation {Gen} -> {Next})",
+                _socketGeneration, _socketGeneration + 1);
+            foreach (MdnsInterfaceSocket sock in _sockets) {
+                sock.Dispose();
+            }
+            _sockets = [];
+            _firstPacketLogged.Clear();
+            _socketGeneration++;
+            _interfaces = [.. NetworkInterface.GetAllNetworkInterfaces()];
+            BindInterfaceSockets();
+        }
+        SocketsRebound?.Invoke();
+    }
+
+    /// <summary>Snapshot the current sockets under the lock for the receive/send loop to iterate safely.</summary>
+    private (MdnsInterfaceSocket[] Sockets, int Generation) SnapshotSockets() {
+        lock (_socketsLock) {
+            return ([.. _sockets], _socketGeneration);
+        }
     }
 
     private void BindInterfaceSockets() {
@@ -280,7 +328,7 @@ internal class MdnsBrowser : IDisposable {
         TimeSpan window = TimeSpan.FromMilliseconds(timeout);
 
         using var deadline = new CancellationTokenSource(window);
-        int packetsReceived = await ReceiveUntilAsync(sink, deadline.Token).ConfigureAwait(false);
+        int packetsReceived = (await ReceiveUntilAsync(sink, deadline.Token).ConfigureAwait(false)).Packets;
 
         DropAndClose();
 
@@ -309,19 +357,43 @@ internal class MdnsBrowser : IDisposable {
     /// loop routinely missed the response. This shared loop is used by both the one-shot browse and the
     /// persistent browser's continuous receive.
     /// </summary>
-    private async Task<int> ReceiveUntilAsync(IMdnsRecordSink sink, CancellationToken token) {
+    /// <summary>
+    /// Outcome of one receive window: total packets, the per-interface receive tally, and the set of
+    /// interface indices that HAD a live socket this window (so a dead-join detector can tell "an interface
+    /// that should have received got 0" from "no such interface").
+    /// </summary>
+    internal readonly struct ReceiveWindowResult(int packets, Dictionary<int, int> perInterface, HashSet<int> boundInterfaces) {
+        public int Packets { get; } = packets;
+        public Dictionary<int, int> PerInterface { get; } = perInterface;
+        public HashSet<int> BoundInterfaces { get; } = boundInterfaces;
+    }
+
+    private async Task<ReceiveWindowResult> ReceiveUntilAsync(IMdnsRecordSink sink, CancellationToken token) {
         int packetsReceived = 0;
-        if (_sockets.Count == 0) {
-            return 0;
+        // Per-interface receive tally for this window, returned to the driver's dead-join detector.
+        var perInterface = new Dictionary<int, int>();
+        // Snapshot the sockets under the lock so a concurrent RebindSockets() cannot reallocate the list
+        // out from under the index-aligned `pending` array. If a rebind happens DURING this window,
+        // SocketsRebound cancels the window (see PersistentMdnsBrowser) and the driver re-enters with the
+        // fresh snapshot — so this loop always operates on a single, stable generation of sockets.
+        (MdnsInterfaceSocket[] sockets, int generation) = SnapshotSockets();
+        var boundInterfaces = new HashSet<int>();
+        foreach (MdnsInterfaceSocket s in sockets) {
+            if (s.InterfaceIndex >= 0) {
+                boundInterfaces.Add(s.InterfaceIndex);
+            }
+        }
+        if (sockets.Length == 0) {
+            return new ReceiveWindowResult(0, perInterface, boundInterfaces);
         }
 
-        // One pending receive per socket; index-aligned with _sockets so a completed task maps back to the
+        // One pending receive per socket; index-aligned with `sockets` so a completed task maps back to the
         // socket (hence the arrival interface) it came from.
-        var pending = new Task<UdpReceiveResult>?[_sockets.Count];
+        var pending = new Task<UdpReceiveResult>?[sockets.Length];
         try {
             while (!token.IsCancellationRequested) {
-                for (int i = 0; i < _sockets.Count; i++) {
-                    pending[i] ??= _sockets[i].ReceiveAsync(token).AsTask();
+                for (int i = 0; i < sockets.Length; i++) {
+                    pending[i] ??= sockets[i].ReceiveAsync(token).AsTask();
                 }
 
                 Task<UdpReceiveResult> completed = await Task.WhenAny(GetPending(pending)).ConfigureAwait(false);
@@ -341,14 +413,19 @@ internal class MdnsBrowser : IDisposable {
                         pending[slot] = null;
                     }
                     _logger.LogDebug(ex, "mDNS receive error on if {Interface}; continuing to listen",
-                        slot >= 0 ? _sockets[slot].InterfaceIndex : -1);
+                        slot >= 0 ? sockets[slot].InterfaceIndex : -1);
                     continue;
                 }
 
-                long arrivalIndex = slot >= 0 ? _sockets[slot].InterfaceIndex : -1;
+                int arrivalIndex = slot >= 0 ? sockets[slot].InterfaceIndex : -1;
                 // Re-arm the socket whose receive just completed; leave the others pending.
                 if (slot >= 0) {
                     pending[slot] = null;
+                }
+
+                if (arrivalIndex >= 0) {
+                    perInterface[arrivalIndex] = perInterface.TryGetValue(arrivalIndex, out int c) ? c + 1 : 1;
+                    LogFirstPacketOnInterface(arrivalIndex, generation);
                 }
 
                 byte[] data = result.Buffer;
@@ -379,7 +456,24 @@ internal class MdnsBrowser : IDisposable {
                 await ObserveCancelled(p).ConfigureAwait(false);
             }
         }
-        return packetsReceived;
+        return new ReceiveWindowResult(packetsReceived, perInterface, boundInterfaces);
+    }
+
+    /// <summary>
+    /// Log the FIRST packet seen on an interface for the current socket generation, so a join that came up
+    /// dead-on-arrival (no packets ever) is distinguishable in the field log from one that simply healed
+    /// after a rebind. Fires once per (interface, generation).
+    /// </summary>
+    private void LogFirstPacketOnInterface(int interfaceIndex, int generation) {
+        string key = generation + ":" + interfaceIndex;
+        bool firstForKey;
+        lock (_socketsLock) {
+            firstForKey = _firstPacketLogged.Add(key);
+        }
+        if (firstForKey) {
+            _logger.LogInformation("first mDNS packet received on if {Interface} (socket generation {Gen})",
+                interfaceIndex, generation);
+        }
     }
 
     /// <summary>The non-null pending receive tasks, for Task.WhenAny.</summary>
@@ -414,7 +508,9 @@ internal class MdnsBrowser : IDisposable {
         // egress option per send on a shared socket; pinning it once per socket is equivalent and removes
         // the cross-send option churn. The iOS device only answers (over IPv4, with a routable A record)
         // when the query actually egresses the Wi-Fi NIC (ScribeHold #1914/#1917).
-        foreach (MdnsInterfaceSocket sock in _sockets) {
+        // Iterate a snapshot so a concurrent RebindSockets() cannot mutate the list mid-send.
+        (MdnsInterfaceSocket[] sockets, _) = SnapshotSockets();
+        foreach (MdnsInterfaceSocket sock in sockets) {
             try {
                 await sock.SendQueryAsync(query).ConfigureAwait(false);
             }
@@ -431,14 +527,16 @@ internal class MdnsBrowser : IDisposable {
     // These thin members let it reuse the bind/send/receive/parse engine without duplicating it, while
     // BrowseService keeps the one-shot lifecycle for the non-polled callers.
 
-    internal Task<int> ReceiveIntoAsync(IMdnsRecordSink sink, CancellationToken token)
+    internal Task<ReceiveWindowResult> ReceiveIntoAsync(IMdnsRecordSink sink, CancellationToken token)
         => ReceiveUntilAsync(sink, token);
 
     internal void DropAndClose() {
-        foreach (MdnsInterfaceSocket sock in _sockets) {
-            sock.Dispose();
+        lock (_socketsLock) {
+            foreach (MdnsInterfaceSocket sock in _sockets) {
+                sock.Dispose();
+            }
+            _sockets = [];
         }
-        _sockets.Clear();
     }
 
     public void Dispose() => DropAndClose();
