@@ -9,6 +9,15 @@ namespace Netimobiledevice.Lockdown;
 
 public class TcpLockdownClient : LockdownClient
 {
+    /// <summary>
+    /// Read timeout (ms) for the WiFi lockdown CONTROL channel — bounds the synchronous plist reads
+    /// (QueryType / GetValue / StartService) so an idle/unresponsive WiFi lockdown socket fails fast
+    /// instead of wedging the backup worker thread forever (#1926). 30s is generous for a control
+    /// round-trip on a healthy LAN; the bulk mobilebackup2 data channel is a separate connection and
+    /// is unaffected.
+    /// </summary>
+    private const int ControlReadTimeoutMs = 30000;
+
     private readonly string _hostname;
 
     public TcpLockdownClient(ServiceConnection service, string hostId, string hostname = "", string identifier = "", string label = DEFAULT_CLIENT_NAME,
@@ -49,6 +58,17 @@ public class TcpLockdownClient : LockdownClient
     {
         string hostId = PairRecords.GenerateHostId(localHostname);
         DirectoryInfo? pairingRecordsCacheDirectory = PairRecords.GetPairingRecordsCacheFolder(pairingRecordsCacheFolder);
+
+        // Bound the lockdown CONTROL-channel reads for WiFi (TCP). The control plist exchanges
+        // (QueryType, GetValue, StartService) use a synchronous Stream.Read with no timeout, so when a
+        // WiFi device's lockdown socket goes idle/unresponsive after the connect — e.g. the StartService
+        // request for mobilebackup2 — the backup worker thread blocks FOREVER and the backup wedges in
+        // Backup_Initializing with no passcode (ScribeHold #1926). A finite ReadTimeout makes such a
+        // stalled control read throw (IOException) so the attempt fails fast and retries instead of
+        // hanging. This is the CONTROL channel only: the separate mobilebackup2 DATA ServiceConnection
+        // (returned by StartLockdownService) is NOT a TcpLockdownClient and keeps its long
+        // keepalive budget for multi-minute bulk-transfer reads (#1857), so this does not truncate backups.
+        service.SetTimeout(ControlReadTimeoutMs);
 
         TcpLockdownClient lockdownClient = new(service, hostId: hostId, hostname: hostname, identifier: identifier, label: label, systemBuid: systemBuid, pairRecord: pairRecord,
             pairingRecordsCacheDirectory: pairingRecordsCacheDirectory, port: port, logger: logger);

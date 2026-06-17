@@ -333,6 +333,13 @@ public class ServiceConnection : IDisposable {
         if (_networkStream == null) {
             throw new InvalidOperationException("Network stream is null");
         }
+        // Carry any read/write timeout configured on the pre-SSL network stream forward to the SSL stream:
+        // SslStream defaults to an infinite timeout and does NOT inherit the inner stream's, so a control
+        // channel that set a finite SetTimeout before the handshake would silently lose it once SSL starts
+        // and could then block forever on a stalled read (ScribeHold #1926). -1 (infinite) is preserved as
+        // -1, so the bulk data channel is unaffected.
+        int readTimeout = SafeTimeout(() => _networkStream.ReadTimeout);
+        int writeTimeout = SafeTimeout(() => _networkStream.WriteTimeout);
         _networkStream.Flush();
 
         _sslStream = new SslStream(_networkStream, true, UserCertificateValidationCallback, null, EncryptionPolicy.RequireEncryption);
@@ -344,7 +351,23 @@ public class ServiceConnection : IDisposable {
             return false;
         }
 
+        if (readTimeout != Timeout.Infinite) {
+            _sslStream.ReadTimeout = readTimeout;
+        }
+        if (writeTimeout != Timeout.Infinite) {
+            _sslStream.WriteTimeout = writeTimeout;
+        }
         return true;
+    }
+
+    /// <summary>Read a stream timeout property defensively (NetworkStream throws if no timeout is set).</summary>
+    private static int SafeTimeout(Func<int> get) {
+        try {
+            return get();
+        }
+        catch {
+            return Timeout.Infinite;
+        }
     }
 
     public async Task<bool> StartSslAsync(X509Certificate2 certificate) {
