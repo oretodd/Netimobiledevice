@@ -66,9 +66,15 @@ internal sealed class MdnsInterfaceSocket : IDisposable {
         try {
             client = new UdpClient(AddressFamily.InterNetwork);
             client.Client.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
-            // Bind to ANY:5353 (Windows requires the wildcard, not the unicast address, for a socket that
-            // receives multicast) but restrict membership to THIS interface so only its datagrams arrive.
-            client.Client.Bind(new IPEndPoint(IPAddress.Any, MdnsPort));
+            // Bind to THIS INTERFACE'S UNICAST ADDRESS:5353, NOT IPAddress.Any. With multiple per-interface
+            // sockets all wildcard-bound to Any:5353 (+SO_REUSEADDR), Windows delivers each inbound multicast
+            // datagram to only ONE of them — the lowest-metric interface, which on this host is the NordLynx
+            // VPN — so the Wi-Fi socket joined the group but received ~0 datagrams while dns-sd (one socket
+            // per interface, unicast-bound) saw the device fine. Binding to the interface unicast address
+            // routes that interface's multicast traffic to THIS socket (measured real-device, VPN on:
+            // ~3-4 pkts/window on Wi-Fi with Any-bind -> ~22-24 with unicast-bind). AddMembership +
+            // MulticastInterface below still scope join/egress to this interface.
+            client.Client.Bind(new IPEndPoint(localAddress, MdnsPort));
             client.Client.SetSocketOption(SocketOptionLevel.IP, SocketOptionName.AddMembership,
                 new MulticastOption(group, localAddress));
             // Egress for queries sent from this socket goes out THIS interface (network-order address).
