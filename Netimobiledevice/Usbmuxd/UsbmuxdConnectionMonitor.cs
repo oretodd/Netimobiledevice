@@ -28,6 +28,60 @@ internal class UsbmuxdConnectionMonitor(Action<UsbmuxdDevice, UsbmuxdConnectionE
         _callback(usbmuxdDevice, UsbmuxdConnectionEventType.Add);
     }
 
+    /// <summary>
+    /// Resolves the device for a BINARY-protocol Add event into one carrying its REAL
+    /// <see cref="UsbmuxdConnectionType"/> (+NetworkAddress). The binary Add record cannot carry the
+    /// connection type, so a literal construction is always <see cref="UsbmuxdConnectionType.Usb"/> —
+    /// which misclassifies a WiFi device and breaks any WiFi-vs-USB transport gating downstream
+    /// (ScribeHold #1914 flap). Rather than guess, this cross-references usbmuxd's device list, which is
+    /// served over the Plist protocol and DOES carry the per-device <c>ConnectionType</c>, and returns
+    /// the matching authoritative entry. This is an authoritative lookup, NOT synthesis: a genuinely
+    /// cabled device still comes back <c>USB</c>, so there is no inverse-misclassification risk. Falls
+    /// back to the legacy <c>Usb</c> construction if the lookup finds nothing or fails (single device
+    /// dropped between Add and lookup, daemon truly binary-only, transient error) — never worse than
+    /// before.
+    /// </summary>
+    private UsbmuxdDevice ResolveAddedDevice(uint deviceId, string serial) {
+        try {
+            List<UsbmuxdDevice> devices = Usbmux.GetDeviceList(logger: _logger);
+
+            // The DeviceId is the unique per-connection id usbmuxd assigned to THIS Add, so it
+            // disambiguates a device present on both USB and Network (each connection has its own
+            // DeviceId). Prefer it.
+            foreach (UsbmuxdDevice candidate in devices) {
+                if (candidate.DeviceId == deviceId && candidate.ConnectionType != UsbmuxdConnectionType.None) {
+                    return candidate;
+                }
+            }
+
+            // No DeviceId match (e.g. the daemon's list churned between the Add and this lookup). Fall
+            // back to a serial match, preferring a USB entry over a Network one when the same serial
+            // appears on both — matching usbmuxd's own "prefer USB" lookup and ScribeHold's prefer-USB
+            // cross-transport policy.
+            if (!string.IsNullOrEmpty(serial)) {
+                UsbmuxdDevice? bySerial = null;
+                foreach (UsbmuxdDevice candidate in devices) {
+                    if (candidate.Serial != serial || candidate.ConnectionType == UsbmuxdConnectionType.None) {
+                        continue;
+                    }
+                    if (candidate.ConnectionType == UsbmuxdConnectionType.Usb) {
+                        return candidate; // USB wins outright
+                    }
+                    bySerial ??= candidate; // remember the first (e.g. Network) match
+                }
+                if (bySerial is not null) {
+                    return bySerial;
+                }
+            }
+        }
+        catch (Exception ex) {
+            // The lookup opens its own short-lived connection; a failure here must not abort the listen
+            // loop. Fall through to the legacy Usb construction so behaviour is never worse than before.
+            _logger?.LogDebug(ex, "usbmux binary Add: device-list lookup failed for {Serial}; defaulting to Usb", serial);
+        }
+        return new UsbmuxdDevice(deviceId, serial, UsbmuxdConnectionType.Usb);
+    }
+
     private async Task ConnectionListener() {
         CancellationToken ct = _cancellationTokenSource.Token;
         do {
@@ -90,19 +144,19 @@ internal class UsbmuxdConnectionMonitor(Action<UsbmuxdDevice, UsbmuxdConnectionE
         switch (packet.Header.Message) {
             case UsbmuxdMessageType.Add: {
                 AddResponse response = new AddResponse(packet.Header, packet.Payload);
-                UsbmuxdDevice usbmuxdDevice = new UsbmuxdDevice(response.DeviceRecord.DeviceId, response.DeviceRecord.SerialNumber, UsbmuxdConnectionType.Usb);
-                // The BINARY usbmux protocol's Add record (UsbmuxdDeviceRecord) predates network devices
-                // and carries NO ConnectionType — so it is hardcoded to Usb here. If the daemon ever
-                // delivers a WiFi (Network) device over this legacy path, it is classified Usb, and any
-                // consumer that gates WiFi behaviour on ConnectionType (e.g. ScribeHold's disconnect
-                // grace window) would treat a WiFi socket idle-drop as a USB unplug = a connect/disconnect
-                // FLAP. Modern usbmuxd/AMDS negotiates the Plist protocol, whose Attached events DO carry
-                // the real ConnectionType (the case below). Log the path + serial so a real-device run
-                // makes the active path self-evident (ScribeHold #1914): a WiFi device flapping while this
-                // line appears means the binary path is in use and the transport cannot be determined here.
+                // The BINARY usbmux Add record (UsbmuxdDeviceRecord) predates network devices and carries
+                // NO ConnectionType — taken literally it can only be Usb. But a WiFi device delivered over
+                // this path would then classify Usb downstream, and any consumer that gates WiFi behaviour
+                // on ConnectionType (ScribeHold's disconnect grace window) would treat a WiFi socket
+                // idle-drop as a USB unplug = a connect/disconnect FLAP (ScribeHold #1914). So instead of
+                // hardcoding Usb, recover the REAL ConnectionType (+NetworkAddress) by cross-referencing
+                // the daemon's device list — which is served over the Plist protocol and DOES carry the
+                // per-device ConnectionType. This mirrors how the Plist Attached path is already enriched.
+                UsbmuxdDevice usbmuxdDevice =
+                    ResolveAddedDevice(response.DeviceRecord.DeviceId, response.DeviceRecord.SerialNumber);
                 _logger?.LogInformation(
-                    "usbmux Add event (BINARY path, ConnectionType not carried -> defaulting Usb) for device {Serial} id {DeviceId}",
-                    usbmuxdDevice.Serial, usbmuxdDevice.DeviceId);
+                    "usbmux Add event (BINARY path) for device {Serial} id {DeviceId}: ConnectionType={ConnectionType}",
+                    usbmuxdDevice.Serial, usbmuxdDevice.DeviceId, usbmuxdDevice.ConnectionType);
                 AddDevice(usbmuxdDevice);
                 break;
             }
