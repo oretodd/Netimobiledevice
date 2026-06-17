@@ -32,6 +32,24 @@ internal class MdnsBrowser {
     // this list so send and receive target the same real interfaces.
     private readonly List<int> _joinedV6Indexes = [];
 
+    // The local IPv4 unicast addresses we successfully joined the mDNS group on, in join order.
+    // SendQuery iterates these to set IP_MULTICAST_IF and send the IPv4 query out of EVERY joined NIC
+    // — not just the OS default multicast interface.
+    //
+    // This is the PRIME root cause of ScribeHold #1914 (QA rounds 1-5). Earlier rounds chased the IPv6
+    // join because the mobdev2 service-instance NAME embeds the device's "fe80::..." link-local. But on
+    // the owner's box the physical Wi-Fi NIC has NO IPv6 stack at all — GetIPv6Properties() throws and
+    // there is no IPv6 unicast address — so it could never be IPv6-joined and IPv6 is a dead channel
+    // there. The device IS reachable over IPv4: its mobdev2 advert carries a routable A record
+    // (192.168.68.82) on the Wi-Fi subnet, and the Wi-Fi NIC (192.168.68.55) DOES IPv4-join every sweep.
+    // The remaining defect was that SendQuery sent the IPv4 query only ONCE, on the OS default multicast
+    // egress interface (a VPN/virtual adapter on a host with NordLynx + Hyper-V/WSL switches). The query
+    // therefore never egressed the Wi-Fi NIC, so the LAN device never heard it and never answered over
+    // IPv4 — while `dns-sd` (which fans the query out per interface) saw it fine. Sending the IPv4 query
+    // per joined interface, mirroring the IPv6 per-index egress loop, makes the device answer over IPv4
+    // with a connectable SRV+A — with the VPN connected and with no IPv6 on the Wi-Fi NIC.
+    private readonly List<IPAddress> _joinedV4Addresses = [];
+
     public MdnsBrowser(ILogger? logger = null) {
         _logger = logger ?? NullLogger.Instance;
         _interfaces = [.. NetworkInterface.GetAllNetworkInterfaces()];
@@ -51,7 +69,6 @@ internal class MdnsBrowser {
         // path already uses. A device only needs to be reachable on ONE interface, so a failed join on
         // an interface that has no IPv4 / is down is logged at Trace and skipped, not fatal.
         IPAddress multicastV4 = IPAddress.Parse(MdnsMulticastV4);
-        int joined = 0;
         foreach (NetworkInterface ni in _interfaces) {
             if (ni.OperationalStatus != OperationalStatus.Up || !ni.SupportsMulticast) {
                 continue;
@@ -67,7 +84,7 @@ internal class MdnsBrowser {
                         SocketOptionLevel.IP,
                         SocketOptionName.AddMembership,
                         new MulticastOption(multicastV4, uni.Address));
-                    joined++;
+                    _joinedV4Addresses.Add(uni.Address);
                     _logger.LogDebug("mDNS IPv4 multicast join OK on {Interface} ({LocalIp})", ni.Name, uni.Address);
                 }
                 catch (Exception ex) {
@@ -76,7 +93,7 @@ internal class MdnsBrowser {
             }
         }
 
-        if (joined == 0) {
+        if (_joinedV4Addresses.Count == 0) {
             // No per-interface join succeeded — fall back to the default-interface join so a
             // single-NIC machine still works, and surface that the per-interface fan-out found nothing.
             _logger.LogWarning("mDNS IPv4 multicast: no per-interface join succeeded; falling back to default interface");
@@ -88,7 +105,12 @@ internal class MdnsBrowser {
             }
         }
         else {
-            _logger.LogDebug("mDNS IPv4 multicast joined on {Count} interface address(es)", joined);
+            // List the ACTUAL joined IPv4 addresses (not just a count) so a real-device log confirms the
+            // physical Wi-Fi NIC's LAN address is among them — SendQuery sends the IPv4 query out of each
+            // of these, which is the fix for the #1914 default-egress defect (the device only answers
+            // over IPv4 when the query actually egresses the Wi-Fi NIC).
+            _logger.LogInformation("mDNS IPv4 multicast joined on address(es): [{Addresses}]",
+                string.Join(", ", _joinedV4Addresses));
         }
 
         return client;
@@ -485,8 +507,35 @@ internal class MdnsBrowser {
     }
 
     public async Task SendQuery(byte[] query) {
+        // Send the IPv4 query once PER joined interface, setting the IPv4 multicast egress interface
+        // (IP_MULTICAST_IF) to each joined local address first. The previous code sent ONCE with no
+        // egress selection, so the query left only via the OS default multicast interface — on a host
+        // with a VPN + Hyper-V/WSL virtual switches that default is a virtual/VPN adapter, NOT the
+        // physical Wi-Fi NIC. The iOS device advertises mobdev2 on the Wi-Fi subnet and only answers
+        // (over IPv4, with a routable A record) when it actually receives the query on that subnet, so
+        // the single default-egress send never reached it (ScribeHold #1914). Iterating the real joined
+        // addresses mirrors the IPv6 per-index egress loop below and matches what `dns-sd` does.
+        //
+        // IP_MULTICAST_IF takes the interface's local IPv4 address in NETWORK byte order (unlike the
+        // IPv6 option, which takes a host-order interface index). GetAddressBytes() yields network order.
         var v4Target = new IPEndPoint(IPAddress.Parse(MdnsMulticastV4), MdnsPort);
-        await _clientV4.SendAsync(query, query.Length, v4Target).ConfigureAwait(false);
+        if (_joinedV4Addresses.Count == 0) {
+            // No per-interface join recorded (single-NIC fallback path) — send once on the default iface.
+            await _clientV4.SendAsync(query, query.Length, v4Target).ConfigureAwait(false);
+        }
+        else {
+            foreach (IPAddress localAddr in _joinedV4Addresses) {
+                try {
+                    _clientV4.Client.SetSocketOption(SocketOptionLevel.IP, SocketOptionName.MulticastInterface,
+                        localAddr.GetAddressBytes());
+                    await _clientV4.SendAsync(query, query.Length, v4Target).ConfigureAwait(false);
+                }
+                catch (Exception ex) {
+                    // Interface may have gone down between join and send — skip onto the next one.
+                    _logger.LogTrace(ex, "mDNS IPv4 query send skipped on local address {LocalIp}", localAddr);
+                }
+            }
+        }
 
         // Send the IPv6 query once PER joined interface index, setting the multicast egress interface
         // each time. Iterate the REAL OS indexes we actually joined (_joinedV6Indexes) — NOT the
