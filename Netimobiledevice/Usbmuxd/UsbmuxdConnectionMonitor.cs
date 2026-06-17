@@ -91,6 +91,18 @@ internal class UsbmuxdConnectionMonitor(Action<UsbmuxdDevice, UsbmuxdConnectionE
             case UsbmuxdMessageType.Add: {
                 AddResponse response = new AddResponse(packet.Header, packet.Payload);
                 UsbmuxdDevice usbmuxdDevice = new UsbmuxdDevice(response.DeviceRecord.DeviceId, response.DeviceRecord.SerialNumber, UsbmuxdConnectionType.Usb);
+                // The BINARY usbmux protocol's Add record (UsbmuxdDeviceRecord) predates network devices
+                // and carries NO ConnectionType — so it is hardcoded to Usb here. If the daemon ever
+                // delivers a WiFi (Network) device over this legacy path, it is classified Usb, and any
+                // consumer that gates WiFi behaviour on ConnectionType (e.g. ScribeHold's disconnect
+                // grace window) would treat a WiFi socket idle-drop as a USB unplug = a connect/disconnect
+                // FLAP. Modern usbmuxd/AMDS negotiates the Plist protocol, whose Attached events DO carry
+                // the real ConnectionType (the case below). Log the path + serial so a real-device run
+                // makes the active path self-evident (ScribeHold #1914): a WiFi device flapping while this
+                // line appears means the binary path is in use and the transport cannot be determined here.
+                _logger?.LogInformation(
+                    "usbmux Add event (BINARY path, ConnectionType not carried -> defaulting Usb) for device {Serial} id {DeviceId}",
+                    usbmuxdDevice.Serial, usbmuxdDevice.DeviceId);
                 AddDevice(usbmuxdDevice);
                 break;
             }
@@ -110,6 +122,16 @@ internal class UsbmuxdConnectionMonitor(Action<UsbmuxdDevice, UsbmuxdConnectionE
                 string messageType = responseDict["MessageType"].AsStringNode().Value;
                 if (messageType == "Attached") {
                     UsbmuxdDevice usbmuxdDevice = new UsbmuxdDevice(responseDict["DeviceID"].AsIntegerNode(), responseDict["Properties"].AsDictionaryNode());
+                    // The PLIST protocol's Attached payload carries the real per-device ConnectionType
+                    // (USB vs Network) + NetworkAddress, parsed by the UsbmuxdDevice(IntegerNode,
+                    // DictionaryNode) ctor. Log it so a real-device run shows exactly how each device was
+                    // classified at the source — the decisive datum for ScribeHold #1914's WiFi-flap
+                    // diagnosis (a device reported here as Network must reach ScribeHold as WiFi transport
+                    // so the disconnect grace window engages; one reported as Usb correctly takes the fast
+                    // unplug path).
+                    _logger?.LogInformation(
+                        "usbmux Attached event (PLIST path) for device {Serial} id {DeviceId}: ConnectionType={ConnectionType}",
+                        usbmuxdDevice.Serial, usbmuxdDevice.DeviceId, usbmuxdDevice.ConnectionType);
                     AddDevice(usbmuxdDevice);
                 }
                 else if (messageType == "Detached") {
