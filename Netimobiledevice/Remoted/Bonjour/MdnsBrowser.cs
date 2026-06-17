@@ -21,6 +21,17 @@ internal class MdnsBrowser {
     private readonly NetworkInterface[] _interfaces;
     private readonly ILogger _logger;
 
+    // The REAL OS IPv6 interface indexes we successfully joined the mDNS group on. These come from
+    // NetworkInterface.GetIPv6Properties().Index — they are sparse and machine-assigned (e.g. 26 for a
+    // Wi-Fi adapter), NOT the 0..N-1 position of an interface in the GetAllNetworkInterfaces() array.
+    // The previous code used the array position as the join/send index, so on a host whose real Wi-Fi
+    // index is outside 0..N-1 (the common case — indexes 1,5,10,19,26,32,38,62...), the mDNS group was
+    // NEVER joined on the Wi-Fi NIC and the query was NEVER sent out of it. Apple devices advertise
+    // mobdev2 on IPv6 link-local on exactly that NIC, so ScribeHold only ever received echoes from
+    // VPN/virtual adapters and resolved zero devices (ScribeHold #1914 QA round 5). SendQuery reuses
+    // this list so send and receive target the same real interfaces.
+    private readonly List<int> _joinedV6Indexes = [];
+
     public MdnsBrowser(ILogger? logger = null) {
         _logger = logger ?? NullLogger.Instance;
         _interfaces = [.. NetworkInterface.GetAllNetworkInterfaces()];
@@ -89,25 +100,47 @@ internal class MdnsBrowser {
         client.Client.Bind(new IPEndPoint(IPAddress.IPv6Any, MdnsPort));
 
         IPAddress multicastV6 = IPAddress.Parse(MdnsMulticastV6);
-        int joined = 0;
-        for (int i = 0; i < _interfaces.Length; i++) {
+        foreach (NetworkInterface ni in _interfaces) {
+            if (ni.OperationalStatus != OperationalStatus.Up || !ni.SupportsMulticast) {
+                continue;
+            }
+
+            // Use the REAL OS interface index, not the array position. JoinMulticastGroup(int, ...)
+            // expects the IPv6 interface index; passing the loop counter joined the wrong (or a
+            // non-existent) interface, which is why the Wi-Fi NIC carrying the mobdev2 adverts was
+            // never joined (ScribeHold #1914 QA round 5).
+            int index;
             try {
-                client.JoinMulticastGroup(i, multicastV6);
-                joined++;
+                index = ni.GetIPProperties().GetIPv6Properties().Index;
             }
             catch (Exception ex) {
-                // Interface may have no IPv6 / be down — skip onto the next one.
-                _logger.LogTrace(ex, "mDNS IPv6 multicast join skipped on interface index {Index}", i);
+                // Interface has no IPv6 properties (IPv6 disabled on it) — nothing to join.
+                _logger.LogTrace(ex, "mDNS IPv6 multicast join skipped on {Interface} (no IPv6 properties)", ni.Name);
                 continue;
+            }
+
+            try {
+                client.JoinMulticastGroup(index, multicastV6);
+                _joinedV6Indexes.Add(index);
+                _logger.LogDebug("mDNS IPv6 multicast join OK on {Interface} (if {Index})", ni.Name, index);
+            }
+            catch (Exception ex) {
+                // Interface may be down / have no link-local — skip onto the next one.
+                _logger.LogTrace(ex, "mDNS IPv6 multicast join skipped on {Interface} (if {Index})", ni.Name, index);
             }
         }
 
-        _logger.LogDebug("mDNS IPv6 multicast joined on {Count} interface index(es)", joined);
+        // List the ACTUAL joined indexes (not just a count) so a real-device log can confirm the
+        // Wi-Fi adapter's index is among them — the decisive check for ScribeHold #1914: if dns-sd
+        // homes to if 26 but this list lacks 26, the join itself is the fault.
+        _logger.LogInformation("mDNS IPv6 multicast joined on interface index(es): [{Indexes}]",
+            string.Join(", ", _joinedV6Indexes));
         return client;
     }
 
     private void ParseMdnsMessage(
         byte[] data,
+        long arrivalInterfaceIndex,
         HashSet<string> ptrTargets,
         Dictionary<string, List<Service>> srvMap,
         Dictionary<string, Dictionary<string, string>> txtMap,
@@ -129,13 +162,14 @@ internal class MdnsBrowser {
         }
 
         for (int i = 0; i < anCount + nsCount + arCount; i++) {
-            offset = ParseRR(data, offset, ptrTargets, srvMap, txtMap, hostAddrs);
+            offset = ParseRR(data, offset, arrivalInterfaceIndex, ptrTargets, srvMap, txtMap, hostAddrs);
         }
     }
 
     private int ParseRR(
         byte[] data,
         int offset,
+        long arrivalInterfaceIndex,
         HashSet<string> ptrTargets,
         Dictionary<string, List<Service>> srvMap,
         Dictionary<string, Dictionary<string, string>> txtMap,
@@ -189,12 +223,26 @@ internal class MdnsBrowser {
         else if ((rtype == DnsHelpers.QTYPE_A && rdlen == 4) ||
                  (rtype == DnsHelpers.QTYPE_AAAA && rdlen == 16)) {
             IPAddress ip = new IPAddress(rdata);
-            string iface = PickInterfaceForIp(ip);
+
+            // For a link-local IPv6 advert, the CORRECT zone is the interface the advert ARRIVED on,
+            // not just any local interface that happens to own a link-local address. A device's
+            // fe80::... is only reachable via the NIC that received it; using a different interface's
+            // index produces an unreachable "fe80::...%wrong" and the lockdown connect fails. When the
+            // arrival index is known (link-local source carries it in the packet's ScopeId), use it;
+            // otherwise fall back to subnet/interface matching. PickInterfaceForIp still serves IPv4
+            // (returns the interface name) and the unknown-arrival case.
+            string iface;
+            if (ip.AddressFamily == AddressFamily.InterNetworkV6 && ip.IsIPv6LinkLocal && arrivalInterfaceIndex >= 0) {
+                iface = arrivalInterfaceIndex.ToString(System.Globalization.CultureInfo.InvariantCulture);
+            }
+            else {
+                iface = PickInterfaceForIp(ip);
+            }
 
             // ALWAYS record the address — including IPv6 link-local (fe80::). Real iOS devices advertise
             // mobdev2 with ONLY an IPv6 link-local AAAA record (verified via dns-sd, #1914), so dropping
             // link-local would resolve every such device to zero connectable addresses. The zone index is
-            // carried by Address.FullIp ("fe80::...%iface"); PickInterfaceForIp supplies the matching
+            // carried by Address.FullIp ("fe80::...%iface"); the scope above supplies the matching
             // local interface so the scope is correct. An empty iface is still recorded (best effort)
             // rather than discarded — discarding here is exactly what broke WiFi discovery.
             if (!hostAddrs.ContainsKey(name)) {
@@ -209,6 +257,40 @@ internal class MdnsBrowser {
         }
 
         return offset;
+    }
+
+    /// <summary>
+    /// Best-effort local interface INDEX a received datagram arrived on, for diagnostics. For an IPv6
+    /// link-local source the kernel stamps the arrival zone into the source address's ScopeId, which IS
+    /// the real receive interface index; that is used directly. Otherwise the source address is matched
+    /// to a local interface by subnet (IPv4) or by interface lookup (IPv6 global). Returns -1 if unknown.
+    /// </summary>
+    private long GetArrivalInterfaceIndex(IPEndPoint? source) {
+        if (source is null) {
+            return -1;
+        }
+        IPAddress src = source.Address;
+        if (src.AddressFamily == AddressFamily.InterNetworkV6 && src.IsIPv6LinkLocal && src.ScopeId != 0) {
+            return src.ScopeId;
+        }
+        string token = PickInterfaceForIp(src);
+        if (src.AddressFamily == AddressFamily.InterNetworkV6) {
+            // PickInterfaceForIp returns the interface index (as a string) for IPv6.
+            return long.TryParse(token, System.Globalization.NumberStyles.Integer,
+                System.Globalization.CultureInfo.InvariantCulture, out long idx) ? idx : -1;
+        }
+        // For IPv4 PickInterfaceForIp returns the interface NAME; resolve it to an index for the log.
+        foreach (NetworkInterface ni in _interfaces) {
+            if (ni.Name == token) {
+                try {
+                    return ni.GetIPProperties().GetIPv4Properties().Index;
+                }
+                catch {
+                    return -1;
+                }
+            }
+        }
+        return -1;
     }
 
     /// <summary>
@@ -321,11 +403,19 @@ internal class MdnsBrowser {
                 // level: a sweep reporting "0 advertisements" is otherwise indistinguishable between
                 // "the only packets came from unrelated mDNS responders" and "our target's advert
                 // arrived but was not parsed". The source IP tells which device/subnet answered (#1914).
-                _logger.LogDebug("mDNS packet #{Index} received: {Bytes} bytes from {Source}",
-                    packetsReceived, data.Length, result.RemoteEndPoint);
+                //
+                // Also log the local interface INDEX the packet arrived on. For an IPv6 link-local
+                // source (how Apple devices answer) the kernel stamps the arrival zone into the source
+                // address's ScopeId, so this is the real receive interface — the decisive datum for
+                // ScribeHold #1914 QA round 5: it must show the Wi-Fi index (if 26), not only the
+                // VPN/virtual adapters. Falls back to subnet/zone matching for other sources.
+                long arrivalIndex = GetArrivalInterfaceIndex(result.RemoteEndPoint);
+                _logger.LogDebug("mDNS packet #{Index} received: {Bytes} bytes from {Source} (arrived on if {Interface})",
+                    packetsReceived, data.Length, result.RemoteEndPoint,
+                    arrivalIndex >= 0 ? arrivalIndex.ToString(System.Globalization.CultureInfo.InvariantCulture) : "?");
 
                 try {
-                    ParseMdnsMessage(data, ptrTargets, srvMap, txtMap, hostAddrs);
+                    ParseMdnsMessage(data, arrivalIndex, ptrTargets, srvMap, txtMap, hostAddrs);
                 }
                 catch (Exception ex) {
                     // A single malformed packet must not abort the browse, but it was previously swallowed
@@ -398,22 +488,25 @@ internal class MdnsBrowser {
         var v4Target = new IPEndPoint(IPAddress.Parse(MdnsMulticastV4), MdnsPort);
         await _clientV4.SendAsync(query, query.Length, v4Target).ConfigureAwait(false);
 
-        // Send the IPv6 query once PER interface index, setting the multicast egress interface each time.
-        // The previous loop sent N copies but never varied the outgoing interface (MulticastInterface
-        // socket option), so every copy left via the default interface and the query never reached a
-        // device whose link-local advert lives on a non-default NIC (e.g. Wi-Fi). iOS devices advertise
-        // mobdev2 on IPv6 link-local, so reaching the right interface is what makes them discoverable.
+        // Send the IPv6 query once PER joined interface index, setting the multicast egress interface
+        // each time. Iterate the REAL OS indexes we actually joined (_joinedV6Indexes) — NOT the
+        // 0..N-1 array positions the previous code used. With array positions, MulticastInterface was
+        // set to indexes that don't correspond to the Wi-Fi NIC (real index e.g. 26), so the query
+        // never egressed the interface where the device advertises and no advert was ever received
+        // (ScribeHold #1914 QA round 5). iOS devices advertise mobdev2 on IPv6 link-local, so the
+        // egress interface must be the real LAN/Wi-Fi NIC.
         var v6Target = new IPEndPoint(IPAddress.Parse(MdnsMulticastV6), MdnsPort);
-        for (int i = 0; i < _interfaces.Length; i++) {
+        foreach (int index in _joinedV6Indexes) {
             try {
                 // IPv6 MulticastInterface takes the interface INDEX in host order (unlike the IPv4
-                // option, which takes a network-order address). i is the index we joined the group on.
-                _clientV6.Client.SetSocketOption(SocketOptionLevel.IPv6, SocketOptionName.MulticastInterface, i);
+                // option, which takes a network-order address). index is the real OS interface index
+                // we joined the group on.
+                _clientV6.Client.SetSocketOption(SocketOptionLevel.IPv6, SocketOptionName.MulticastInterface, index);
                 await _clientV6.SendAsync(query, query.Length, v6Target).ConfigureAwait(false);
             }
-            catch {
-                // Interface may have no IPv6 / be down — skip onto the next one.
-                continue;
+            catch (Exception ex) {
+                // Interface may have gone down between join and send — skip onto the next one.
+                _logger.LogTrace(ex, "mDNS IPv6 query send skipped on interface index {Index}", index);
             }
         }
     }
