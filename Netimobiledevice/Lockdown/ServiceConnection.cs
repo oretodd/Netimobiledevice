@@ -329,6 +329,17 @@ public class ServiceConnection : IDisposable {
         Stream.WriteTimeout = timeout;
     }
 
+    /// <summary>
+    /// Hard ceiling on the synchronous SSL handshake (<see cref="SslStream.AuthenticateAsClient(string)"/>).
+    /// The handshake reads from the underlying socket with NO timeout of its own, so when a WiFi device
+    /// accepts the secondary mobilebackup2 service TCP connection but never completes the TLS handshake
+    /// (its lockdown relay went idle, or it is mid-reauthorising the wireless session), the backup worker
+    /// thread blocks here FOREVER and the backup wedges in Backup_Initializing with no passcode and no
+    /// progress — the connect is bounded but the handshake was not (ScribeHold #1926, deeper layer). A
+    /// finite handshake deadline makes a stalled handshake throw so the attempt fails fast and retries.
+    /// </summary>
+    private static readonly TimeSpan SslHandshakeTimeout = TimeSpan.FromSeconds(30);
+
     public bool StartSsl(X509Certificate2 certificate) {
         if (_networkStream == null) {
             throw new InvalidOperationException("Network stream is null");
@@ -344,10 +355,25 @@ public class ServiceConnection : IDisposable {
 
         _sslStream = new SslStream(_networkStream, true, UserCertificateValidationCallback, null, EncryptionPolicy.RequireEncryption);
         try {
-            _sslStream.AuthenticateAsClient(string.Empty, [certificate], SslProtocols.None, false);
+            SslClientAuthenticationOptions authOptions = new() {
+                TargetHost = string.Empty,
+                ClientCertificates = [certificate],
+                EnabledSslProtocols = SslProtocols.None,
+                CertificateRevocationCheckMode = X509RevocationMode.NoCheck
+            };
+            // Bound the handshake: AuthenticateAsClient has no timeout, so use the cancellable async
+            // overload with a deadline and block on it. On timeout the socket read is cancelled and we
+            // surface it as a failed handshake (the same shape callers already treat as a pairing/connect
+            // failure), instead of hanging the backup thread indefinitely.
+            using var handshakeCts = new CancellationTokenSource(SslHandshakeTimeout);
+            _sslStream.AuthenticateAsClientAsync(authOptions, handshakeCts.Token).GetAwaiter().GetResult();
         }
         catch (AuthenticationException ex) {
             _logger.LogError(ex, "SSL authentication failed");
+            return false;
+        }
+        catch (OperationCanceledException) {
+            _logger.LogError("SSL handshake timed out after {TimeoutSeconds}s on the service connection", SslHandshakeTimeout.TotalSeconds);
             return false;
         }
 
@@ -378,11 +404,25 @@ public class ServiceConnection : IDisposable {
 
         _sslStream = new SslStream(_networkStream, true, UserCertificateValidationCallback, null, EncryptionPolicy.RequireEncryption);
         try {
-            // TLS v1.2 is supported since iOS 5 so we should specify this as a minimum
-            _sslStream.AuthenticateAsClient(string.Empty, [certificate], SslProtocols.Tls12 | SslProtocols.Tls13, false);
+            // TLS v1.2 is supported since iOS 5 so we should specify this as a minimum.
+            // Bound the handshake symmetrically with the synchronous StartSsl (#1926): an unbounded
+            // handshake on a fresh per-service WiFi socket wedges the backup forever. Any caller that
+            // switches to the async StartLockdownService path must get the same protection.
+            SslClientAuthenticationOptions authOptions = new() {
+                TargetHost = string.Empty,
+                ClientCertificates = [certificate],
+                EnabledSslProtocols = SslProtocols.Tls12 | SslProtocols.Tls13,
+                CertificateRevocationCheckMode = X509RevocationMode.NoCheck
+            };
+            using var handshakeCts = new CancellationTokenSource(SslHandshakeTimeout);
+            await _sslStream.AuthenticateAsClientAsync(authOptions, handshakeCts.Token).ConfigureAwait(false);
         }
         catch (AuthenticationException ex) {
             _logger.LogError(ex, "SSL authentication failed");
+            return false;
+        }
+        catch (OperationCanceledException) {
+            _logger.LogError("SSL handshake timed out after {TimeoutSeconds}s on the service connection", SslHandshakeTimeout.TotalSeconds);
             return false;
         }
 
