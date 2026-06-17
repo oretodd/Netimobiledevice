@@ -69,10 +69,41 @@ public class ServiceConnection : IDisposable {
         sock.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.TcpKeepAliveRetryCount, 10);
     }
 
+    /// <summary>
+    /// Hard ceiling on a TCP-over-WiFi connect. A bare <c>Socket.Connect</c> has NO connect timeout, so a
+    /// secondary lockdown-service connect to a WiFi device whose network socket has gone idle (Apple drops
+    /// the mobdev2 TCP relay after ~1-3 min of inactivity) blocks the calling thread for the OS default —
+    /// tens of seconds to effectively forever. ScribeHold opens these secondary connects synchronously
+    /// from the backup worker (BackupKeepSet/Mobilebackup2Service -> StartLockdownService), so an unbounded
+    /// connect wedges the whole backup in Backup_Initializing with no passcode and no progress (#1926). The
+    /// primary lockdown connect is already bounded by WiFiLockdownConnectionFactory; this bounds every
+    /// SUBSEQUENT per-service TCP connect the same way so a stalled endpoint fails fast and loud instead.
+    /// </summary>
+    private static readonly TimeSpan TcpConnectTimeout = TimeSpan.FromSeconds(10);
+
+    private static Socket ConnectTcpBounded(IPAddress ip, ushort port) {
+        Socket sock = new Socket(SocketType.Stream, ProtocolType.IP);
+        try {
+            // ConnectAsync + a timeout gives the bounded connect that Socket.Connect lacks. On timeout the
+            // socket is disposed (cancelling the in-flight connect) and a SocketException(TimedOut) is
+            // thrown — the same shape callers already handle as a failed connect.
+            using var cts = new CancellationTokenSource(TcpConnectTimeout);
+            sock.ConnectAsync(ip, port, cts.Token).AsTask().GetAwaiter().GetResult();
+            return sock;
+        }
+        catch (OperationCanceledException) {
+            sock.Dispose();
+            throw new SocketException((int) SocketError.TimedOut);
+        }
+        catch {
+            sock.Dispose();
+            throw;
+        }
+    }
+
     internal static ServiceConnection CreateUsingTcp(string hostname, ushort port, ILogger? logger = null) {
         IPAddress ip = IPAddress.Parse(hostname);
-        Socket sock = new Socket(SocketType.Stream, ProtocolType.IP);
-        sock.Connect(ip, port);
+        Socket sock = ConnectTcpBounded(ip, port);
         ConfigureKeepAlive(sock);
         return new ServiceConnection(sock, logger ?? NullLogger.Instance);
     }
@@ -80,7 +111,18 @@ public class ServiceConnection : IDisposable {
     internal static async Task<ServiceConnection> CreateUsingTcpAsync(string hostname, ushort port, ILogger? logger = null) {
         IPAddress ip = IPAddress.Parse(hostname);
         Socket sock = new Socket(SocketType.Stream, ProtocolType.IP);
-        await sock.ConnectAsync(ip, port).ConfigureAwait(false);
+        try {
+            using var cts = new CancellationTokenSource(TcpConnectTimeout);
+            await sock.ConnectAsync(ip, port, cts.Token).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) {
+            sock.Dispose();
+            throw new SocketException((int) SocketError.TimedOut);
+        }
+        catch {
+            sock.Dispose();
+            throw;
+        }
         ConfigureKeepAlive(sock);
         return new ServiceConnection(sock, logger ?? NullLogger.Instance);
     }
