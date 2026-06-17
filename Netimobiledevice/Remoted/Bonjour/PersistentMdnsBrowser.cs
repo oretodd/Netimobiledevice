@@ -42,11 +42,21 @@ public sealed class PersistentMdnsBrowser : IAsyncDisposable {
     private static readonly TimeSpan RebindDebounce = TimeSpan.FromSeconds(2.5);
 
     /// <summary>
-    /// Dead-join detector threshold: if an interface that HAD a live socket received 0 packets for this
-    /// many consecutive windows WHILE some other interface was receiving, rebind to drop+rejoin it.
-    /// Conservative (a healthy idle LAN can be quiet for a few windows) to avoid thrashing.
+    /// Dead-join detector threshold: an interface that had a live socket but received 0 FOREIGN packets for
+    /// this many consecutive windows WHILE another interface received FOREIGN packets is treated as a dead
+    /// join. Conservative so a quiet LAN does not thrash. (#1924 — counts FOREIGN, not self-echoes.)
     /// </summary>
-    private const int DeadJoinWindows = 8;
+    private const int DeadJoinWindows = 12;
+
+    /// <summary>
+    /// Minimum interval between dead-join rebinds. The detector previously rebound every ~8 windows and,
+    /// because the rebind reset the receive state so the next windows again saw only self-echoes, formed a
+    /// destructive churn loop (ScribeHold #1924). A long cooldown guarantees a rebind gets MANY stable
+    /// windows to actually receive device responses before another dead-join rebind can fire — so a single
+    /// genuine dead join still heals, but a mistaken trigger cannot loop. (Network-change rebinds are NOT
+    /// subject to this cooldown — a real NIC transition rebinds immediately.)
+    /// </summary>
+    private static readonly TimeSpan DeadJoinRebindCooldown = TimeSpan.FromSeconds(90);
 
     private readonly string _serviceType;
     private readonly ILogger _logger;
@@ -66,8 +76,15 @@ public sealed class PersistentMdnsBrowser : IAsyncDisposable {
     private readonly object _debounceLock = new();
     private Timer? _debounceTimer;
     private bool _networkSubscribed;
-    // Per-interface consecutive-empty-window counters for the dead-join detector.
+    // Per-interface consecutive-empty (no FOREIGN packet) window counters for the dead-join detector.
     private readonly Dictionary<int, int> _consecutiveEmpty = [];
+    // Interfaces that have EVER received a FOREIGN packet (a real device response) in this browser's life.
+    // Only such interfaces are dead-join candidates: an interface that has NEVER heard a device is simply a
+    // wrong-subnet / VPN / virtual NIC with nothing on it (if 32/38/5/1/62 on the owner's host), NOT a dead
+    // join — counting it churns forever (ScribeHold #1924). A genuine dead join is "was alive, went silent".
+    private readonly HashSet<int> _everReceivedForeign = [];
+    // When the last dead-join rebind fired, to enforce DeadJoinRebindCooldown and break churn (#1924).
+    private DateTime _lastDeadJoinRebindUtc = DateTime.MinValue;
 
     // Instance names we have already announced as fully resolved, so the "resolved" log fires once per
     // device rather than every sweep.
@@ -188,27 +205,51 @@ public sealed class PersistentMdnsBrowser : IAsyncDisposable {
     }
 
     /// <summary>
-    /// Defense-in-depth dead-join detector: per window, an interface that had a live socket but received 0
-    /// packets accrues a strike; one that received clears its strikes. If ANY interface hits
-    /// <see cref="DeadJoinWindows"/> consecutive empty windows WHILE another interface received this window
-    /// (proving the LAN is live), request a rebind to drop+rejoin. The "another interface received" guard
-    /// keeps a globally-quiet LAN from triggering pointless rebinds.
+    /// Defense-in-depth dead-join detector, hardened against the #1924 churn loop.
+    /// <para>
+    /// Keys off FOREIGN packets only (real device responses). A multicast query we send loops back to every
+    /// joined socket as a self-echo; counting those as "received" made an interface that heard ONLY its own
+    /// echoes look alive, and — combined with rebinding every ~8 windows — formed a destructive loop:
+    /// rebind → only echoes seen in the reset windows → "if26 got 0 (real)" → rebind again, forever, so
+    /// device responses never got a stable window to land. The hardening:
+    /// </para>
+    /// <list type="number">
+    /// <item>An interface clears its strikes when it receives a FOREIGN packet (self-echoes do not clear).</item>
+    /// <item>Only an interface that has EVER received a foreign packet is a dead-join candidate. An interface
+    /// that has never heard a device (a VPN / virtual / wrong-subnet NIC — if 32/38/5/1/62 on the owner's
+    /// host) is not dead, it simply has no LAN devices on it; counting it churns forever. A genuine dead
+    /// join is "was alive, then went silent while the device is still reachable elsewhere".</item>
+    /// <item>A strike accrues only when SOME OTHER interface received a FOREIGN packet this window — the LAN
+    /// is provably live. A globally quiet / echo-only window accrues nothing.</item>
+    /// <item>A rebind fires at most once per <see cref="DeadJoinRebindCooldown"/>, so a rebind gets many
+    /// stable windows to actually receive before another dead-join rebind can fire.</item>
+    /// </list>
     /// </summary>
     private void EvaluateDeadJoins(MdnsBrowser.ReceiveWindowResult result) {
         if (result.BoundInterfaces is null || result.BoundInterfaces.Count == 0) {
             return;
         }
-        bool anyReceived = result.Packets > 0;
+        // "LAN is live" = at least one interface received a FOREIGN packet (not just our own echoes).
+        bool anyForeignReceived = result.ForeignPackets > 0;
         bool deadJoinFound = false;
         lock (_debounceLock) {
             foreach (int ifIndex in result.BoundInterfaces) {
-                int got = result.PerInterface.TryGetValue(ifIndex, out int c) ? c : 0;
-                if (got > 0) {
+                int foreign = result.PerInterfaceForeign is not null
+                    && result.PerInterfaceForeign.TryGetValue(ifIndex, out int fc) ? fc : 0;
+                if (foreign > 0) {
                     _consecutiveEmpty[ifIndex] = 0;
+                    _everReceivedForeign.Add(ifIndex);
                     continue;
                 }
-                // Only count an empty window against an interface when SOME interface received (LAN is live).
-                if (!anyReceived) {
+                // An interface that has NEVER heard a device is not a dead join — it just has no LAN devices
+                // on it (VPN/virtual/wrong-subnet). Never accrue strikes against it. This is the core #1924
+                // fix: the previous detector mis-fired forever on the owner's if 32/38/5/1/62.
+                if (!_everReceivedForeign.Contains(ifIndex)) {
+                    continue;
+                }
+                // No foreign packet this window on an interface that WAS alive. Only count it when ANOTHER
+                // interface heard a foreign packet (the LAN is live) — otherwise it is a quiet window.
+                if (!anyForeignReceived) {
                     continue;
                 }
                 int strikes = _consecutiveEmpty.TryGetValue(ifIndex, out int s) ? s + 1 : 1;
@@ -216,12 +257,28 @@ public sealed class PersistentMdnsBrowser : IAsyncDisposable {
                 if (strikes >= DeadJoinWindows) {
                     deadJoinFound = true;
                     _logger.LogWarning(
-                        "mDNS: if {Interface} received 0 packets for {Strikes} consecutive windows while other interfaces received — rebinding (dead-join self-heal)",
+                        "mDNS: if {Interface} was receiving but got 0 FOREIGN packets for {Strikes} consecutive windows while another interface received — candidate dead join",
                         ifIndex, strikes);
+                }
+            }
+
+            if (deadJoinFound) {
+                DateTime now = DateTime.UtcNow;
+                if (now - _lastDeadJoinRebindUtc < DeadJoinRebindCooldown) {
+                    // Within the cooldown — do NOT rebind (this is what breaks the churn loop). Leave the
+                    // strikes in place; if the interface is truly dead it will rebind after the cooldown.
+                    _logger.LogDebug(
+                        "mDNS: dead-join candidate suppressed — within {Cooldown}s rebind cooldown (last {Ago:F0}s ago)",
+                        DeadJoinRebindCooldown.TotalSeconds, (now - _lastDeadJoinRebindUtc).TotalSeconds);
+                    deadJoinFound = false;
+                }
+                else {
+                    _lastDeadJoinRebindUtc = now;
                 }
             }
         }
         if (deadJoinFound) {
+            _logger.LogWarning("mDNS: rebinding sockets (dead-join self-heal)");
             RequestRebind("dead-join detector");
         }
     }

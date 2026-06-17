@@ -34,6 +34,12 @@ internal class MdnsBrowser : IDisposable {
     private NetworkInterface[] _interfaces;
     private int _socketGeneration;
     private readonly HashSet<string> _firstPacketLogged = [];
+    // This host's OWN unicast addresses (all up interfaces). A multicast query we send loops back to every
+    // joined socket as a "self-echo" with one of these as its source IP. Self-echoes must NOT count as a
+    // device response: the dead-join detector keys off FOREIGN packets only, otherwise an interface that
+    // hears only its own echoes looks "alive" and a churn loop forms (ScribeHold #1924). Rebuilt each
+    // generation under _socketsLock alongside _sockets.
+    private readonly HashSet<IPAddress> _localAddresses = [];
     private readonly ILogger _logger;
 
     /// <summary>
@@ -88,6 +94,21 @@ internal class MdnsBrowser : IDisposable {
 
         var v4Bound = new List<string>();
         var v6Bound = new List<int>();
+
+        // Rebuild the set of this host's own unicast addresses so received self-echoes can be told apart
+        // from real device responses (ScribeHold #1924).
+        _localAddresses.Clear();
+        foreach (NetworkInterface ni in _interfaces) {
+            if (ni.OperationalStatus != OperationalStatus.Up || !ni.SupportsMulticast) {
+                continue;
+            }
+            foreach (UnicastIPAddressInformation uni in ni.GetIPProperties().UnicastAddresses) {
+                // Store the bare address (scope-id stripped for IPv6) so a self-echo source like
+                // fe80::...%26 still matches our unicast fe80::... Equality on IPAddress ignores ScopeId
+                // for comparison only when the bytes match; normalise by mapping to a scopeless copy.
+                _localAddresses.Add(Scopeless(uni.Address));
+            }
+        }
 
         foreach (NetworkInterface ni in _interfaces) {
             if (ni.OperationalStatus != OperationalStatus.Up || !ni.SupportsMulticast) {
@@ -362,16 +383,43 @@ internal class MdnsBrowser : IDisposable {
     /// interface indices that HAD a live socket this window (so a dead-join detector can tell "an interface
     /// that should have received got 0" from "no such interface").
     /// </summary>
-    internal readonly struct ReceiveWindowResult(int packets, Dictionary<int, int> perInterface, HashSet<int> boundInterfaces) {
+    internal readonly struct ReceiveWindowResult(
+        int packets, Dictionary<int, int> perInterface, HashSet<int> boundInterfaces,
+        int foreignPackets, Dictionary<int, int> perInterfaceForeign) {
+        /// <summary>All packets received this window (includes our own multicast query self-echoes).</summary>
         public int Packets { get; } = packets;
         public Dictionary<int, int> PerInterface { get; } = perInterface;
         public HashSet<int> BoundInterfaces { get; } = boundInterfaces;
+        /// <summary>FOREIGN packets only — from another host (real device responses), self-echoes excluded.
+        /// The dead-join detector keys off these so an interface hearing only its own echoes is not counted
+        /// as alive (ScribeHold #1924).</summary>
+        public int ForeignPackets { get; } = foreignPackets;
+        public Dictionary<int, int> PerInterfaceForeign { get; } = perInterfaceForeign;
+    }
+
+    /// <summary>Return an address with no IPv6 scope id, so a scoped self-echo source matches our unicast.</summary>
+    private static IPAddress Scopeless(IPAddress address) {
+        if (address.AddressFamily == AddressFamily.InterNetworkV6 && address.ScopeId != 0) {
+            return new IPAddress(address.GetAddressBytes());
+        }
+        return address;
+    }
+
+    /// <summary>True if <paramref name="source"/> is one of THIS host's own addresses (a query self-echo).</summary>
+    private bool IsSelfEcho(IPAddress source) {
+        IPAddress bare = Scopeless(source);
+        lock (_socketsLock) {
+            return _localAddresses.Contains(bare);
+        }
     }
 
     private async Task<ReceiveWindowResult> ReceiveUntilAsync(IMdnsRecordSink sink, CancellationToken token) {
         int packetsReceived = 0;
-        // Per-interface receive tally for this window, returned to the driver's dead-join detector.
+        int foreignPackets = 0;
+        // Per-interface receive tallies for this window. perInterface = ALL packets; perInterfaceForeign =
+        // FOREIGN (non-self-echo) only — the dead-join detector keys off the foreign tally (#1924).
         var perInterface = new Dictionary<int, int>();
+        var perInterfaceForeign = new Dictionary<int, int>();
         // Snapshot the sockets under the lock so a concurrent RebindSockets() cannot reallocate the list
         // out from under the index-aligned `pending` array. If a rebind happens DURING this window,
         // SocketsRebound cancels the window (see PersistentMdnsBrowser) and the driver re-enters with the
@@ -384,7 +432,7 @@ internal class MdnsBrowser : IDisposable {
             }
         }
         if (sockets.Length == 0) {
-            return new ReceiveWindowResult(0, perInterface, boundInterfaces);
+            return new ReceiveWindowResult(0, perInterface, boundInterfaces, 0, perInterfaceForeign);
         }
 
         // One pending receive per socket; index-aligned with `sockets` so a completed task maps back to the
@@ -423,9 +471,16 @@ internal class MdnsBrowser : IDisposable {
                     pending[slot] = null;
                 }
 
+                bool selfEcho = result.RemoteEndPoint.Address is { } src && IsSelfEcho(src);
                 if (arrivalIndex >= 0) {
                     perInterface[arrivalIndex] = perInterface.TryGetValue(arrivalIndex, out int c) ? c + 1 : 1;
+                    if (!selfEcho) {
+                        perInterfaceForeign[arrivalIndex] = perInterfaceForeign.TryGetValue(arrivalIndex, out int fc) ? fc + 1 : 1;
+                    }
                     LogFirstPacketOnInterface(arrivalIndex, generation);
+                }
+                if (!selfEcho) {
+                    foreignPackets++;
                 }
 
                 byte[] data = result.Buffer;
@@ -456,7 +511,7 @@ internal class MdnsBrowser : IDisposable {
                 await ObserveCancelled(p).ConfigureAwait(false);
             }
         }
-        return new ReceiveWindowResult(packetsReceived, perInterface, boundInterfaces);
+        return new ReceiveWindowResult(packetsReceived, perInterface, boundInterfaces, foreignPackets, perInterfaceForeign);
     }
 
     /// <summary>
