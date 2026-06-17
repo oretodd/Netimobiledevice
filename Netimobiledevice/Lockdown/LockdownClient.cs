@@ -153,7 +153,9 @@ public abstract class LockdownClient : LockdownServiceProvider, IDisposable {
             options.Add("EscrowBag", _pairRecord["EscrowBag"]);
         }
 
+        Logger.LogInformation("[mb2-diag] StartService request for '{Service}' — sending on control connection (medium={Medium})", name, _medium);
         DictionaryNode response = Request("StartService", options).AsDictionaryNode();
+        Logger.LogInformation("[mb2-diag] StartService response received for '{Service}'", name);
         if (response.ContainsKey("Error")) {
             string error = response["Error"].AsStringNode().Value;
             if (error == "PasswordProtected") {
@@ -640,7 +642,10 @@ public abstract class LockdownClient : LockdownServiceProvider, IDisposable {
 
     public override ServiceConnection StartLockdownService(string name, bool useEscrowBag = false, bool useTrustedConnection = true) {
         DictionaryNode attr = GetServiceConnectionAttributes(name, useEscrowBag, useTrustedConnection).AsDictionaryNode();
-        ServiceConnection serviceConnection = CreateServiceConnection((ushort) attr["Port"].AsIntegerNode().Value);
+        ushort servicePort = (ushort) attr["Port"].AsIntegerNode().Value;
+        Logger.LogInformation("[mb2-diag] StartService '{Service}' -> port {Port}; opening service connection", name, servicePort);
+        ServiceConnection serviceConnection = CreateServiceConnection(servicePort);
+        Logger.LogInformation("[mb2-diag] Service connection to '{Service}' on port {Port} opened", name, servicePort);
 
         if (attr.TryGetValue("EnableServiceSSL", out PropertyNode? enableServiceSsl) && enableServiceSsl?.AsBooleanNode().Value == true) {
             if (_pairRecord == null) {
@@ -650,10 +655,15 @@ public abstract class LockdownClient : LockdownServiceProvider, IDisposable {
                 Encoding.UTF8.GetString(_pairRecord["HostCertificate"].AsDataNode().Value),
                 Encoding.UTF8.GetString(_pairRecord["HostPrivateKey"].AsDataNode().Value)
             );
+            Logger.LogInformation("[mb2-diag] Starting SSL handshake for '{Service}' on port {Port}", name, servicePort);
             bool startedSSL = serviceConnection.StartSsl(sslCert);
+            Logger.LogInformation("[mb2-diag] SSL handshake for '{Service}' on port {Port} returned {Result}", name, servicePort, startedSSL);
             if (!startedSSL) {
                 throw new FatalPairingException("Failed starting SSL, assuming pairing issue");
             }
+        }
+        else {
+            Logger.LogInformation("[mb2-diag] Service '{Service}' on port {Port} does not require SSL", name, servicePort);
         }
         return serviceConnection;
     }

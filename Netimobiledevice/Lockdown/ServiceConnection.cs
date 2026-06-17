@@ -312,7 +312,11 @@ public class ServiceConnection : IDisposable {
 
     public PropertyNode? SendReceivePlist(PropertyNode data) {
         SendPlist(data);
-        return ReceivePlist();
+        int rt = SafeTimeout(() => Stream.ReadTimeout);
+        _logger.LogInformation("[mb2-diag] SendReceivePlist: sent request, blocking on synchronous read (ReadTimeout={ReadTimeout}ms, ssl={Ssl})", rt, _sslStream != null);
+        PropertyNode? result = ReceivePlist();
+        _logger.LogInformation("[mb2-diag] SendReceivePlist: read completed");
+        return result;
     }
 
     public async Task<PropertyNode?> SendReceivePlistAsync(PropertyNode data, CancellationToken cancellationToken) {
