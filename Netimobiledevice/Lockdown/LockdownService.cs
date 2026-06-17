@@ -146,22 +146,35 @@ public abstract class LockdownService : IDisposable {
                     answer.Instance);
             }
 
-            foreach (Address address in answer.Addresses) {
+            // Try the device's IPv4 (A-record) address FIRST, then IPv6. On a Wi-Fi NIC with no working
+            // IPv6 route (the owner's machine — #1923) every IPv6 connect to the device's fe80::/fd8d::
+            // AAAA address fails immediately with WSAENETUNREACH (10051), and the routable IPv4 A record
+            // (192.168.68.x — the prototype proved the device answers IPv4 on Wi-Fi and a lockdown connect
+            // to 192.168.68.88:62078 succeeds) was never reached / tried last. Ordering IPv4 first makes the
+            // routable address the first attempt; IPv6 remains a fallback for hosts that DO have IPv6 on the
+            // mDNS interface. A stable ordered copy is logged so a "no IPv4 candidate" case is visible.
+            List<Address> ordered = OrderIpv4First(answer.Addresses);
+            logger.LogDebug("mobdev2 device {Instance} connect candidates (IPv4-first): [{Candidates}]",
+                answer.Instance, string.Join(", ", ordered.ConvertAll(a => a.FullIp)));
+
+            foreach (Address address in ordered) {
                 // Use FullIp, not Ip: iOS advertises mobdev2 on an IPv6 LINK-LOCAL address (fe80::...),
                 // which is unroutable without its zone index. Address.FullIp appends "%<interface>" for
                 // fe80: addresses so the socket can scope it; connecting to the bare Ip fails with an
                 // invalid-argument / no-route error (ScribeHold #1914). The zone-scoped endpoint is also
-                // what we yield, so the backup path reconnects to the same scoped address.
+                // what we yield, so the backup path reconnects to the same scoped address. (IPv4 A records
+                // have no zone, so FullIp returns the bare routable address — what we want.)
                 string endpoint = address.FullIp;
                 TcpLockdownClient lockdown;
                 try {
                     lockdown = MobileDevice.CreateUsingTcp(hostname: endpoint, autopair: false, pairRecord: record);
                 }
                 catch (Exception ex) {
-                    // The TCP lockdown connect/handshake to a matched, advertised device failed. This was
-                    // previously swallowed silently, hiding a "matched but cannot connect" failure mode
-                    // (wrong port, unreachable IP, handshake reject) behind a zero-device sweep.
-                    logger.LogInformation(ex, "mobdev2 device {Instance} at {Endpoint} matched but TCP lockdown connect failed",
+                    // The TCP lockdown connect/handshake to a matched, advertised device failed (e.g. an
+                    // IPv6 candidate on a NIC with no IPv6 route => WSAENETUNREACH). KEEP TRYING the
+                    // remaining candidates — the next one may be the routable IPv4 address — instead of
+                    // letting the first failure abort the device (#1923).
+                    logger.LogInformation(ex, "mobdev2 device {Instance} at {Endpoint} matched but TCP lockdown connect failed; trying next candidate",
                         answer.Instance, endpoint);
                     continue;
                 }
@@ -183,5 +196,27 @@ public abstract class LockdownService : IDisposable {
         logger.LogInformation(
             "mobdev2 sweep result: {AdvertisementsMatched} matched, {AdvertisementsUnmatched} unmatched of {AdvertisementsSeen} advertisement(s)",
             advertisementsMatched, advertisementsUnmatched, advertisementsSeen);
+    }
+
+    /// <summary>
+    /// Return the addresses ordered IPv4 first, then IPv6, preserving the original relative order within
+    /// each family (stable). On a Wi-Fi NIC with no IPv6 route the IPv4 A record is the only routable
+    /// candidate, so it must be attempted before the unreachable fe80::/fd8d:: AAAA addresses (#1923).
+    /// IPv4 vs IPv6 is decided by the presence of ':' in the address string (IPv6 contains colons; an
+    /// IPv4 dotted-quad does not), avoiding an IPAddress.Parse of the already-zone-scoped FullIp.
+    /// </summary>
+    private static List<Address> OrderIpv4First(List<Address> addresses) {
+        List<Address> v4 = [];
+        List<Address> v6 = [];
+        foreach (Address a in addresses) {
+            if (a.Ip.Contains(':')) {
+                v6.Add(a);
+            }
+            else {
+                v4.Add(a);
+            }
+        }
+        v4.AddRange(v6);
+        return v4;
     }
 }
