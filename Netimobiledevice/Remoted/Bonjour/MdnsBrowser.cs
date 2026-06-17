@@ -160,14 +160,7 @@ internal class MdnsBrowser {
         return client;
     }
 
-    private void ParseMdnsMessage(
-        byte[] data,
-        long arrivalInterfaceIndex,
-        HashSet<string> ptrTargets,
-        Dictionary<string, List<Service>> srvMap,
-        Dictionary<string, Dictionary<string, string>> txtMap,
-        Dictionary<string, List<Address>> hostAddrs
-    ) {
+    private void ParseMdnsMessage(byte[] data, long arrivalInterfaceIndex, IMdnsRecordSink sink) {
         if (data.Length < 12) {
             return;
         }
@@ -183,20 +176,16 @@ internal class MdnsBrowser {
             offset = newOffset + 4;
         }
 
+        // Walk EVERY record section — ANSWER, AUTHORITY and ADDITIONAL. mDNS responders routinely put the
+        // SRV/TXT/A records for a browsed PTR in the ADDITIONAL section (known-answer suppression), so a
+        // parser that stopped at anCount would see the PTR but miss its SRV/A and never resolve the
+        // instance (ScribeHold #1914 round 7). anCount+nsCount+arCount covers all three.
         for (int i = 0; i < anCount + nsCount + arCount; i++) {
-            offset = ParseRR(data, offset, arrivalInterfaceIndex, ptrTargets, srvMap, txtMap, hostAddrs);
+            offset = ParseRR(data, offset, arrivalInterfaceIndex, sink);
         }
     }
 
-    private int ParseRR(
-        byte[] data,
-        int offset,
-        long arrivalInterfaceIndex,
-        HashSet<string> ptrTargets,
-        Dictionary<string, List<Service>> srvMap,
-        Dictionary<string, Dictionary<string, string>> txtMap,
-        Dictionary<string, List<Address>> hostAddrs
-    ) {
+    private int ParseRR(byte[] data, int offset, long arrivalInterfaceIndex, IMdnsRecordSink sink) {
         (string? name, int newOffset) = DnsHelpers.DecodeName(data, offset);
         offset = newOffset;
 
@@ -205,6 +194,9 @@ internal class MdnsBrowser {
         }
         ushort rtype = (ushort) ((data[offset] << 8) | data[offset + 1]);
         ushort rclass = (ushort) ((data[offset + 2] << 8) | data[offset + 3]);
+        // TTL is a 32-bit field at offset+4..+7. It drives the record cache's expiry; a TTL of 0 is an
+        // mDNS "goodbye" that evicts the record (ScribeHold #1914 round 7 — devices leaving the LAN).
+        uint ttl = (uint) ((data[offset + 4] << 24) | (data[offset + 5] << 16) | (data[offset + 6] << 8) | data[offset + 7]);
         ushort rdlen = (ushort) ((data[offset + 8] << 8) | data[offset + 9]);
         offset += 10;
 
@@ -217,15 +209,12 @@ internal class MdnsBrowser {
 
         if (rtype == DnsHelpers.QTYPE_PTR) {
             (string? target, int _) = DnsHelpers.DecodeName(rdata, 0);
-            ptrTargets.Add(target);
+            sink.AddPtr(name, target, ttl);
         }
         else if (rtype == DnsHelpers.QTYPE_SRV && rdlen >= 6) {
             ushort port = (ushort) ((rdata[4] << 8) | rdata[5]);
             (string? target, int _) = DnsHelpers.DecodeName(rdata, 6);
-            if (!srvMap.ContainsKey(name)) {
-                srvMap[name] = [];
-            }
-            srvMap[name].Add(new(target, port));
+            sink.AddSrv(name, new Service(target, port), ttl);
         }
         else if (rtype == DnsHelpers.QTYPE_TXT) {
             var dict = new Dictionary<string, string>();
@@ -240,7 +229,7 @@ internal class MdnsBrowser {
                 string[] parts = txt.Split('=', 2);
                 dict[parts[0]] = parts.Length == 2 ? parts[1] : "";
             }
-            txtMap[name] = dict;
+            sink.AddTxt(name, dict, ttl);
         }
         else if ((rtype == DnsHelpers.QTYPE_A && rdlen == 4) ||
                  (rtype == DnsHelpers.QTYPE_AAAA && rdlen == 16)) {
@@ -267,15 +256,9 @@ internal class MdnsBrowser {
             // carried by Address.FullIp ("fe80::...%iface"); the scope above supplies the matching
             // local interface so the scope is correct. An empty iface is still recorded (best effort)
             // rather than discarded — discarding here is exactly what broke WiFi discovery.
-            if (!hostAddrs.ContainsKey(name)) {
-                hostAddrs[name] = [];
-            }
-            List<Address> existing = hostAddrs[name];
-            if (!existing.Exists(a => a.Ip == ip.ToString())) {
-                existing.Add(new Address(ip.ToString(), iface));
-                _logger.LogDebug("mDNS {Type} {Ip} for {Name} on interface '{Interface}'",
-                    ip.AddressFamily == AddressFamily.InterNetworkV6 ? "AAAA" : "A", ip, name, iface);
-            }
+            sink.AddAddress(name, new Address(ip.ToString(), iface), ttl);
+            _logger.LogDebug("mDNS {Type} {Ip} for {Name} on interface '{Interface}' (ttl {Ttl}s)",
+                ip.AddressFamily == AddressFamily.InterNetworkV6 ? "AAAA" : "A", ip, name, iface, ttl);
         }
 
         return offset;
@@ -354,7 +337,11 @@ internal class MdnsBrowser {
     }
 
     /// <summary>
-    /// Discover a DNS-SD/mDNS service type (e.g. "_remoted._tcp.local.") on the local network.
+    /// Discover a DNS-SD/mDNS service type (e.g. "_remoted._tcp.local.") on the local network in a single
+    /// time-bounded sweep. Used by the one-shot Bonjour browse paths (RemoteD, RemotePairing, Tunneld)
+    /// that are NOT polled in a tight loop. For the mobdev2 discovery path, which IS polled every few
+    /// seconds, prefer <see cref="PersistentMdnsBrowser"/> — its cross-sweep record cache resolves
+    /// instances whose PTR/SRV/A arrive across different windows (ScribeHold #1914 round 7).
     /// </summary>
     /// <param name="serviceType"></param>
     /// <param name="timeout"></param>
@@ -368,12 +355,9 @@ internal class MdnsBrowser {
         await SendQuery(query).ConfigureAwait(false);
         _logger.LogDebug("mDNS PTR query sent for {ServiceType} (timeout {Timeout}ms)", serviceType, timeout);
 
-        HashSet<string> ptrTargets = [];
-        Dictionary<string, List<Service>> srvMap = [];
-        Dictionary<string, Dictionary<string, string>> txtMap = [];
-        Dictionary<string, List<Address>> hostAddrs = [];
-        int packetsReceived = 0;
-        int parseFailures = 0;
+        // A per-browse sink that accumulates this sweep's records (single-window semantics, unchanged
+        // for the one-shot callers).
+        SweepRecordSink sink = new();
 
         // timeout is MILLISECONDS (DEFAULT_BONJOUR_TIMEOUT is 2000ms = 2s on Windows, 1000ms elsewhere).
         // This was previously AddSeconds(timeout), which turned the 2000ms default into a 2000-SECOND
@@ -383,21 +367,51 @@ internal class MdnsBrowser {
         // named makes a sweep the intended ~2s.
         TimeSpan window = TimeSpan.FromMilliseconds(timeout);
 
-        // Continuously-pending receive on each socket, awaited against a single overall deadline.
-        //
-        // The previous loop only issued ReceiveAsync() when UdpClient.Available > 0 at poll time and
-        // otherwise slept 50ms. mDNS responses arrive within a few ms of the query, so the response
-        // routinely landed during a sleep and only ONE buffered datagram was drained per 50ms tick —
-        // on a real device this surfaced as "1 packet received, 0 PTR" while `dns-sd` (which keeps a
-        // receive outstanding) saw the advert fine (ScribeHold #1914). Keeping a pending ReceiveAsync
-        // on each socket means every datagram is taken the instant it arrives, for the whole window.
         using var deadline = new CancellationTokenSource(window);
+        int packetsReceived = await ReceiveUntilAsync(sink, deadline.Token).ConfigureAwait(false);
+
+        // Single-arg DropMulticastGroup does not symmetrically drop the per-interface IPv4 memberships
+        // added above, but that is not a leak: both sockets are Close()d immediately, so the OS reclaims
+        // every membership with the socket. The Drop calls are kept as a best-effort tidy-up.
+        _clientV4.DropMulticastGroup(IPAddress.Parse(MdnsMulticastV4));
+        _clientV6.DropMulticastGroup(IPAddress.Parse(MdnsMulticastV6));
+        _clientV4.Close();
+        _clientV6.Close();
+
+        List<ServiceInstance> services = sink.Resolve();
+
+        // One summary line per browse: packets in, raw record counts, and resolved service instances.
+        // This is what turns a silent zero-result sweep into a diagnosable one — we can now tell
+        // "no packets arrived" (browser/interface/firewall) from "packets arrived but no PTR/SRV"
+        // (wrong service type / parse) from "resolved instances but no addresses" (A records missed).
+        _logger.LogInformation(
+            "mDNS browse {ServiceType}: {Packets} packet(s) received, {ParseFailures} parse failure(s), " +
+            "{PtrTargets} PTR target(s), {SrvNames} SRV name(s), {Instances} resolved instance(s)",
+            serviceType, packetsReceived, sink.ParseFailures, sink.PtrTargetCount, sink.SrvCount, services.Count);
+
+        return services;
+    }
+
+    /// <summary>
+    /// Drain every datagram that arrives on either socket until <paramref name="token"/> fires, feeding
+    /// each parsed record into <paramref name="sink"/>. Returns the number of packets received.
+    ///
+    /// Keeps a continuously-pending receive on each socket, awaited against the deadline. The original
+    /// loop only issued ReceiveAsync() when UdpClient.Available > 0 at poll time and otherwise slept
+    /// 50ms; mDNS responses arrive within a few ms of the query, so the response routinely landed during
+    /// a sleep and only ONE buffered datagram was drained per tick — on a real device this surfaced as
+    /// "1 packet received, 0 PTR" while `dns-sd` (which keeps a receive outstanding) saw the advert fine
+    /// (ScribeHold #1914). This shared loop is used by both the one-shot browse and the persistent
+    /// browser's continuous receive.
+    /// </summary>
+    private async Task<int> ReceiveUntilAsync(IMdnsRecordSink sink, CancellationToken token) {
+        int packetsReceived = 0;
         Task<UdpReceiveResult>? recvV4 = null;
         Task<UdpReceiveResult>? recvV6 = null;
         try {
-            while (!deadline.IsCancellationRequested) {
-                recvV4 ??= _clientV4.ReceiveAsync(deadline.Token).AsTask();
-                recvV6 ??= _clientV6.ReceiveAsync(deadline.Token).AsTask();
+            while (!token.IsCancellationRequested) {
+                recvV4 ??= _clientV4.ReceiveAsync(token).AsTask();
+                recvV6 ??= _clientV6.ReceiveAsync(token).AsTask();
 
                 Task<UdpReceiveResult> completed = await Task.WhenAny(recvV4, recvV6).ConfigureAwait(false);
 
@@ -437,57 +451,23 @@ internal class MdnsBrowser {
                     arrivalIndex >= 0 ? arrivalIndex.ToString(System.Globalization.CultureInfo.InvariantCulture) : "?");
 
                 try {
-                    ParseMdnsMessage(data, arrivalIndex, ptrTargets, srvMap, txtMap, hostAddrs);
+                    ParseMdnsMessage(data, arrivalIndex, sink);
                 }
                 catch (Exception ex) {
                     // A single malformed packet must not abort the browse, but it was previously swallowed
                     // silently — count and log it so a parse-side failure is distinguishable from "no packets".
-                    parseFailures++;
+                    sink.RecordParseFailure();
                     _logger.LogDebug(ex, "mDNS packet #{Index} from {Source} failed to parse", packetsReceived, result.RemoteEndPoint);
                 }
             }
         }
         finally {
             // Observe any still-pending receive's cancellation so it doesn't surface as an unobserved
-            // task exception when the sockets close below.
+            // task exception when the sockets close.
             await ObserveCancelled(recvV4).ConfigureAwait(false);
             await ObserveCancelled(recvV6).ConfigureAwait(false);
         }
-
-        // Single-arg DropMulticastGroup does not symmetrically drop the per-interface IPv4 memberships
-        // added above, but that is not a leak: both sockets are Close()d immediately, so the OS reclaims
-        // every membership with the socket. The Drop calls are kept as a best-effort tidy-up.
-        _clientV4.DropMulticastGroup(IPAddress.Parse(MdnsMulticastV4));
-        _clientV6.DropMulticastGroup(IPAddress.Parse(MdnsMulticastV6));
-        _clientV4.Close();
-        _clientV6.Close();
-
-        List<ServiceInstance> services = [];
-        foreach (string inst in ptrTargets) {
-            if (!srvMap.ContainsKey(inst)) {
-                continue;
-            }
-            foreach (Service srv in srvMap[inst]) {
-                ServiceInstance si = new(inst) {
-                    Host = srv.Target.TrimEnd('.'),
-                    Port = srv.Port,
-                    Addresses = hostAddrs.TryGetValue(srv.Target, out List<Address>? value1) ? value1 : [],
-                    Properties = txtMap.TryGetValue(inst, out Dictionary<string, string>? value) ? value : []
-                };
-                services.Add(si);
-            }
-        }
-
-        // One summary line per browse: packets in, raw record counts, and resolved service instances.
-        // This is what turns a silent zero-result sweep into a diagnosable one — we can now tell
-        // "no packets arrived" (browser/interface/firewall) from "packets arrived but no PTR/SRV"
-        // (wrong service type / parse) from "resolved instances but no addresses" (A records missed).
-        _logger.LogInformation(
-            "mDNS browse {ServiceType}: {Packets} packet(s) received, {ParseFailures} parse failure(s), " +
-            "{PtrTargets} PTR target(s), {SrvNames} SRV name(s), {Instances} resolved instance(s)",
-            serviceType, packetsReceived, parseFailures, ptrTargets.Count, srvMap.Count, services.Count);
-
-        return services;
+        return packetsReceived;
     }
 
     /// <summary>
@@ -557,6 +537,81 @@ internal class MdnsBrowser {
                 // Interface may have gone down between join and send — skip onto the next one.
                 _logger.LogTrace(ex, "mDNS IPv6 query send skipped on interface index {Index}", index);
             }
+        }
+    }
+
+    // --- Persistent-mode surface ---------------------------------------------------------------------
+    //
+    // PersistentMdnsBrowser drives the same sockets continuously rather than open-browse-close per sweep.
+    // These thin members let it reuse the bind/send/receive/parse engine without duplicating it, while
+    // BrowseService keeps the one-shot lifecycle for the non-polled callers.
+
+    internal Task<int> ReceiveIntoAsync(IMdnsRecordSink sink, CancellationToken token)
+        => ReceiveUntilAsync(sink, token);
+
+    internal void DropAndClose() {
+        try { _clientV4.DropMulticastGroup(IPAddress.Parse(MdnsMulticastV4)); } catch { /* socket already closing */ }
+        try { _clientV6.DropMulticastGroup(IPAddress.Parse(MdnsMulticastV6)); } catch { /* socket already closing */ }
+        _clientV4.Close();
+        _clientV6.Close();
+    }
+
+    /// <summary>
+    /// Per-sweep record accumulator for the one-shot <see cref="BrowseService"/> path. Resolution requires
+    /// PTR + matching SRV in the same window (the historical single-sweep semantics, preserved for the
+    /// RemoteD/Tunneld callers that browse once rather than polling).
+    /// </summary>
+    private sealed class SweepRecordSink : IMdnsRecordSink {
+        private readonly HashSet<string> _ptrTargets = [];
+        private readonly Dictionary<string, List<Service>> _srvMap = [];
+        private readonly Dictionary<string, Dictionary<string, string>> _txtMap = [];
+        private readonly Dictionary<string, List<Address>> _hostAddrs = [];
+
+        public int ParseFailures { get; private set; }
+        public int PtrTargetCount => _ptrTargets.Count;
+        public int SrvCount => _srvMap.Count;
+
+        public void AddPtr(string serviceType, string instance, uint ttl) => _ptrTargets.Add(instance);
+
+        public void AddSrv(string instance, Service service, uint ttl) {
+            if (!_srvMap.TryGetValue(instance, out List<Service>? list)) {
+                list = [];
+                _srvMap[instance] = list;
+            }
+            list.Add(service);
+        }
+
+        public void AddTxt(string instance, Dictionary<string, string> properties, uint ttl)
+            => _txtMap[instance] = properties;
+
+        public void AddAddress(string host, Address address, uint ttl) {
+            if (!_hostAddrs.TryGetValue(host, out List<Address>? list)) {
+                list = [];
+                _hostAddrs[host] = list;
+            }
+            if (!list.Exists(a => a.Ip == address.Ip)) {
+                list.Add(address);
+            }
+        }
+
+        public void RecordParseFailure() => ParseFailures++;
+
+        public List<ServiceInstance> Resolve() {
+            List<ServiceInstance> services = [];
+            foreach (string inst in _ptrTargets) {
+                if (!_srvMap.TryGetValue(inst, out List<Service>? srvs)) {
+                    continue;
+                }
+                foreach (Service srv in srvs) {
+                    services.Add(new ServiceInstance(inst) {
+                        Host = srv.Target.TrimEnd('.'),
+                        Port = srv.Port,
+                        Addresses = _hostAddrs.TryGetValue(srv.Target, out List<Address>? addrs) ? addrs : [],
+                        Properties = _txtMap.TryGetValue(inst, out Dictionary<string, string>? props) ? props : []
+                    });
+                }
+            }
+            return services;
         }
     }
 }

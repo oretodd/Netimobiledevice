@@ -1,6 +1,7 @@
 using Microsoft.Extensions.Logging;
 using Netimobiledevice.Lockdown;
 using Netimobiledevice.Plist;
+using Netimobiledevice.Remoted.Bonjour;
 
 namespace NetimobiledeviceTest.Lockdown;
 
@@ -129,26 +130,37 @@ public class GetMobdev2LockdownsTests
     {
         // ScribeHold #1914: the mDNS browser layer (MdnsBrowser/BonjourService) was previously SILENT —
         // a zero-result sweep could not be distinguished from "the browse never ran". The logger now
-        // flows GetMobdev2Lockdowns -> BonjourService.BrowseMobdev2Async -> MdnsBrowser, which emits a
-        // per-browse summary (packets received, parse failures, PTR/SRV counts, resolved instances).
-        // On a device-free CI host the browse resolves nothing, but the summary line MUST still appear —
-        // that is exactly what proves the Bonjour chain is now observable end-to-end.
+        // flows GetMobdev2Lockdowns -> BonjourService.BrowseMobdev2Async -> the persistent mDNS browser,
+        // which emits a per-sweep summary (resolved instance count in the accumulated cache). On a
+        // device-free CI host the browse resolves nothing, but the summary line MUST still appear — that
+        // is exactly what proves the Bonjour chain is now observable end-to-end.
+        //
+        // Round 7 replaced the open-listen-close-per-sweep browser with a persistent one that receives
+        // continuously and accumulates records across sweeps, so the observable line is now the
+        // "mDNS persistent sweep ... resolved instance(s) in cache" summary rather than the old
+        // per-browse "packet(s) received" line.
         string dir = Directory.CreateTempSubdirectory("nimd-1914-").FullName;
         CapturingLogger logger = new();
         try {
+            // The persistent mobdev2 browser is a process-wide singleton; tear down any instance a prior
+            // test created so THIS logger captures the sweep summary (a reused browser would log to the
+            // logger from its first creation).
+            await BonjourService.StopMobdev2BrowsingAsync();
+
             WriteRecord(dir, "00008110-AAAA1111BBBB2222", withWiFiMac: true);
 
             await DrainAsync(dir, logger);
 
             bool hasBrowseSummary = logger.Messages.Exists(m =>
-                m.Contains("mDNS browse") &&
+                m.Contains("mDNS persistent sweep") &&
                 m.Contains("_apple-mobdev2._tcp.local.") &&
-                m.Contains("packet(s) received"));
+                m.Contains("resolved instance(s) in cache"));
             Assert.IsTrue(hasBrowseSummary,
-                "Expected an mDNS browse summary line proving the Bonjour layer is instrumented. Messages: "
+                "Expected an mDNS persistent-sweep summary line proving the Bonjour layer is instrumented. Messages: "
                 + string.Join(" | ", logger.Messages));
         }
         finally {
+            await BonjourService.StopMobdev2BrowsingAsync();
             Directory.Delete(dir, recursive: true);
         }
     }
