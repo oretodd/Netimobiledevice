@@ -826,8 +826,16 @@ internal sealed class DeviceLinkService : IDisposable {
     /// <param name="versionMajor">The major version number to check.</param>
     /// <param name="versionMinor">The minor version number to check.</param>
     public async Task VersionExchange(ulong versionMajor, ulong versionMinor, CancellationToken cancellationToken) {
-        // Get DLMessageVersionExchange from device
+        // Get DLMessageVersionExchange from device.
+        // ReceiveMessage returns an EMPTY array when the device sends nothing (ReceivePlistAsync read 0
+        // bytes — common on the FIRST mobilebackup2 DeviceLink read over WiFi against an idle device: the
+        // relay accepts the connection but the version-exchange reply never materialises). Guard the array
+        // BEFORE indexing [0] so this surfaces as a clean DeviceLinkException the backup retry path can
+        // handle, instead of an ArgumentOutOfRangeException that crashes the attempt (ScribeHold #1932).
         ArrayNode versionExchangeMessage = await ReceiveMessage(cancellationToken);
+        if (versionExchangeMessage.Count == 0) {
+            throw new DeviceLinkException("Didn't receive a DLMessageVersionExchange from device (empty reply)");
+        }
         string dlMessage = versionExchangeMessage[0].AsStringNode().Value;
         if (string.IsNullOrEmpty(dlMessage) || dlMessage != "DLMessageVersionExchange") {
             throw new DeviceLinkException("Didn't receive DLMessageVersionExchange from device");
@@ -853,8 +861,11 @@ internal sealed class DeviceLinkService : IDisposable {
             new IntegerNode(versionMajor)
         }, PlistFormat.Binary);
 
-        // Receive DeviceReady message
+        // Receive DeviceReady message (same empty-reply guard as the version exchange above).
         ArrayNode messageDeviceReady = await ReceiveMessage(cancellationToken);
+        if (messageDeviceReady.Count == 0) {
+            throw new DeviceLinkException("Didn't receive a DLMessageDeviceReady from device (empty reply)");
+        }
         dlMessage = messageDeviceReady[0].AsStringNode().Value;
         if (string.IsNullOrEmpty(dlMessage) || dlMessage != "DLMessageDeviceReady") {
             throw new DeviceLinkException("Device link didn't return ready state (DLMessageDeviceReady)");
