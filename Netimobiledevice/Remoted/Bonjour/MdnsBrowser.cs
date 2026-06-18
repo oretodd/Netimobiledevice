@@ -489,7 +489,10 @@ internal class MdnsBrowser : IDisposable {
                 // level. The arrival interface is now the receiving socket's OWN interface index (exact),
                 // the decisive datum for ScribeHold #1917: a sweep that resolves a device must show its
                 // adverts arriving on the Wi-Fi index, not only the VPN/virtual if 32.
-                _logger.LogDebug("mDNS packet #{Index} received: {Bytes} bytes from {Source} (arrived on if {Interface})",
+                // OBSERVATION-ONLY (#1936): per-packet noise demoted Debug->Trace so the service's default
+                // Debug level is no longer flooded one-line-per-datagram; the per-sweep heartbeat
+                // (PersistentMdnsBrowser) carries the aggregate. Message + args unchanged.
+                _logger.LogTrace("mDNS packet #{Index} received: {Bytes} bytes from {Source} (arrived on if {Interface})",
                     packetsReceived, data.Length, result.RemoteEndPoint,
                     arrivalIndex >= 0 ? arrivalIndex.ToString(System.Globalization.CultureInfo.InvariantCulture) : "?");
 
@@ -500,7 +503,9 @@ internal class MdnsBrowser : IDisposable {
                     // A single malformed packet must not abort the browse, but it was previously swallowed
                     // silently — count and log it so a parse-side failure is distinguishable from "no packets".
                     sink.RecordParseFailure();
-                    _logger.LogDebug(ex, "mDNS packet #{Index} from {Source} failed to parse", packetsReceived, result.RemoteEndPoint);
+                    // OBSERVATION-ONLY (#1936): per-packet parse-fail noise demoted Debug->Trace (the sweep
+                    // browse summary already reports the aggregate ParseFailures count). Message + args unchanged.
+                    _logger.LogTrace(ex, "mDNS packet #{Index} from {Source} failed to parse", packetsReceived, result.RemoteEndPoint);
                 }
             }
         }
@@ -526,7 +531,10 @@ internal class MdnsBrowser : IDisposable {
             firstForKey = _firstPacketLogged.Add(key);
         }
         if (firstForKey) {
-            _logger.LogInformation("first mDNS packet received on if {Interface} (socket generation {Gen})",
+            // OBSERVATION-ONLY (#1936): demoted Info->Debug — still fires once per (interface, generation),
+            // but no longer at the default Info level (the per-sweep heartbeat is the headline signal).
+            // Message + args unchanged.
+            _logger.LogDebug("first mDNS packet received on if {Interface} (socket generation {Gen})",
                 interfaceIndex, generation);
         }
     }

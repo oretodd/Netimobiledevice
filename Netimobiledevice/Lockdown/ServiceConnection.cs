@@ -81,7 +81,7 @@ public class ServiceConnection : IDisposable {
     /// </summary>
     private static readonly TimeSpan TcpConnectTimeout = TimeSpan.FromSeconds(10);
 
-    private static Socket ConnectTcpBounded(IPAddress ip, ushort port) {
+    private static Socket ConnectTcpBounded(IPAddress ip, ushort port, ILogger? logger = null) {
         Socket sock = new Socket(SocketType.Stream, ProtocolType.IP);
         try {
             // ConnectAsync + a timeout gives the bounded connect that Socket.Connect lacks. On timeout the
@@ -93,6 +93,12 @@ public class ServiceConnection : IDisposable {
         }
         catch (OperationCanceledException) {
             sock.Dispose();
+            // OBSERVATION-ONLY (#1936): name the layer + the timeout VALUE before the (unchanged) throw, so
+            // an L3 unicast-62078 reachability timeout is loud and queryable. Does not change the timeout
+            // budget or the throw shape.
+            (logger ?? NullLogger.Instance).LogWarning(
+                "WiFi TCP connect to {Ip}:{Port} timed out after {TimeoutMs}ms (L3 unicast 62078 reachability)",
+                ip, port, (long) TcpConnectTimeout.TotalMilliseconds);
             throw new SocketException((int) SocketError.TimedOut);
         }
         catch {
@@ -103,7 +109,7 @@ public class ServiceConnection : IDisposable {
 
     internal static ServiceConnection CreateUsingTcp(string hostname, ushort port, ILogger? logger = null) {
         IPAddress ip = IPAddress.Parse(hostname);
-        Socket sock = ConnectTcpBounded(ip, port);
+        Socket sock = ConnectTcpBounded(ip, port, logger);
         ConfigureKeepAlive(sock);
         return new ServiceConnection(sock, logger ?? NullLogger.Instance);
     }
@@ -117,6 +123,11 @@ public class ServiceConnection : IDisposable {
         }
         catch (OperationCanceledException) {
             sock.Dispose();
+            // OBSERVATION-ONLY (#1936): mirror the synchronous path — name the layer + timeout value before
+            // the unchanged throw. Does not change the timeout budget or throw shape.
+            (logger ?? NullLogger.Instance).LogWarning(
+                "WiFi TCP connect to {Ip}:{Port} timed out after {TimeoutMs}ms (L3 unicast 62078 reachability)",
+                ip, port, (long) TcpConnectTimeout.TotalMilliseconds);
             throw new SocketException((int) SocketError.TimedOut);
         }
         catch {
@@ -223,6 +234,13 @@ public class ServiceConnection : IDisposable {
                     }
                     catch (OperationCanceledException) {
                         if (localTaskComplete.IsCancellationRequested) {
+                            // OBSERVATION-ONLY (#1936): the WiFi lockdown CONTROL-channel read budget fired.
+                            // Name the layer + the value before the (unchanged) throw so an L4 lockdown
+                            // handshake/control timeout is loud and queryable. Stream.ReadTimeout is safe to
+                            // read here — this branch only runs when it was != -1.
+                            _logger.LogWarning(
+                                "WiFi lockdown control read timed out after {TimeoutMs}ms (L4 lockdown handshake/control)",
+                                Stream.ReadTimeout);
                             throw new TimeoutException("Timeout waiting for message from service");
                         }
                         throw;
@@ -313,9 +331,9 @@ public class ServiceConnection : IDisposable {
     public PropertyNode? SendReceivePlist(PropertyNode data) {
         SendPlist(data);
         int rt = SafeTimeout(() => Stream.ReadTimeout);
-        _logger.LogInformation("[mb2-diag] SendReceivePlist: sent request, blocking on synchronous read (ReadTimeout={ReadTimeout}ms, ssl={Ssl})", rt, _sslStream != null);
+        _logger.LogTrace("[mb2-diag] SendReceivePlist: sent request, blocking on synchronous read (ReadTimeout={ReadTimeout}ms, ssl={Ssl})", rt, _sslStream != null);
         PropertyNode? result = ReceivePlist();
-        _logger.LogInformation("[mb2-diag] SendReceivePlist: read completed");
+        _logger.LogTrace("[mb2-diag] SendReceivePlist: read completed");
         return result;
     }
 
