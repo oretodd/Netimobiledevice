@@ -834,7 +834,11 @@ internal sealed class DeviceLinkService : IDisposable {
         // handle, instead of an ArgumentOutOfRangeException that crashes the attempt (ScribeHold #1932).
         ArrayNode versionExchangeMessage = await ReceiveMessage(cancellationToken);
         if (versionExchangeMessage.Count == 0) {
-            throw new DeviceLinkException("Didn't receive a DLMessageVersionExchange from device (empty reply)");
+            // #1932 guard behaviour retained unchanged (empty 0-byte read -> clean exception, same
+            // message). The thrown type is refined to EmptyDeviceLinkReplyException — still a
+            // DeviceLinkException, so every existing catch is unaffected — so the WiFi stale-escrow
+            // wedge (#1945) can be classified without fragile message-string matching.
+            throw new EmptyDeviceLinkReplyException("Didn't receive a DLMessageVersionExchange from device (empty reply)");
         }
         string dlMessage = versionExchangeMessage[0].AsStringNode().Value;
         if (string.IsNullOrEmpty(dlMessage) || dlMessage != "DLMessageVersionExchange") {
@@ -864,7 +868,8 @@ internal sealed class DeviceLinkService : IDisposable {
         // Receive DeviceReady message (same empty-reply guard as the version exchange above).
         ArrayNode messageDeviceReady = await ReceiveMessage(cancellationToken);
         if (messageDeviceReady.Count == 0) {
-            throw new DeviceLinkException("Didn't receive a DLMessageDeviceReady from device (empty reply)");
+            // Same empty-reply guard refinement as the version-exchange read above (#1932 / #1945).
+            throw new EmptyDeviceLinkReplyException("Didn't receive a DLMessageDeviceReady from device (empty reply)");
         }
         dlMessage = messageDeviceReady[0].AsStringNode().Value;
         if (string.IsNullOrEmpty(dlMessage) || dlMessage != "DLMessageDeviceReady") {
