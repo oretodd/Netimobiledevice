@@ -1,3 +1,5 @@
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
 using System;
 using System.Collections.Generic;
 using System.Linq;
@@ -36,6 +38,10 @@ public sealed class MdnsRecordCache : IMdnsRecordSink {
 
     private readonly object _lock = new();
     private readonly Func<DateTime> _utcNow;
+    // OBSERVATION-ONLY (ScribeHold #1936): Trace-level L2 RX observation logger. Defaults to NullLogger so
+    // existing call sites (and tests) that construct the cache with no logger are unaffected. Logging here
+    // records record arrivals/goodbyes; it never changes the eviction policy or any cache logic.
+    private readonly ILogger _logger;
 
     // PTR: service type (e.g. "_apple-mobdev2._tcp.local.") -> set of instance names it points at.
     private readonly Dictionary<string, Dictionary<string, Expiring<bool>>> _ptr = new(StringComparer.OrdinalIgnoreCase);
@@ -46,11 +52,12 @@ public sealed class MdnsRecordCache : IMdnsRecordSink {
     // Addresses: host name (the SRV target) -> distinct addresses (by FullIp), each with its expiry.
     private readonly Dictionary<string, Dictionary<string, Expiring<Address>>> _addr = new(StringComparer.OrdinalIgnoreCase);
 
-    public MdnsRecordCache() : this(static () => DateTime.UtcNow) { }
+    public MdnsRecordCache(ILogger? logger = null) : this(static () => DateTime.UtcNow, logger) { }
 
     /// <summary>Test seam: inject a deterministic clock so TTL/expiry behaviour is verifiable.</summary>
-    public MdnsRecordCache(Func<DateTime> utcNow) {
+    public MdnsRecordCache(Func<DateTime> utcNow, ILogger? logger = null) {
         _utcNow = utcNow ?? throw new ArgumentNullException(nameof(utcNow));
+        _logger = logger ?? NullLogger.Instance;
     }
 
     /// <summary>
@@ -63,6 +70,8 @@ public sealed class MdnsRecordCache : IMdnsRecordSink {
                 if (_ptr.TryGetValue(serviceType, out Dictionary<string, Expiring<bool>>? targets)) {
                     targets.Remove(instance);
                 }
+                // OBSERVATION-ONLY (#1936): L2 RX goodbye/eviction. Trace level, no policy change.
+                _logger.LogTrace("[mdns-rx] evict {Type} {Name} (goodbye, ttl=0) for {Instance}", "PTR", serviceType, instance);
                 return;
             }
             if (!_ptr.TryGetValue(serviceType, out Dictionary<string, Expiring<bool>>? map)) {
@@ -70,6 +79,8 @@ public sealed class MdnsRecordCache : IMdnsRecordSink {
                 _ptr[serviceType] = map;
             }
             map[instance] = new Expiring<bool>(true, ExpiryFrom(ttlSeconds));
+            // OBSERVATION-ONLY (#1936): L2 RX record insert. Trace level, no policy change.
+            _logger.LogTrace("[mdns-rx] insert {Type} {Name} -> {Instance} (ttl {Ttl}s)", "PTR", serviceType, instance, ttlSeconds);
         }
     }
 
@@ -102,9 +113,13 @@ public sealed class MdnsRecordCache : IMdnsRecordSink {
             string key = address.FullIp;
             if (ttlSeconds == 0) {
                 map.Remove(key);
+                // OBSERVATION-ONLY (#1936): L2 RX address goodbye/eviction. Trace level, no policy change.
+                _logger.LogTrace("[mdns-rx] evict {Type} {Name} {Ip} (goodbye, ttl=0)", "A/AAAA", host, key);
                 return;
             }
             map[key] = new Expiring<Address>(address, ExpiryFrom(ttlSeconds));
+            // OBSERVATION-ONLY (#1936): L2 RX address insert. Trace level, no policy change.
+            _logger.LogTrace("[mdns-rx] insert {Type} {Name} {Ip} (ttl {Ttl}s)", "A/AAAA", host, key, ttlSeconds);
         }
     }
 

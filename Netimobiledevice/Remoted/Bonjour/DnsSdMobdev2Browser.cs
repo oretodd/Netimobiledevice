@@ -140,7 +140,9 @@ public sealed class DnsSdMobdev2Browser : IDisposable {
         if (err != kErrorNoError || (flags & kFlagsAdd) == 0) {
             return;
         }
-        _logger.LogDebug("dnssd mobdev2 browse add: {Service} (if {Interface})", serviceName, iface);
+        // OBSERVATION-ONLY (#1936): L1/L2 dnssd-daemon browse-callback observation. Debug level; the
+        // {Layer} field matches the Service-side diagnostic shape so the daemon path is queryable too.
+        _logger.LogDebug("dnssd mobdev2 browse add: {Service} (if {Interface}) layer={Layer}", serviceName, iface, "L2_MdnsRx");
         ResolveReply resolveCb = OnResolve;
         lock (_lock) {
             _callbacks.Add(resolveCb);
@@ -156,6 +158,9 @@ public sealed class DnsSdMobdev2Browser : IDisposable {
             return;
         }
         ushort hostPort = (ushort)((port >> 8) | (port << 8)); // network -> host order
+        // OBSERVATION-ONLY (#1936): L2 dnssd resolve-callback observation. Debug; queryable {Layer} field.
+        _logger.LogDebug("dnssd mobdev2 resolve: {Service} -> {Host}:{Port} (if {Interface}) layer={Layer}",
+            fullname, hostTarget, hostPort, iface, "L2_MdnsRx");
         lock (_lock) {
             _instances[fullname] = new ResolvedInstance { Instance = fullname, Host = hostTarget, Port = hostPort, Interface = iface };
             AddrReply addrCb = OnAddr;
@@ -186,7 +191,8 @@ public sealed class DnsSdMobdev2Browser : IDisposable {
             }
             if (!list.Contains(ipStr)) {
                 list.Add(ipStr);
-                _logger.LogDebug("dnssd mobdev2 addr: {Host} -> {Ip} (if {Interface})", hostname, ipStr, iface);
+                // OBSERVATION-ONLY (#1936): L2 dnssd getaddrinfo-callback observation. Debug; {Layer} field.
+                _logger.LogDebug("dnssd mobdev2 addr: {Host} -> {Ip} (if {Interface}) layer={Layer}", hostname, ipStr, iface, "L2_MdnsRx");
             }
         }
     }

@@ -90,6 +90,12 @@ public sealed class PersistentMdnsBrowser : IAsyncDisposable {
     // device rather than every sweep.
     private readonly HashSet<string> _announced = new(StringComparer.OrdinalIgnoreCase);
 
+    // OBSERVATION-ONLY (ScribeHold #1936): per-sweep heartbeat state. _sweepId counts receive windows so a
+    // log line can be correlated to a sweep; _heartbeatTracker is the PURE deaf-NIC decision helper (warn
+    // once after N consecutive zero-foreign sweeps, reset on activity). Neither affects discovery behavior.
+    private int _sweepId;
+    private readonly MdnsSweepHeartbeatTracker _heartbeatTracker = new();
+
     public PersistentMdnsBrowser(string serviceType, ILogger? logger = null, MdnsRecordCache? cache = null) {
         if (!serviceType.EndsWith('.')) {
             serviceType += ".";
@@ -181,6 +187,7 @@ public sealed class PersistentMdnsBrowser : IAsyncDisposable {
                 }
                 _cache.Prune();
                 EvaluateDeadJoins(result);
+                EmitSweepHeartbeat(result);
             }
         }
         catch (OperationCanceledException) {
@@ -281,6 +288,49 @@ public sealed class PersistentMdnsBrowser : IAsyncDisposable {
             _logger.LogWarning("mDNS: rebinding sockets (dead-join self-heal)");
             RequestRebind("dead-join detector");
         }
+    }
+
+    /// <summary>
+    /// OBSERVATION-ONLY (ScribeHold #1936): emit the per-sweep mDNS heartbeat. This is the blind-spot fix —
+    /// previously nothing reported per sweep, so an L2 receive deafness (the NIC stopped hearing device
+    /// responses) was invisible. The PURE <see cref="MdnsSweepHeartbeatTracker"/> decides: when a sweep has
+    /// foreign (real device-response) RX, log a Debug heartbeat with the per-interface counts; when N
+    /// consecutive sweeps see ZERO foreign RX, log ONE Warning that the NIC is deaf (then suppress until
+    /// activity resets the counter). Field names match the Service-side MdnsSweepHeartbeatEvent shape
+    /// (<c>{SweepId}</c>, <c>{ForeignRxPackets}</c>, <c>{Resolved}</c>, <c>{InterfaceActivity}</c>) so both
+    /// sources are queryable identically. The counter NEVER affects discovery behavior.
+    /// </summary>
+    private void EmitSweepHeartbeat(MdnsBrowser.ReceiveWindowResult result) {
+        int sweepId = ++_sweepId;
+        int foreignRx = result.ForeignPackets;
+        int resolved = _cache.Resolve(_serviceType).Count;
+        string interfaceActivity = DescribeInterfaceActivity(result);
+
+        SweepHeartbeatDecision decision = _heartbeatTracker.Record(foreignRx);
+        if (decision.EmitDeafWarning) {
+            _logger.LogWarning(
+                "mDNS NIC deaf for {Sweeps} consecutive sweeps (no foreign RX) — L2 receive blind spot; sweep={SweepId} foreignRxPackets={ForeignRxPackets} resolved={Resolved} interfaceActivity={InterfaceActivity}",
+                decision.ConsecutiveZeroForeignSweeps, sweepId, foreignRx, resolved, interfaceActivity);
+            return;
+        }
+
+        _logger.LogDebug(
+            "mDNS sweep heartbeat sweep={SweepId} foreignRxPackets={ForeignRxPackets} resolved={Resolved} interfaceActivity={InterfaceActivity}",
+            sweepId, foreignRx, resolved, interfaceActivity);
+    }
+
+    /// <summary>Build a compact "if=total/foreign" per-interface activity string for the heartbeat.</summary>
+    private static string DescribeInterfaceActivity(MdnsBrowser.ReceiveWindowResult result) {
+        if (result.BoundInterfaces is null || result.BoundInterfaces.Count == 0) {
+            return "(none bound)";
+        }
+        List<string> parts = [];
+        foreach (int ifIndex in result.BoundInterfaces) {
+            int total = result.PerInterface is not null && result.PerInterface.TryGetValue(ifIndex, out int t) ? t : 0;
+            int foreign = result.PerInterfaceForeign is not null && result.PerInterfaceForeign.TryGetValue(ifIndex, out int f) ? f : 0;
+            parts.Add($"if{ifIndex}={total}/{foreign}");
+        }
+        return string.Join(", ", parts);
     }
 
     /// <summary>
