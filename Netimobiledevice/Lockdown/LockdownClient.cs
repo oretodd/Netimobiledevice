@@ -714,6 +714,10 @@ public abstract class LockdownClient : LockdownServiceProvider, IDisposable {
             };
             Request("Unpair", options, true);
             IsPaired = false;
+            // ScribeHold fork (Hook A): an explicit unpair invalidates the pair record, so the
+            // latched validation must be cleared too — otherwise GetServiceConnectionAttributes
+            // would still pass the !PairRecordValidated gate for a device that is no longer paired.
+            PairRecordValidated = false;
             _pairRecord = null;
         }
     }
@@ -729,6 +733,10 @@ public abstract class LockdownClient : LockdownServiceProvider, IDisposable {
             };
             await RequestAsync("Unpair", options, true).ConfigureAwait(false);
             IsPaired = false;
+            // ScribeHold fork (Hook A): an explicit unpair invalidates the pair record, so the
+            // latched validation must be cleared too — otherwise GetServiceConnectionAttributes
+            // would still pass the !PairRecordValidated gate for a device that is no longer paired.
+            PairRecordValidated = false;
             _pairRecord = null;
         }
     }
