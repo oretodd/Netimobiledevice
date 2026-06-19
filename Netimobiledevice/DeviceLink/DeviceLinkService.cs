@@ -7,6 +7,7 @@ using Netimobiledevice.Plist;
 using System;
 using System.Collections.Generic;
 using System.ComponentModel;
+using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Text;
@@ -20,8 +21,11 @@ public delegate void SendFileErrorEventHandler(DictionaryNode errorNode, string 
 internal sealed class DeviceLinkService : IDisposable {
     private const int BULK_OPERATION_ERROR = -13;
     private const uint FILE_TRANSFER_TERMINATOR = 0x00;
-    // Set the default timeout to be 5 minutes
-    private const int SERVICE_TIMEOUT = 5 * 60 * 1000;
+    // ScribeHold fork: bumped 5 → 10 minutes. iOS's "build incremental diff" prep window on
+    // large devices (iPhone 16 Pro Max heavy users, iOS 26.x) regularly takes 5–6 minutes
+    // between passcode-accepted and the first PROGRESS-TICK. The original 5-minute value was
+    // on the wrong side of that variance and produced spurious TimeoutException failures.
+    private const int SERVICE_READ_TIMEOUT_MS = 10 * 60 * 1000;
 
     private readonly ServiceConnection _service;
     private readonly string _rootPath;
@@ -30,7 +34,24 @@ internal sealed class DeviceLinkService : IDisposable {
     private readonly bool _ignoreTransferErrors;
     private readonly bool _performBackupSizeCheck;
     private FileStream? _fileStream;
+    private bool _discarding;
     private CancellationTokenSource _internalCancellationTokenSource;
+
+    // ScribeHold fork: throughput instrumentation — accumulates time spent in the USB/network
+    // receive call vs. the disk write call during UploadFiles. Used to diagnose whether backup
+    // speed is transfer-bound or disk-bound. Read/reset via GetAndResetThroughputStats().
+    private long _rxBytes;
+    private long _rxTicks;
+    private long _wxBytes;
+    private long _wxTicks;
+
+    /// <summary>
+    /// ScribeHold fork: optional delegate to classify whether a file should be discarded (bytes
+    /// drained but not written to disk). When null, all files are written normally. When set,
+    /// called once per file at the start of the first chunk using the device-side path.
+    /// Returns true = discard.
+    /// </summary>
+    public Func<string, bool>? ShouldDiscardFile { get; set; }
 
     private Dictionary<string, Func<ArrayNode, CancellationToken, Task>> DeviceLinkHandlers { get; }
     /// <summary>
@@ -92,7 +113,7 @@ internal sealed class DeviceLinkService : IDisposable {
         _internalCancellationTokenSource = new CancellationTokenSource();
 
         // Adjust the timeout to be long enough to handle device with a large amount of data
-        _service.SetTimeout(SERVICE_TIMEOUT);
+        _service.SetTimeout(SERVICE_READ_TIMEOUT_MS);
 
         DeviceLinkHandlers = new Dictionary<string, Func<ArrayNode, CancellationToken, Task>>() {
             { DeviceLinkMessage.ContentsOfDirectory, ContentsOfDirectory },
@@ -316,29 +337,58 @@ internal sealed class DeviceLinkService : IDisposable {
     /// <param name="msg">The message received from the device.</param>
     /// <returns>The number of items moved.</returns>
     private async Task MoveItems(ArrayNode msg, CancellationToken cancellationToken) {
-        foreach (KeyValuePair<string, PropertyNode> move in msg[1].AsDictionaryNode()) {
+        // [DISK-DIAG] Per-invocation counters — see SoliMessage issue #912.
+        // These tell us whether device-driven MoveItems is responsible for the
+        // mid-backup D: free-space oscillation observed in PerfMon.
+        var moves = msg[1].AsDictionaryNode();
+        int moveCount = 0;
+        int destOverwriteCount = 0;
+        long destOverwriteBytes = 0;
+        int movesApplied = 0;
+        _logger.LogInformation("[DISK-DIAG] MoveItems invoked: {Count} moves requested by device", moves.Count);
+
+        foreach (KeyValuePair<string, PropertyNode> move in moves) {
             if (cancellationToken.IsCancellationRequested) {
                 break;
             }
+            moveCount++;
 
             string newPath = move.Value.AsStringNode().Value;
             if (!string.IsNullOrEmpty(newPath)) {
                 FileInfo newFile = new FileInfo(Path.Combine(_rootPath, newPath));
                 if (newFile.Exists) {
+                    // [DISK-DIAG] Destination exists — device wants us to overwrite.
+                    // Capture size so we know how many bytes are being released here.
+                    long overwrittenBytes = 0;
                     if (newFile.Attributes.HasFlag(FileAttributes.Directory)) {
+                        try {
+                            overwrittenBytes = new DirectoryInfo(newFile.FullName)
+                                .EnumerateFiles("*", SearchOption.AllDirectories)
+                                .Sum(f => { try { return f.Length; } catch { return 0L; } });
+                        }
+                        catch { /* size probe is best-effort */ }
                         new DirectoryInfo(newFile.FullName).Delete(true);
                     }
                     else {
+                        try { overwrittenBytes = newFile.Length; } catch { /* best-effort */ }
                         newFile.Delete();
                     }
+                    destOverwriteCount++;
+                    destOverwriteBytes += overwrittenBytes;
+                    _logger.LogInformation("[DISK-DIAG] MoveItems overwrite: dest={NewPath} existed ({Bytes} bytes) — deleted before rename",
+                        newPath, overwrittenBytes);
                 }
 
                 FileInfo oldFile = new FileInfo(Path.Combine(_rootPath, move.Key));
                 if (oldFile.Exists) {
                     oldFile.MoveTo(newFile.FullName);
+                    movesApplied++;
                 }
             }
         }
+
+        _logger.LogInformation("[DISK-DIAG] MoveItems complete: {MoveCount} moves requested, {Applied} applied, {OverwriteCount} destinations overwritten, {OverwriteBytes} bytes released via overwrite",
+            moveCount, movesApplied, destOverwriteCount, destOverwriteBytes);
 
         if (!cancellationToken.IsCancellationRequested) {
             await SendStatusReport(0, string.Empty, cancellationToken: cancellationToken).ConfigureAwait(false);
@@ -469,7 +519,17 @@ internal sealed class DeviceLinkService : IDisposable {
     /// <param name="msg">The message received from the device.</param>
     /// <returns>The number of items removed.</returns>
     private async Task RemoveItems(ArrayNode message, CancellationToken cancellationToken) {
+        // [DISK-DIAG] Per-invocation counters — see SoliMessage issue #912.
+        // These tell us whether device-driven RemoveItems is responsible for the
+        // mid-backup D: free-space recovery observed in PerfMon during long backups.
         ArrayNode removes = message[1].AsArrayNode();
+        int filesDeleted = 0;
+        long fileBytesReleased = 0;
+        int dirsDeleted = 0;
+        long dirBytesReleased = 0;
+        int notFoundCount = 0;
+        _logger.LogInformation("[DISK-DIAG] RemoveItems invoked: {Count} paths requested by device", removes.Count);
+
         foreach (StringNode filename in removes.Cast<StringNode>()) {
             if (cancellationToken.IsCancellationRequested) {
                 break;
@@ -481,10 +541,29 @@ internal sealed class DeviceLinkService : IDisposable {
             else {
                 string path = Path.Combine(_rootPath, filename.Value);
                 if (File.Exists(path)) {
+                    long size = 0;
+                    try { size = new FileInfo(path).Length; } catch { /* best-effort */ }
                     File.Delete(path);
+                    filesDeleted++;
+                    fileBytesReleased += size;
+                    _logger.LogInformation("[DISK-DIAG] RemoveItems file: {Path} ({Bytes} bytes)", filename.Value, size);
                 }
                 else if (Directory.Exists(path)) {
+                    long size = 0;
+                    try {
+                        size = new DirectoryInfo(path)
+                            .EnumerateFiles("*", SearchOption.AllDirectories)
+                            .Sum(f => { try { return f.Length; } catch { return 0L; } });
+                    }
+                    catch { /* best-effort */ }
                     Directory.Delete(path, true);
+                    dirsDeleted++;
+                    dirBytesReleased += size;
+                    _logger.LogInformation("[DISK-DIAG] RemoveItems dir: {Path} ({Bytes} bytes)", filename.Value, size);
+                }
+                else {
+                    notFoundCount++;
+                    _logger.LogDebug("[DISK-DIAG] RemoveItems target not found: {Path}", filename.Value);
                 }
             }
 
@@ -492,6 +571,9 @@ internal sealed class DeviceLinkService : IDisposable {
                 await SendStatusReport(0, string.Empty, cancellationToken: cancellationToken).ConfigureAwait(false);
             }
         }
+
+        _logger.LogInformation("[DISK-DIAG] RemoveItems complete: {FilesDeleted} files ({FileBytes} bytes), {DirsDeleted} dirs ({DirBytes} bytes), {NotFound} not found. Total released: {TotalBytes} bytes",
+            filesDeleted, fileBytesReleased, dirsDeleted, dirBytesReleased, notFoundCount, fileBytesReleased + dirBytesReleased);
     }
 
     /// <summary>
@@ -581,12 +663,39 @@ internal sealed class DeviceLinkService : IDisposable {
                 if (backupFile.LocalPath.Contains("Status.plist") && File.Exists(backupFile.LocalPath)) {
                     File.Delete(backupFile.LocalPath);
                 }
-                _fileStream ??= File.OpenWrite(backupFile.LocalPath);
-                _fileStream.Seek(0, SeekOrigin.End);
+
+                // ScribeHold fork: classify once per file (at first chunk). If discarding, skip
+                // File.OpenWrite and drain all chunks without writing. _fileStream stays null for
+                // discarded files.
+                if (_fileStream == null && !_discarding) {
+                    _discarding = ShouldDiscardFile?.Invoke(backupFile.DevicePath) ?? false;
+                    if (!_discarding) {
+                        _fileStream = File.OpenWrite(backupFile.LocalPath);
+                        _fileStream.Seek(0, SeekOrigin.End);
+                    }
+                }
+                else if (_fileStream != null) {
+                    _fileStream.Seek(0, SeekOrigin.End);
+                }
 
                 while (size > 0 && code == ResultCode.FileData) {
+                    // ScribeHold fork: time the transfer receive and disk write separately so the
+                    // caller can diagnose whether the backup is transfer-bound or disk-bound. We
+                    // measure only the buffer-sized chunk transfers here (the dominant path);
+                    // metadata ReadInt32/ReadCode calls are excluded as they are negligible.
+                    long rxStart = Stopwatch.GetTimestamp();
                     byte[] buffer = await _service.ReceiveAsync(size, cancellationToken).ConfigureAwait(false);
-                    await _fileStream.WriteAsync(buffer, cancellationToken).ConfigureAwait(false);
+                    long rxElapsed = Stopwatch.GetTimestamp() - rxStart;
+                    Interlocked.Add(ref _rxBytes, buffer.Length);
+                    Interlocked.Add(ref _rxTicks, rxElapsed);
+
+                    if (!_discarding) {
+                        long wxStart = Stopwatch.GetTimestamp();
+                        await _fileStream!.WriteAsync(buffer, cancellationToken).ConfigureAwait(false);
+                        long wxElapsed = Stopwatch.GetTimestamp() - wxStart;
+                        Interlocked.Add(ref _wxBytes, buffer.Length);
+                        Interlocked.Add(ref _wxTicks, wxElapsed);
+                    }
 
                     backupFile.FileSize += buffer.Length;
                     OnFileReceiving(backupFile, buffer);
@@ -602,11 +711,18 @@ internal sealed class DeviceLinkService : IDisposable {
 
                     _logger.LogWarning("Failed to fully upload {localPath}. Device file name {devicePath}. Reason: {msg}", backupFile.LocalPath, backupFile.DevicePath, errorMessage);
                     OnFileTransferError(backupFile, $"{code}: {msg} [ExpectedSize: {backupFile.ExpectedFileSize}, ActualReceived: {backupFile.FileSize} ]");
+                    _discarding = false;
 
                     continue;
                 }
 
                 if (code == ResultCode.Success) {
+                    if (_discarding) {
+                        // Create zero-byte stub so Manifest.db references and subsequent incremental
+                        // backup logic (File.Exists check) remain consistent.
+                        using (File.Create(backupFile.LocalPath)) { }
+                        _discarding = false;
+                    }
                     OnFileReceived(backupFile);
                 }
             }
@@ -623,6 +739,21 @@ internal sealed class DeviceLinkService : IDisposable {
         }
     }
 
+
+    /// <summary>
+    /// ScribeHold fork: returns cumulative receive/write throughput counters and resets them to
+    /// zero. Intended for diagnostic logging at the end of a backup session to determine whether
+    /// transfer time is dominated by the transfer receive or the disk write.
+    /// </summary>
+    public (long rxBytes, TimeSpan rxTime, long wxBytes, TimeSpan wxTime) GetAndResetThroughputStats() {
+        long rxBytes = Interlocked.Exchange(ref _rxBytes, 0);
+        long rxTicks = Interlocked.Exchange(ref _rxTicks, 0);
+        long wxBytes = Interlocked.Exchange(ref _wxBytes, 0);
+        long wxTicks = Interlocked.Exchange(ref _wxTicks, 0);
+        var rxTime = TimeSpan.FromSeconds((double) rxTicks / Stopwatch.Frequency);
+        var wxTime = TimeSpan.FromSeconds((double) wxTicks / Stopwatch.Frequency);
+        return (rxBytes, rxTime, wxBytes, wxTime);
+    }
 
     public void Dispose() {
         Disconnect();
