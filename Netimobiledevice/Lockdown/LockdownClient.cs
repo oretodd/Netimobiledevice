@@ -35,6 +35,17 @@ public abstract class LockdownClient : LockdownServiceProvider, IDisposable {
     private readonly string _sessionId;
     private string _systemBuid;
 
+    /// <summary>
+    /// Set by <see cref="ValidatePairing"/> when the device ACCEPTED the StartSession handshake (so a
+    /// valid pair record exists and the device considers us paired) but then ABORTED the SSL
+    /// re-validation of the lockdown CONTROL connect (<see cref="ServiceConnection.StartSsl"/> returned
+    /// <c>false</c> on a connection abort/reset). In that state the device is already paired — a fresh
+    /// <c>PairDevice</c> would be wrong (it requires a user Trust prompt the device is not offering) — so
+    /// <see cref="HandleAutoPair"/> leaves the (identity-readable, non-SSL) client usable instead of
+    /// escalating to <see cref="FatalPairingException"/>. ScribeHold #1958 seam e1.
+    /// </summary>
+    private bool _sslReValidationAbortedWhilePaired;
+
     protected readonly DirectoryInfo? _pairingRecordsCacheDirectory;
     /// <summary>
     /// The pairing record for the connected device
@@ -330,6 +341,7 @@ public abstract class LockdownClient : LockdownServiceProvider, IDisposable {
     }
 
     private bool ValidatePairing() {
+        _sslReValidationAbortedWhilePaired = false;
         if (_pairRecord == null && !string.IsNullOrEmpty(Identifier)) {
             try {
                 FetchPairRecord();
@@ -384,6 +396,12 @@ public abstract class LockdownClient : LockdownServiceProvider, IDisposable {
             );
             bool? startedSSL = _service?.StartSsl(sslCert);
             IsPaired = startedSSL == true;
+            // StartSession was accepted (the device knows this HostID/pair record) but the SSL
+            // re-validation was declined/aborted by the device — record it so HandleAutoPair does NOT
+            // force a destructive re-pair on an already-paired device (ScribeHold #1958 seam e1).
+            if (startedSSL == false) {
+                _sslReValidationAbortedWhilePaired = true;
+            }
         }
 
         // Reload data after pairing
@@ -407,6 +425,17 @@ public abstract class LockdownClient : LockdownServiceProvider, IDisposable {
 
     protected virtual void HandleAutoPair(bool autoPair, float timeout) {
         if (ValidatePairing()) {
+            return;
+        }
+
+        // The device accepted StartSession (it IS paired) but aborted the SSL re-validation of the
+        // lockdown CONTROL connect. Re-pairing here would be wrong: the device is already paired and is
+        // not offering the user Trust prompt PairDevice needs — it would either throw or, on the merged
+        // build, leave the device "Unknown / disappeared". Return with the (non-SSL, identity-readable)
+        // client instead so identity reads succeed and the device stays Connected-but-degraded. Trusted
+        // services (mobilebackup2) still correctly throw NotPairedException downstream because
+        // IsPaired == false. ScribeHold #1958 seam e1.
+        if (_sslReValidationAbortedWhilePaired) {
             return;
         }
 
