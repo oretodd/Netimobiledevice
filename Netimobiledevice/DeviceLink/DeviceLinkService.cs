@@ -775,8 +775,14 @@ internal sealed class DeviceLinkService : IDisposable {
             string command = message[0].AsStringNode().Value;
             _logger.LogDebug("Command recieved: {command}", command);
             if (command == DeviceLinkMessage.ProcessMessage) {
-                if (message[1].AsDictionaryNode()["ErrorCode"].AsIntegerNode().Value != (ulong) ResultCode.Success) {
-                    throw new DeviceLinkException($"Device link error: {PropertyList.SaveAsString(message[1], PlistFormat.Xml)}");
+                ulong errorCode = message[1].AsDictionaryNode()["ErrorCode"].AsIntegerNode().Value;
+                if (errorCode != (ulong) ResultCode.Success) {
+                    string errorPlist = PropertyList.SaveAsString(message[1], PlistFormat.Xml);
+                    // Surface the daemon errno as a typed subtype so callers can react to a specific code
+                    // without parsing the serialized plist. Existing catch (DeviceLinkException) is unaffected
+                    // (DeviceLinkServiceException : DeviceLinkException). e.g. errno 208 = device auto-locked
+                    // mid-backup, which the host can recover from rather than treating as fatal.
+                    throw new DeviceLinkServiceException((int) errorCode, $"Device link error (ErrorCode {errorCode}): {errorPlist}");
                 }
                 Completed?.Invoke(this, new BackupResultEventArgs(FailedFiles, false, false));
                 return ResultCode.Success;
