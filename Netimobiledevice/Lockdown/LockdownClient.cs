@@ -30,10 +30,27 @@ public abstract class LockdownClient : LockdownServiceProvider, IDisposable {
     /// The internal logger
     /// </summary>
     private readonly ILogger _logger;
-    private readonly ConnectionMedium _medium;
     private readonly ushort _port;
     private readonly string _sessionId;
     private string _systemBuid;
+
+    /// <summary>
+    /// ScribeHold fork (Hook B): the connection medium for this client. Defaults to Tcp; the
+    /// usbmux subclass assigns Usbmux so the pair record is saved back to usbmuxd after Pair().
+    /// Upstream declared this as an unassigned readonly field that always read Tcp, so SavePairRecord
+    /// to usbmuxd never fired. Making it settable from the subclass fixes that latent correctness bug.
+    /// </summary>
+    protected ConnectionMedium Medium { get; set; } = ConnectionMedium.Tcp;
+
+    /// <summary>
+    /// ScribeHold fork (Hook A): true once a pair record has been validated via a successful
+    /// StartSession + control-channel SSL handshake. Unlike <see cref="IsPaired"/>, this is NOT
+    /// cleared when a later control-channel SSL re-validation is declined — a declined re-validation
+    /// does not unpair the device, and the mb2 data socket opens its own independent SSL connection.
+    /// Used to gate trusted service starts so a transient SSL decline cannot block a backup whose
+    /// pair record was already proven valid.
+    /// </summary>
+    public bool PairRecordValidated { get; private set; }
 
     protected readonly DirectoryInfo? _pairingRecordsCacheDirectory;
     /// <summary>
@@ -142,7 +159,11 @@ public abstract class LockdownClient : LockdownServiceProvider, IDisposable {
     }
 
     private DictionaryNode GetServiceConnectionAttributes(string name, bool useEscrowBag, bool useTrustedConnection) {
-        if (!IsPaired && useTrustedConnection) {
+        // ScribeHold fork (Hook A): gate on PairRecordValidated, not IsPaired. A prior successful
+        // StartSession proves the pair record is valid; a later declined control-channel SSL
+        // re-validation flips IsPaired=false but does not invalidate the pair record. The mb2 data
+        // socket opens its own SSL connection, so blocking here on IsPaired wrongly fails the backup.
+        if (!PairRecordValidated && useTrustedConnection) {
             throw new NotPairedException();
         }
 
@@ -308,7 +329,7 @@ public abstract class LockdownClient : LockdownServiceProvider, IDisposable {
         _pairRecord = newPairRecord;
         WriteStorageFile($"{Udid}.plist", PropertyList.SaveAsByteArray(_pairRecord, PlistFormat.Xml));
 
-        if (_medium == ConnectionMedium.Usbmux) {
+        if (Medium == ConnectionMedium.Usbmux) {
             byte[] recordData = PropertyList.SaveAsByteArray(_pairRecord, PlistFormat.Xml);
 
             UsbmuxConnection mux = UsbmuxConnection.Create(logger: Logger);
@@ -386,6 +407,10 @@ public abstract class LockdownClient : LockdownServiceProvider, IDisposable {
 
         // Reload data after pairing
         if (IsPaired) {
+            // ScribeHold fork (Hook A): a successful StartSession + SSL handshake proves the pair
+            // record is valid. Latch PairRecordValidated so a later declined SSL re-validation
+            // (which flips IsPaired back to false) does not block a backup whose trust is intact.
+            PairRecordValidated = true;
             _allValues = GetValue()?.AsDictionaryNode() ?? [];
             Udid = _allValues["UniqueDeviceID"].AsStringNode().Value;
         }

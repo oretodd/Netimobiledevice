@@ -15,6 +15,9 @@ public class UsbmuxLockdownClient : LockdownClient {
         : base(service, hostId, identifier, label, systemBuid, pairRecord, pairingRecordsCacheDirectory, port, logger) {
         _usbmuxAddress = usbmuxAddress;
         ConnectionType = UsbmuxdConnectionType.Usb;
+        // ScribeHold fork (Hook B): mark the medium as usbmux so Pair() saves the pair record back
+        // to usbmuxd. Upstream left _medium unassigned (always Tcp), so this never fired.
+        Medium = ConnectionMedium.Usbmux;
     }
 
     public override ServiceConnection CreateServiceConnection(ushort port) {
