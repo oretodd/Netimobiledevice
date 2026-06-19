@@ -46,6 +46,22 @@ public abstract class LockdownClient : LockdownServiceProvider, IDisposable {
     /// </summary>
     private bool _sslReValidationAbortedWhilePaired;
 
+    /// <summary>
+    /// Set by <see cref="ValidatePairing"/> when the device ACCEPTED the <c>StartSession</c> handshake —
+    /// i.e. it recognised our <c>HostID</c>/<c>SystemBUID</c> and considers the pair record valid. This is
+    /// the authoritative "the pair record is good" signal, independent of whether the device subsequently
+    /// declined the control-connect SSL re-validation (which #1958 seam e1 records in
+    /// <see cref="_sslReValidationAbortedWhilePaired"/> and which clears <see cref="IsPaired"/> to keep the
+    /// device on the Connected-but-degraded list without a "Unknown / Unknown Model" display).
+    ///
+    /// Trusted services such as mobilebackup2 negotiate their OWN SSL on the data socket, so a
+    /// StartSession-validated device with a present pair record + escrow bag is backup-capable even when
+    /// the lockdown CONTROL connect declined SSL re-validation. <see cref="GetServiceConnectionAttributes"/>
+    /// gates on THIS signal (not the display-driven <see cref="IsPaired"/>) so the seam e1 display fix no
+    /// longer forces the trusted-service path to <see cref="NotPairedException"/>. ScribeHold #1965.
+    /// </summary>
+    private bool _pairRecordValidatedViaStartSession;
+
     protected readonly DirectoryInfo? _pairingRecordsCacheDirectory;
     /// <summary>
     /// The pairing record for the connected device
@@ -152,8 +168,37 @@ public abstract class LockdownClient : LockdownServiceProvider, IDisposable {
         };
     }
 
+    /// <summary>
+    /// Decides whether starting a TRUSTED lockdown service (e.g. mobilebackup2) must be blocked with
+    /// <see cref="NotPairedException"/>. A trusted-service start is blocked ONLY when the connection is
+    /// trusted AND the device is neither <paramref name="isPaired"/> nor StartSession-validated with a
+    /// present pair record.
+    ///
+    /// <para>
+    /// This is the load-bearing #1965 decision. Before #1965 the gate keyed solely on
+    /// <paramref name="isPaired"/>, but #1958 seam e1 deliberately clears <c>IsPaired</c> when the device
+    /// declines the control-connect SSL re-validation (to keep the device on the Connected list without a
+    /// "Unknown" display). That same cleared flag wrongly forced an actually-paired device to throw
+    /// <see cref="NotPairedException"/> on every backup. A device that ACCEPTED <c>StartSession</c> has a
+    /// valid pair record and is backup-capable — mobilebackup2 negotiates its OWN SSL on the data socket —
+    /// so the StartSession-validated signal (with a present pair record) keeps the trusted path open even
+    /// when the control-connect SSL re-validation was declined.
+    /// </para>
+    /// </summary>
+    /// <param name="useTrustedConnection">Whether the requested service requires a trusted connection.</param>
+    /// <param name="isPaired">The display-driven <see cref="IsPaired"/> flag (seam e1 may clear this).</param>
+    /// <param name="pairRecordValidatedViaStartSession">Whether <c>StartSession</c> was accepted this connect.</param>
+    /// <param name="hasPairRecord">Whether a pair record is present (needed for the escrow bag).</param>
+    internal static bool IsTrustedServiceStartBlocked(bool useTrustedConnection, bool isPaired, bool pairRecordValidatedViaStartSession, bool hasPairRecord) {
+        if (!useTrustedConnection) {
+            return false;
+        }
+        bool pairValidForTrustedService = isPaired || (pairRecordValidatedViaStartSession && hasPairRecord);
+        return !pairValidForTrustedService;
+    }
+
     private DictionaryNode GetServiceConnectionAttributes(string name, bool useEscrowBag, bool useTrustedConnection) {
-        if (!IsPaired && useTrustedConnection) {
+        if (IsTrustedServiceStartBlocked(useTrustedConnection, IsPaired, _pairRecordValidatedViaStartSession, _pairRecord != null)) {
             throw new NotPairedException();
         }
 
@@ -342,6 +387,7 @@ public abstract class LockdownClient : LockdownServiceProvider, IDisposable {
 
     private bool ValidatePairing() {
         _sslReValidationAbortedWhilePaired = false;
+        _pairRecordValidatedViaStartSession = false;
         if (_pairRecord == null && !string.IsNullOrEmpty(Identifier)) {
             try {
                 FetchPairRecord();
@@ -377,6 +423,10 @@ public abstract class LockdownClient : LockdownServiceProvider, IDisposable {
                 { "SystemBUID", new StringNode(_systemBuid) }
             };
             startSession = Request("StartSession", options).AsDictionaryNode();
+            // The device accepted StartSession: it recognises this HostID/SystemBUID and considers the
+            // pair record valid. Record that authoritatively so trusted services (mobilebackup2) can
+            // proceed even if the control-connect SSL re-validation below is declined (ScribeHold #1965).
+            _pairRecordValidatedViaStartSession = true;
         }
         catch (LockdownException ex) {
             if (ex.LockdownError == LockdownError.InvalidHostID) {
@@ -432,9 +482,11 @@ public abstract class LockdownClient : LockdownServiceProvider, IDisposable {
         // lockdown CONTROL connect. Re-pairing here would be wrong: the device is already paired and is
         // not offering the user Trust prompt PairDevice needs — it would either throw or, on the merged
         // build, leave the device "Unknown / disappeared". Return with the (non-SSL, identity-readable)
-        // client instead so identity reads succeed and the device stays Connected-but-degraded. Trusted
-        // services (mobilebackup2) still correctly throw NotPairedException downstream because
-        // IsPaired == false. ScribeHold #1958 seam e1.
+        // client instead so identity reads succeed and the device stays Connected-but-degraded
+        // (ScribeHold #1958 seam e1). Trusted services (mobilebackup2) are NO LONGER blocked here even
+        // though IsPaired == false: GetServiceConnectionAttributes now gates on the StartSession-validated
+        // signal (_pairRecordValidatedViaStartSession) so a StartSession-validated device with a present
+        // pair record stays backup-capable (ScribeHold #1965).
         if (_sslReValidationAbortedWhilePaired) {
             return;
         }
