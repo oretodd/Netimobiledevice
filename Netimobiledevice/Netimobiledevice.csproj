@@ -9,6 +9,10 @@
 		<IsTrimmable>True</IsTrimmable>
 		<Nullable>Enable</Nullable>
 		<TargetFrameworks>net10.0</TargetFrameworks>
+		<!-- Suppress warnings in this third-party fork; we only fix bugs, not upstream code quality.
+		     CA1416 is intentionally omitted: upstream applies [SupportedOSPlatform("Windows")] on
+		     TunTapDevice, so the analyzer is satisfied without the suppression. -->
+		<NoWarn>$(NoWarn);CS0169;CS0414;CS0649;CS8602;CS8603;CS8618;IL2026</NoWarn>
 	</PropertyGroup>
 
 	<PropertyGroup>
