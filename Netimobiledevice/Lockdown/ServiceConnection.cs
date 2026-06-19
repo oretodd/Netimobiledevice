@@ -97,6 +97,14 @@ public class ServiceConnection : IDisposable {
             throw new NoDeviceConnectedException();
         }
         Socket sock = targetDevice.Connect(port, usbmuxAddress: usbmuxAddress, logger);
+        // ScribeHold fork (#1857): keepalive budget must outlast the multi-minute heads-down bursts
+        // usbmuxd produces while servicing the multiplexed device data channel — otherwise the local
+        // TCP stack aborts a healthy relay socket and the bulk read throws IOException(10053/10054).
+        // Budget ~= 120 + 10*30 = ~7 min, kept under DeviceLinkService's 10-min read timeout.
+        sock.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.KeepAlive, true);
+        sock.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.TcpKeepAliveTime, 120);
+        sock.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.TcpKeepAliveInterval, 30);
+        sock.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.TcpKeepAliveRetryCount, 10);
         return new ServiceConnection(sock, timeout, logger ?? NullLogger.Instance, targetDevice);
     }
 
@@ -109,6 +117,14 @@ public class ServiceConnection : IDisposable {
             throw new NoDeviceConnectedException();
         }
         Socket sock = await targetDevice.ConnectAsync(port, usbmuxAddress: usbmuxAddress, logger).ConfigureAwait(false);
+        // ScribeHold fork (#1857): keepalive budget must outlast the multi-minute heads-down bursts
+        // usbmuxd produces while servicing the multiplexed device data channel — otherwise the local
+        // TCP stack aborts a healthy relay socket and the bulk read throws IOException(10053/10054).
+        // Budget ~= 120 + 10*30 = ~7 min, kept under DeviceLinkService's 10-min read timeout.
+        sock.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.KeepAlive, true);
+        sock.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.TcpKeepAliveTime, 120);
+        sock.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.TcpKeepAliveInterval, 30);
+        sock.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.TcpKeepAliveRetryCount, 10);
         return new ServiceConnection(sock, timeout, logger ?? NullLogger.Instance, targetDevice);
     }
 
