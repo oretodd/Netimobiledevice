@@ -398,6 +398,10 @@ public class ServiceConnection : IDisposable {
             _logger.LogError("SSL handshake timed out after {TimeoutSeconds}s on the service connection", SslHandshakeTimeout.TotalSeconds);
             return false;
         }
+        catch (Exception ex) when (IsHandshakeConnectionAbort(ex)) {
+            _logger.LogError(ex, "SSL handshake aborted by the device on the service connection (connection abort/reset)");
+            return false;
+        }
 
         if (readTimeout != Timeout.Infinite) {
             _sslStream.ReadTimeout = readTimeout;
@@ -447,7 +451,33 @@ public class ServiceConnection : IDisposable {
             _logger.LogError("SSL handshake timed out after {TimeoutSeconds}s on the service connection", SslHandshakeTimeout.TotalSeconds);
             return false;
         }
+        catch (Exception ex) when (IsHandshakeConnectionAbort(ex)) {
+            _logger.LogError(ex, "SSL handshake aborted by the device on the service connection (connection abort/reset)");
+            return false;
+        }
 
         return true;
+    }
+
+    /// <summary>
+    /// True when <paramref name="ex"/> represents the device tearing down the TLS handshake mid-flight:
+    /// a <see cref="SocketException"/> with <see cref="SocketError.ConnectionAborted"/> (WSAECONNABORTED,
+    /// 10053) or <see cref="SocketError.ConnectionReset"/> (WSAECONNRESET, 10054) — thrown directly by
+    /// <c>AuthenticateAsClientAsync</c> or wrapped inside an <see cref="IOException"/>. An already-paired
+    /// device that declines the autopair SSL RE-VALIDATION of the lockdown CONTROL connect surfaces this
+    /// signature (ScribeHold #1958, confirmed independent of host VPN and of trust freshness by the
+    /// Wave-1 bisect). It is treated as a recoverable handshake FAILURE (StartSsl returns <c>false</c>),
+    /// NOT a fatal connect abort, so identity-only consumers keep a usable client.
+    /// </summary>
+    internal static bool IsHandshakeConnectionAbort(Exception ex)
+    {
+        for (Exception? current = ex; current is not null; current = current.InnerException) {
+            if (current is SocketException socketEx &&
+                (socketEx.SocketErrorCode == SocketError.ConnectionAborted ||
+                 socketEx.SocketErrorCode == SocketError.ConnectionReset)) {
+                return true;
+            }
+        }
+        return false;
     }
 }
