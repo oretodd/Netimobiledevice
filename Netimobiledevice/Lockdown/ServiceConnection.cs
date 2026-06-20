@@ -314,9 +314,16 @@ public class ServiceConnection : IDisposable {
         }
         _networkStream.Flush();
 
+        // ScribeHold fork (#1999): the SSL trust handshake must NOT carry the finite data-read
+        // timeout (default 10_000 ms from the re-fork's ServiceConnection ctor). The device shows
+        // a trust/passcode dialog during AuthenticateAsClient that legitimately takes longer than
+        // 10 s; a finite stream timeout makes the host abort the relay socket (SocketException
+        // 10053) and the handshake fails. Run the handshake with Timeout.Infinite (matching the
+        // working marketing behavior), then restore _timeout so the subsequent #1857 bulk-read
+        // budget — set explicitly via SetTimeout by DeviceLinkService — is preserved.
         _sslStream = new SslStream(_networkStream, true, UserCertificateValidationCallback, null, EncryptionPolicy.RequireEncryption) {
-            ReadTimeout = _timeout,
-            WriteTimeout = _timeout
+            ReadTimeout = Timeout.Infinite,
+            WriteTimeout = Timeout.Infinite
         };
         try {
             // TLS v1.2 is supported since iOS 5 so we should specify this as a minimum
@@ -325,6 +332,9 @@ public class ServiceConnection : IDisposable {
         catch (Exception ex) {
             _logger.LogError(ex, "SSL authentication failed");
             return false;
+        }
+        finally {
+            RestoreStreamTimeoutAfterHandshake();
         }
 
         return true;
@@ -336,9 +346,12 @@ public class ServiceConnection : IDisposable {
         }
         await _networkStream.FlushAsync().ConfigureAwait(false);
 
+        // ScribeHold fork (#1999): see StartSsl — handshake runs with Timeout.Infinite so the
+        // trust/passcode dialog (which can exceed the 10 s data-read default) cannot abort the
+        // socket, then _timeout is restored for the subsequent #1857-protected data reads.
         _sslStream = new SslStream(_networkStream, true, UserCertificateValidationCallback, null, EncryptionPolicy.RequireEncryption) {
-            ReadTimeout = _timeout,
-            WriteTimeout = _timeout
+            ReadTimeout = Timeout.Infinite,
+            WriteTimeout = Timeout.Infinite
         };
         try {
             // TLS v1.2 is supported since iOS 5 so we should specify this as a minimum
@@ -348,7 +361,25 @@ public class ServiceConnection : IDisposable {
             _logger.LogError(ex, "SSL authentication failed");
             return false;
         }
+        finally {
+            RestoreStreamTimeoutAfterHandshake();
+        }
 
         return true;
+    }
+
+    /// <summary>
+    /// Restore the configured data-read timeout (<see cref="_timeout"/>) onto the active SSL stream
+    /// once the trust handshake has completed. The handshake itself runs with
+    /// <see cref="Timeout.Infinite"/> so the device's trust/passcode dialog cannot abort the socket
+    /// (#1999), but bulk data reads must keep the finite budget (#1857) that DeviceLinkService and
+    /// the other services rely on via <see cref="SetTimeout"/>.
+    /// </summary>
+    private void RestoreStreamTimeoutAfterHandshake() {
+        if (_sslStream == null) {
+            return;
+        }
+        _sslStream.ReadTimeout = _timeout;
+        _sslStream.WriteTimeout = _timeout;
     }
 }
