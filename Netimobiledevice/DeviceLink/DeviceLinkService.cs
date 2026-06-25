@@ -792,9 +792,25 @@ internal sealed class DeviceLinkService : IDisposable {
     /// <param name="versionMajor">The major version number to check.</param>
     /// <param name="versionMinor">The minor version number to check.</param>
     public async Task VersionExchange(ulong versionMajor, ulong versionMinor, CancellationToken cancellationToken) {
+        // ScribeHold fork (#2068): this is the exact step where the "empty-reply-FIN" wedge bites.
+        // Trace each sub-step with elapsed-ms timing (Debug-gated, free when off) so a live failure
+        // self-explains: FIN-before-reply vs partial vs malformed plist, and WHERE the ~1s wedge
+        // diverges from a healthy ~fast handshake.
+        bool diag = _logger.IsEnabled(LogLevel.Debug);
+        Stopwatch stopwatch = diag ? Stopwatch.StartNew() : new Stopwatch();
+        if (diag) {
+            _logger.LogDebug("DeviceLink VersionExchange: awaiting DLMessageVersionExchange from device (expect {Major}.{Minor})", versionMajor, versionMinor);
+        }
+
         // Get DLMessageVersionExchange from device
         ArrayNode versionExchangeMessage = await ReceiveMessage(cancellationToken);
+        if (diag) {
+            _logger.LogDebug(
+                "DeviceLink VersionExchange: received {Count}-element message after {ElapsedMs}ms: {Message}",
+                versionExchangeMessage.Count, stopwatch.ElapsedMilliseconds, DescribePlist(versionExchangeMessage));
+        }
         if (versionExchangeMessage.Count < 3) {
+            // FIN-before-reply / malformed: ReceiveMessage returns [] when ReceivePlistAsync read 0 bytes.
             throw new DeviceLinkException("DLMessageVersionExchange has unexpected format (size < 3)");
         }
 
@@ -814,6 +830,9 @@ internal sealed class DeviceLinkService : IDisposable {
         }
 
         // The version is ok so send reply
+        if (diag) {
+            _logger.LogDebug("DeviceLink VersionExchange: device offered {Major}.{Minor}; sending DLVersionsOk at {ElapsedMs}ms", vMajor, vMinor, stopwatch.ElapsedMilliseconds);
+        }
         _service.SendPlist(new ArrayNode {
             new StringNode("DLMessageVersionExchange"),
             new StringNode("DLVersionsOk"),
@@ -821,10 +840,47 @@ internal sealed class DeviceLinkService : IDisposable {
         }, PlistFormat.Binary);
 
         // Receive DeviceReady message
+        if (diag) {
+            _logger.LogDebug("DeviceLink VersionExchange: awaiting DLMessageDeviceReady at {ElapsedMs}ms", stopwatch.ElapsedMilliseconds);
+        }
         ArrayNode messageDeviceReady = await ReceiveMessage(cancellationToken);
+        if (diag) {
+            _logger.LogDebug(
+                "DeviceLink VersionExchange: received {Count}-element reply after {ElapsedMs}ms: {Message}",
+                messageDeviceReady.Count, stopwatch.ElapsedMilliseconds, DescribePlist(messageDeviceReady));
+        }
+        if (messageDeviceReady.Count == 0) {
+            // FIN after our DLVersionsOk reply but before DeviceReady — the device accepted the
+            // version but tore down the connection (distinct from the pre-reply FIN above).
+            throw new DeviceLinkException("Device link didn't return ready state (DLMessageDeviceReady); received empty reply");
+        }
         dlMessage = messageDeviceReady[0].AsStringNode().Value;
         if (string.IsNullOrEmpty(dlMessage) || dlMessage != "DLMessageDeviceReady") {
             throw new DeviceLinkException("Device link didn't return ready state (DLMessageDeviceReady)");
+        }
+        if (diag) {
+            _logger.LogDebug("DeviceLink VersionExchange: completed (DeviceReady) in {ElapsedMs}ms", stopwatch.ElapsedMilliseconds);
+        }
+    }
+
+    /// <summary>
+    /// ScribeHold fork (#2068): render a DeviceLink array message as a compact, log-safe string for
+    /// the diagnostic trace. The first element (the DLMessage* type tag) is the discriminator we care
+    /// about; an empty array means a 0-byte/FIN read returned nothing.
+    /// </summary>
+    private static string DescribePlist(ArrayNode message) {
+        if (message.Count == 0) {
+            return "<empty / 0-byte read>";
+        }
+        try {
+            return string.Join(", ", message.Select(static n => n switch {
+                StringNode s => $"\"{s.Value}\"",
+                IntegerNode i => i.Value.ToString(System.Globalization.CultureInfo.InvariantCulture),
+                _ => n.GetType().Name
+            }));
+        }
+        catch (Exception) {
+            return $"<{message.Count} elements>";
         }
     }
 }

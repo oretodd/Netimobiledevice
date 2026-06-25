@@ -158,10 +158,22 @@ public class ServiceConnection : IDisposable {
 
             int bytesRead = Stream.Read(buffer, totalBytesRead, readSize);
             if (bytesRead == 0) {
-                _logger.LogError("Read zero bytes so the connection has been broken");
+                // ScribeHold fork (#2068): the device sent a 0-byte read (FIN). Log WHERE in the
+                // expected payload it died so a wedge self-explains: a FIN at offset 0 of a 4-byte
+                // length-prefix read is the "empty-reply-FIN at version-exchange" signature, while a
+                // FIN partway through a payload read is a truncated/partial reply.
+                _logger.LogError(
+                    "Read zero bytes so the connection has been broken (FIN at offset {Offset}/{Expected} bytes)",
+                    totalBytesRead, length);
                 break;
             }
             totalBytesRead += bytesRead;
+        }
+
+        // ScribeHold fork (#2068): wire-level read trace, gated to Debug (Netimobiledevice category
+        // is pinned to Warning unless EnableDiagnosticLogging raises it), so it is free when off.
+        if (_logger.IsEnabled(LogLevel.Debug)) {
+            _logger.LogDebug("ServiceConnection.Receive read {Read}/{Expected} bytes", totalBytesRead, length);
         }
 
         if (totalBytesRead < buffer.Length) {
@@ -192,7 +204,11 @@ public class ServiceConnection : IDisposable {
                     try {
                         bytesRead = await Stream.ReadAsync(buffer.AsMemory(totalBytesRead, readSize), linkedCancellationTokenSource.Token).ConfigureAwait(false);
                         if (bytesRead == 0) {
-                            _logger.LogError("Read zero bytes so the connection has been broken");
+                            // ScribeHold fork (#2068): record WHERE the FIN landed — offset 0 of a 4-byte
+                            // length-prefix read is the empty-reply-FIN-at-version-exchange signature.
+                            _logger.LogError(
+                                "Read zero bytes so the connection has been broken (FIN at offset {Offset}/{Expected} bytes)",
+                                totalBytesRead, length);
                             break;
                         }
                     }
@@ -209,6 +225,11 @@ public class ServiceConnection : IDisposable {
             }
 
             totalBytesRead += bytesRead;
+        }
+
+        // ScribeHold fork (#2068): wire-level read trace (Debug-gated, free when off).
+        if (_logger.IsEnabled(LogLevel.Debug)) {
+            _logger.LogDebug("ServiceConnection.ReceiveAsync read {Read}/{Expected} bytes", totalBytesRead, length);
         }
 
         if (totalBytesRead < buffer.Length) {
@@ -337,6 +358,7 @@ public class ServiceConnection : IDisposable {
             RestoreStreamTimeoutAfterHandshake();
         }
 
+        LogSslHandshakeResult();
         return true;
     }
 
@@ -365,7 +387,22 @@ public class ServiceConnection : IDisposable {
             RestoreStreamTimeoutAfterHandshake();
         }
 
+        LogSslHandshakeResult();
         return true;
+    }
+
+    /// <summary>
+    /// ScribeHold fork (#2068): on a successful handshake, log the negotiated TLS version and cipher
+    /// suite (Debug-gated, free when the Netimobiledevice category is at its default Warning level).
+    /// This distinguishes "SSL ok" from "SSL handshake threw" when diagnosing a version-exchange FIN.
+    /// </summary>
+    private void LogSslHandshakeResult() {
+        if (_sslStream == null || !_logger.IsEnabled(LogLevel.Debug)) {
+            return;
+        }
+        _logger.LogDebug(
+            "SSL handshake established: protocol={Protocol} cipher={Cipher}",
+            _sslStream.SslProtocol, _sslStream.NegotiatedCipherSuite);
     }
 
     /// <summary>

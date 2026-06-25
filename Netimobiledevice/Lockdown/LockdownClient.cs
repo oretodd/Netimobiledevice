@@ -396,13 +396,23 @@ public abstract class LockdownClient : LockdownServiceProvider, IDisposable {
             }
         }
 
-        if (startSession.TryGetValue("EnableSessionSSL", out PropertyNode? enableSessionSslNode) && enableSessionSslNode.AsBooleanNode().Value) {
+        bool enableSessionSsl = startSession.TryGetValue("EnableSessionSSL", out PropertyNode? enableSessionSslNode) && enableSessionSslNode.AsBooleanNode().Value;
+        // ScribeHold fork (#2068): log the StartSession outcome on the lockdown control channel — whether
+        // the device asked for session SSL, and (below) whether the handshake succeeded. The per-handshake
+        // TLS version/cipher is logged by ServiceConnection.StartSsl itself. Debug-gated, free when off.
+        if (_logger.IsEnabled(LogLevel.Debug)) {
+            _logger.LogDebug("StartSession ok: EnableSessionSSL={EnableSessionSSL}", enableSessionSsl);
+        }
+        if (enableSessionSsl) {
             X509Certificate2 sslCert = CertificateGenerator.LoadCertificate(
                 Encoding.UTF8.GetString(_pairRecord["HostCertificate"].AsDataNode().Value),
                 Encoding.UTF8.GetString(_pairRecord["HostPrivateKey"].AsDataNode().Value)
             );
             bool? startedSSL = _service?.StartSsl(sslCert);
             IsPaired = startedSSL == true;
+            if (_logger.IsEnabled(LogLevel.Debug)) {
+                _logger.LogDebug("StartSession control-channel SSL handshake result: {Result}", startedSSL == true ? "ok" : "failed");
+            }
         }
 
         // Reload data after pairing
@@ -665,6 +675,7 @@ public abstract class LockdownClient : LockdownServiceProvider, IDisposable {
 
     public override ServiceConnection StartLockdownService(string name, bool useEscrowBag = false, bool useTrustedConnection = true) {
         DictionaryNode attr = GetServiceConnectionAttributes(name, useEscrowBag, useTrustedConnection).AsDictionaryNode();
+        LogStartServiceResponse(name, useEscrowBag, attr);
         ServiceConnection serviceConnection = CreateServiceConnection((ushort) attr["Port"].AsIntegerNode().Value);
 
         if (attr.TryGetValue("EnableServiceSSL", out PropertyNode? enableServiceSsl) && enableServiceSsl?.AsBooleanNode().Value == true) {
@@ -685,6 +696,7 @@ public abstract class LockdownClient : LockdownServiceProvider, IDisposable {
 
     public override async Task<ServiceConnection> StartLockdownServiceAsync(string name, bool useEscrowBag = false, bool useTrustedConnection = true) {
         DictionaryNode attr = GetServiceConnectionAttributes(name, useEscrowBag, useTrustedConnection).AsDictionaryNode();
+        LogStartServiceResponse(name, useEscrowBag, attr);
         ServiceConnection serviceConnection = await CreateServiceConnectionAsync((ushort) attr["Port"].AsIntegerNode().Value).ConfigureAwait(false);
 
         if (attr.TryGetValue("EnableServiceSSL", out PropertyNode? enableServiceSsl) && enableServiceSsl?.AsBooleanNode().Value == true) {
@@ -701,6 +713,26 @@ public abstract class LockdownClient : LockdownServiceProvider, IDisposable {
             }
         }
         return serviceConnection;
+    }
+
+    /// <summary>
+    /// ScribeHold fork (#2068): log the lockdown StartService response so a WiFi version-exchange
+    /// wedge self-explains — the negotiated Port, whether the device requested EnableServiceSSL, and
+    /// whether the escrow bag was accepted (a rejected escrow bag would surface an Error key here, not
+    /// a silent FIN downstream). Debug-gated, so it is free when EnableDiagnosticLogging is off.
+    /// </summary>
+    private void LogStartServiceResponse(string name, bool useEscrowBag, DictionaryNode attr) {
+        if (!_logger.IsEnabled(LogLevel.Debug)) {
+            return;
+        }
+
+        ulong port = attr.TryGetValue("Port", out PropertyNode? portNode) ? portNode.AsIntegerNode().Value : 0;
+        bool enableServiceSsl = attr.TryGetValue("EnableServiceSSL", out PropertyNode? sslNode) && sslNode.AsBooleanNode().Value;
+        string error = attr.TryGetValue("Error", out PropertyNode? errorNode) ? errorNode.AsStringNode().Value : "<none>";
+
+        _logger.LogDebug(
+            "StartService(\"{Service}\", useEscrowBag={UseEscrowBag}): Port={Port} EnableServiceSSL={EnableServiceSSL} Error={Error}",
+            name, useEscrowBag, port, enableServiceSsl, error);
     }
 
     /// <summary>

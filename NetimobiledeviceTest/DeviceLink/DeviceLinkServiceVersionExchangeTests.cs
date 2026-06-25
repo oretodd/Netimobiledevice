@@ -68,4 +68,43 @@ public class DeviceLinkServiceVersionExchangeTests
         _ = validMessage[1].AsIntegerNode();
         _ = validMessage[2].AsIntegerNode();
     }
+
+    /// <summary>
+    /// #2068: the DeviceReady receive can come back empty when the device FINs AFTER our DLVersionsOk
+    /// reply but before sending DLMessageDeviceReady. VersionExchange now distinguishes this empty
+    /// reply (Count == 0) from a non-empty-but-wrong reply, so the guard semantics this relies on must
+    /// hold: an empty array reports Count 0 and indexing it throws (proving the explicit Count==0 check
+    /// is required to avoid an unhandled IndexOutOfRange when reading element [0]).
+    /// </summary>
+    [TestMethod]
+    public void DeviceReadyReply_EmptyArray_IsDistinguishableBeforeIndexing()
+    {
+        ArrayNode emptyDeviceReady = [];
+
+        Assert.AreEqual(0, emptyDeviceReady.Count, "An empty DeviceReady reply must report Count 0");
+        Assert.ThrowsExactly<ArgumentOutOfRangeException>(() => {
+            _ = emptyDeviceReady[0];
+        });
+    }
+
+    /// <summary>
+    /// #2068: the diagnostic trace renders the DeviceLink message's first element (the DLMessage* type
+    /// tag) as the discriminator between a healthy reply and a wedge. Confirm the type tag is the first
+    /// element on both the request and the reply messages so the logged trace is meaningful.
+    /// </summary>
+    [TestMethod]
+    public void DeviceLinkMessages_FirstElementIsTheTypeTag()
+    {
+        ArrayNode versionExchange = [
+            new StringNode("DLMessageVersionExchange"),
+            new IntegerNode(400),
+            new IntegerNode(0)
+        ];
+        ArrayNode deviceReady = [
+            new StringNode("DLMessageDeviceReady")
+        ];
+
+        Assert.AreEqual("DLMessageVersionExchange", versionExchange[0].AsStringNode().Value);
+        Assert.AreEqual("DLMessageDeviceReady", deviceReady[0].AsStringNode().Value);
+    }
 }
