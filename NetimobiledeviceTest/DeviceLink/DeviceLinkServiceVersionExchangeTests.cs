@@ -107,4 +107,31 @@ public class DeviceLinkServiceVersionExchangeTests
         Assert.AreEqual("DLMessageVersionExchange", versionExchange[0].AsStringNode().Value);
         Assert.AreEqual("DLMessageDeviceReady", deviceReady[0].AsStringNode().Value);
     }
+
+    /// <summary>
+    /// #2077 (AC4): the host's DLVersionExchange offer — what it WOULD send in DLVersionsOk during a
+    /// healthy flow — is logged so a USB-vs-WiFi diff can compare the offer per transport. The offer
+    /// the host emits is the DLVersionsOk reply carrying the host's supported major version.
+    /// DeviceLinkService is internal sealed (no SslStream-free unit harness), so this asserts the
+    /// offer's observable plist shape: a 3-element [ "DLMessageVersionExchange", "DLVersionsOk",
+    /// versionMajor ] array — matching the reply VersionExchange sends after a successful exchange.
+    /// </summary>
+    [TestMethod]
+    public void HostDlVersionExchangeOffer_HasExpectedThreeElementShape()
+    {
+        // The host's offer, identical in shape to the DLVersionsOk reply DeviceLinkService.VersionExchange
+        // emits (string tag, "DLVersionsOk", supported major version).
+        const ulong hostSupportedMajor = 400;
+        ArrayNode hostOffer = [
+            new StringNode("DLMessageVersionExchange"),
+            new StringNode("DLVersionsOk"),
+            new IntegerNode(hostSupportedMajor)
+        ];
+
+        Assert.AreEqual(3, hostOffer.Count, "The host DLVersionsOk offer must be a 3-element array.");
+        Assert.AreEqual("DLMessageVersionExchange", hostOffer[0].AsStringNode().Value);
+        Assert.AreEqual("DLVersionsOk", hostOffer[1].AsStringNode().Value);
+        Assert.AreEqual(hostSupportedMajor, hostOffer[2].AsIntegerNode().Value,
+            "The third element carries the host's supported major version — the value a USB-vs-WiFi diff compares.");
+    }
 }

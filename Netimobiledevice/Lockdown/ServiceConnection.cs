@@ -38,6 +38,19 @@ public class ServiceConnection : IDisposable {
     private SslStream? _sslStream;
     private int _timeout = Timeout.Infinite;
 
+    // ScribeHold fork (#2077): cumulative count of payload bytes the HOST has written on this
+    // connection. At the version-exchange FIN the dump reports this so a wedge proves whether the
+    // host sent ANYTHING before the device FIN'd (DeviceLink has the device speak first, so a healthy
+    // flow has 0 host bytes before the first read — a non-zero count would be a stray host write).
+    private long _bytesSent;
+    // ScribeHold fork (#2077): when true, a 0-byte / short read at the version-exchange step may hex
+    // dump the decrypted bytes it returned. The window is opened by DeviceLinkService.VersionExchange
+    // and closed (in a finally) the moment version exchange ends, BEFORE the transfer phase. The same
+    // SSL stream later carries the backup transfer (user message content); gating the hex dump on this
+    // flag makes it structurally impossible to dump that content — the safety bound is in code, not
+    // discipline. Default false: nothing dumps unless a version exchange explicitly armed it.
+    private bool _versionExchangeWindow;
+
     public UsbmuxdDevice? MuxDevice { get; private set; }
 
     public bool IsConnected {
@@ -165,6 +178,9 @@ public class ServiceConnection : IDisposable {
                 _logger.LogError(
                     "Read zero bytes so the connection has been broken (FIN at offset {Offset}/{Expected} bytes)",
                     totalBytesRead, length);
+                // ScribeHold fork (#2077): version-exchange-window-bounded plaintext dump + close
+                // classification (see ReceiveAsync for the full rationale).
+                LogVersionExchangeFin(buffer, totalBytesRead, length);
                 break;
             }
             totalBytesRead += bytesRead;
@@ -209,6 +225,12 @@ public class ServiceConnection : IDisposable {
                             _logger.LogError(
                                 "Read zero bytes so the connection has been broken (FIN at offset {Offset}/{Expected} bytes)",
                                 totalBytesRead, length);
+                            // ScribeHold fork (#2077): at the version-exchange window only, dump the
+                            // decrypted partial bytes (if any), confirm whether the host had sent
+                            // anything first, and classify the close as graceful (close_notify / clean
+                            // FIN) vs a hard RST — the decisive USB-vs-WiFi signal. Bounded to the
+                            // version-exchange window so transfer-phase user content is never dumped.
+                            LogVersionExchangeFin(buffer, totalBytesRead, length);
                             break;
                         }
                     }
@@ -284,10 +306,16 @@ public class ServiceConnection : IDisposable {
 
     public void Send(ReadOnlySpan<byte> data) {
         Stream.Write(data);
+        // ScribeHold fork (#2077): track total host-sent payload bytes so the version-exchange FIN
+        // dump can prove whether the host wrote anything before the device FIN'd (it should not —
+        // DeviceLink has the device speak first).
+        Interlocked.Add(ref _bytesSent, data.Length);
     }
 
     public async Task SendAsync(ReadOnlyMemory<byte> data, CancellationToken cancellationToken) {
         await Stream.WriteAsync(data, cancellationToken).ConfigureAwait(false);
+        // ScribeHold fork (#2077): see Send — count host-sent bytes for the FIN dump.
+        Interlocked.Add(ref _bytesSent, data.Length);
     }
 
     public void SendPlist(PropertyNode data, PlistFormat format = PlistFormat.Xml) {
@@ -418,5 +446,123 @@ public class ServiceConnection : IDisposable {
         }
         _sslStream.ReadTimeout = _timeout;
         _sslStream.WriteTimeout = _timeout;
+    }
+
+    /// <summary>
+    /// ScribeHold fork (#2077): arm the version-exchange plaintext dump. Called by
+    /// <see cref="Netimobiledevice.DeviceLink.DeviceLinkService"/> immediately before the first
+    /// DeviceLink read on the mb2 service channel (where the empty-reply-FIN wedge bites). While the
+    /// window is open, a 0-byte / short read MAY hex-dump the decrypted bytes it returned. The window
+    /// MUST be closed (via <see cref="EndVersionExchangeWindow"/>, in a finally) the moment version
+    /// exchange ends — the same SSL stream then carries the backup transfer (user message content),
+    /// which must NEVER be dumped.
+    /// </summary>
+    public void BeginVersionExchangeWindow() {
+        _versionExchangeWindow = true;
+    }
+
+    /// <summary>
+    /// ScribeHold fork (#2077): disarm the version-exchange plaintext dump. After this returns, a
+    /// 0-byte read on the transfer phase only emits the #2068 byte-count trace (no payload), so user
+    /// content on the same SSL stream is structurally unable to be dumped.
+    /// </summary>
+    public void EndVersionExchangeWindow() {
+        _versionExchangeWindow = false;
+    }
+
+    /// <summary>
+    /// ScribeHold fork (#2077): cumulative count of payload bytes the host has written on this
+    /// connection. Exposed so callers (and the diagnostic trace) can confirm the host did not send a
+    /// stray byte before the device-speaks-first DeviceLink read.
+    /// </summary>
+    public long HostBytesSent => Interlocked.Read(ref _bytesSent);
+
+    /// <summary>
+    /// ScribeHold fork (#2077): the decisive version-exchange-FIN dump. Runs ONLY inside the
+    /// version-exchange window (armed by <see cref="BeginVersionExchangeWindow"/>) and only when
+    /// Debug logging is enabled (the Netimobiledevice category is pinned to Warning unless
+    /// EnableDiagnosticLogging raises it), so it is free and silent when the diagnostic switch is off.
+    /// Surfaces, at the exact FIN: (1) whether the host had written anything before the first read
+    /// (AC1), (2) the decrypted partial bytes the SSL read returned, length + hex (AC2), and (3)
+    /// whether the device closed gracefully (close_notify / clean FIN) or hard-RST the socket (AC3).
+    /// </summary>
+    /// <param name="buffer">The receive buffer; the first <paramref name="bytesRead"/> bytes are the decrypted partial.</param>
+    /// <param name="bytesRead">How many bytes were decrypted before the 0-byte read (0 at the canonical 0/4 FIN).</param>
+    /// <param name="expected">The number of bytes the read was waiting for (4 at the length-prefix FIN).</param>
+    private void LogVersionExchangeFin(byte[] buffer, int bytesRead, int expected) {
+        if (!_versionExchangeWindow || !_logger.IsEnabled(LogLevel.Debug)) {
+            return;
+        }
+
+        string partialHex = FormatHexPreview(buffer, bytesRead);
+        string closeKind = ClassifyConnectionClose();
+        _logger.LogDebug(
+            "VersionExchange FIN dump: hostBytesSentBeforeRead={HostBytesSent} decryptedPartial={Read}/{Expected} bytes hex=[{Hex}] close={Close}",
+            HostBytesSent, bytesRead, expected, partialHex, closeKind);
+    }
+
+    /// <summary>
+    /// ScribeHold fork (#2077): classify a 0-byte SSL read on the mb2 service channel as a graceful
+    /// close (TLS <c>close_notify</c> alert or a clean TCP FIN — the device deliberately tore the
+    /// channel down at the application layer) vs a hard <c>RST</c> (transport-level abort). This is THE
+    /// signal that separates "Apple's mb2 logic refused something" from "the socket was killed under
+    /// us". Probes the underlying <see cref="Socket"/>: a connected-but-readable-with-0-available
+    /// socket after an SslStream EOF is a graceful close; <see cref="Socket.Poll(int, SelectMode)"/>
+    /// surfacing an error condition, or a zero-byte send raising a connection-reset
+    /// <see cref="SocketException"/>, is an RST. Best-effort and exception-safe — diagnostics must
+    /// never throw into the read path.
+    /// </summary>
+    private string ClassifyConnectionClose() {
+        try {
+            Socket socket = _networkStream.Socket;
+
+            // SelectError surfaces an out-of-band/error condition (a received RST sets this).
+            bool errored = socket.Poll(0, SelectMode.SelectError);
+            if (errored) {
+                return "rst (socket error condition)";
+            }
+
+            // A zero-byte send forces the stack to surface a pending RST as ConnectionReset without
+            // moving any application data. On a graceful FIN this succeeds (the local side may still
+            // send) or reports a clean shutdown.
+            try {
+                socket.Send(Array.Empty<byte>(), 0, SocketFlags.None);
+            }
+            catch (SocketException sex) when (sex.SocketErrorCode is SocketError.ConnectionReset or SocketError.ConnectionAborted or SocketError.NetworkReset) {
+                return $"rst ({sex.SocketErrorCode})";
+            }
+
+            // Readable with nothing available, after an SslStream EOF, is the signature of a graceful
+            // peer close (close_notify or a clean FIN). We cannot tell close_notify from a bare FIN
+            // through the managed SslStream API, so report the graceful class explicitly.
+            bool readable = socket.Poll(0, SelectMode.SelectRead);
+            if (readable && socket.Available == 0) {
+                return "graceful (close_notify / clean FIN — no RST)";
+            }
+
+            return socket.Connected ? "graceful (peer EOF, socket still connected)" : "graceful (peer EOF, socket closed)";
+        }
+        catch (ObjectDisposedException) {
+            return "unknown (socket disposed)";
+        }
+        catch (SocketException sex) {
+            return $"unknown ({sex.SocketErrorCode})";
+        }
+    }
+
+    /// <summary>
+    /// ScribeHold fork (#2077): render up to <paramref name="count"/> bytes of a buffer as a
+    /// space-separated lowercase hex preview, capped so a stray large read can never balloon the log.
+    /// "&lt;none&gt;" for an empty/0-byte read (the canonical version-exchange FIN). Pure + static so
+    /// the fork regression test exercises identical formatting.
+    /// </summary>
+    internal static string FormatHexPreview(byte[] buffer, int count) {
+        if (buffer == null || count <= 0) {
+            return "<none>";
+        }
+        const int maxBytes = 64;
+        int take = Math.Min(count, Math.Min(buffer.Length, maxBytes));
+        string hex = BitConverter.ToString(buffer, 0, take).Replace('-', ' ').ToLowerInvariant();
+        return count > take ? $"{hex} … (+{count - take} more)" : hex;
     }
 }

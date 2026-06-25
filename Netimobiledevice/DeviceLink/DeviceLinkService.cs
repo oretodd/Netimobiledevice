@@ -798,6 +798,35 @@ internal sealed class DeviceLinkService : IDisposable {
         // diverges from a healthy ~fast handshake.
         bool diag = _logger.IsEnabled(LogLevel.Debug);
         Stopwatch stopwatch = diag ? Stopwatch.StartNew() : new Stopwatch();
+
+        // ScribeHold fork (#2077): arm the service-channel plaintext dump for the version-exchange
+        // window ONLY. While armed, a 0-byte/short read on the mb2 channel (the FIN point) dumps the
+        // decrypted partial bytes + classifies close_notify-vs-RST. We disarm in the finally below the
+        // moment version exchange ends, BEFORE the transfer phase carries user content on the same SSL
+        // stream. We also log the host's DLVersionExchange offer (the supported version the host WOULD
+        // send in DLVersionsOk) so a USB-vs-WiFi diff can compare what each transport offers (AC4).
+        _service.BeginVersionExchangeWindow();
+        if (diag) {
+            _logger.LogDebug(
+                "DeviceLink VersionExchange: host DLVersionExchange offer (would send DLVersionsOk {Major}.{Minor}); hostBytesSentBeforeFirstRead={HostBytesSent}",
+                versionMajor, versionMinor, _service.HostBytesSent);
+        }
+        try {
+            await VersionExchangeCore(versionMajor, versionMinor, diag, stopwatch, cancellationToken).ConfigureAwait(false);
+        }
+        finally {
+            // ScribeHold fork (#2077): close the dump window — the transfer phase that follows carries
+            // user message content and must never be dumped.
+            _service.EndVersionExchangeWindow();
+        }
+    }
+
+    /// <summary>
+    /// ScribeHold fork (#2077): the body of <see cref="VersionExchange"/>, extracted so the
+    /// version-exchange plaintext-dump window can be opened/closed around it with a try/finally
+    /// without nesting the whole flow. Behavior is identical to the prior inline body.
+    /// </summary>
+    private async Task VersionExchangeCore(ulong versionMajor, ulong versionMinor, bool diag, Stopwatch stopwatch, CancellationToken cancellationToken) {
         if (diag) {
             _logger.LogDebug("DeviceLink VersionExchange: awaiting DLMessageVersionExchange from device (expect {Major}.{Minor})", versionMajor, versionMinor);
         }
