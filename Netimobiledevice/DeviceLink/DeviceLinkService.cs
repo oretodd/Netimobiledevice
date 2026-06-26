@@ -26,6 +26,15 @@ internal sealed class DeviceLinkService : IDisposable {
     // between passcode-accepted and the first PROGRESS-TICK. The original 5-minute value was
     // on the wrong side of that variance and produced spurious TimeoutException failures.
     private const int SERVICE_READ_TIMEOUT_MS = 10 * 60 * 1000;
+    // ScribeHold fork (#2081): once the device has reported SnapshotState=Finished (the terminal
+    // backup state), the DlLoop switches its next ReceiveMessage from the long SERVICE_READ_TIMEOUT_MS
+    // block to this short bound. On a healthy session the device immediately sends the terminating
+    // DLMessageProcessMessage and this read returns it well inside 5 s; on the desync this fix targets
+    // (device Finished but holds the TCP connection OPEN — no FIN, no final message — observed live on
+    // WiFi, #2081) the read instead times out quickly and the loop completes gracefully as success
+    // rather than blocking ~10 min and then failing. Kept short so a stuck-but-finished session is
+    // released promptly without risking a premature exit on a still-arriving final message.
+    private const int FINISHED_FINAL_READ_TIMEOUT_MS = 5 * 1000;
 
     private readonly ServiceConnection _service;
     private readonly string _rootPath;
@@ -36,6 +45,16 @@ internal sealed class DeviceLinkService : IDisposable {
     private FileStream? _fileStream;
     private bool _discarding;
     private CancellationTokenSource _internalCancellationTokenSource;
+
+    // ScribeHold fork (#2081): set true once the device reports SnapshotState=Finished — the terminal
+    // backup state. Consulted by DlLoop to switch its next ReceiveMessage from the long
+    // SERVICE_READ_TIMEOUT_MS block to a short FINISHED_FINAL_READ_TIMEOUT_MS bound, so a device that
+    // finishes but holds the connection open (no FIN, no terminating DLMessageProcessMessage — observed
+    // live on WiFi, #2081) completes gracefully as success instead of hanging at 100% for ~10 min and
+    // then failing. Only ever transitions false→true (a backup never un-finishes), so the early-exit
+    // can engage ONLY after the terminal state was genuinely observed — a still-transferring backup is
+    // structurally unaffected.
+    private bool _finishedObserved;
 
     // ScribeHold fork: throughput instrumentation — accumulates time spent in the USB/network
     // receive call vs. the disk write call during UploadFiles. Used to diagnose whether backup
@@ -443,6 +462,17 @@ internal sealed class DeviceLinkService : IDisposable {
         string snapshotState = $"{status.SnapshotState}";
         Status?.Invoke(this, new StatusEventArgs(snapshotState, status));
         _logger.LogDebug("OnStatus: {message}", snapshotState);
+
+        // ScribeHold fork (#2081): latch the terminal Finished state. The device sends this in the
+        // Status.plist transfer right before it expects the host to tear the connection down. When the
+        // device instead holds the connection open (no FIN, no terminating DLMessageProcessMessage),
+        // DlLoop consults this latch to do one short-timeout final read and complete gracefully rather
+        // than blocking on the long read until it times out and fails (#2081). Latch-once: a backup
+        // never transitions out of Finished, so this can only enable the short-read AFTER the terminal
+        // state was actually observed.
+        if (status.SnapshotState == SnapshotState.Finished) {
+            _finishedObserved = true;
+        }
     }
 
     private async Task<ResultCode> ReadCode(CancellationToken cancellationToken) {
@@ -723,14 +753,37 @@ internal sealed class DeviceLinkService : IDisposable {
     public async Task<ResultCode> DlLoop(CancellationToken cancellationToken = default) {
         Started?.Invoke(this, new BackupStartedEventArgs(this._iosVersion));
         FailedFiles.Clear();
+        // ScribeHold fork (#2081): reset the Finished latch per loop so a reused service instance never
+        // carries a prior session's terminal state into a new backup.
+        _finishedObserved = false;
 
         _internalCancellationTokenSource = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         while (!cancellationToken.IsCancellationRequested) {
-            ArrayNode message = await ReceiveMessage(_internalCancellationTokenSource.Token).ConfigureAwait(false);
-            if (message.Count == 0) {
-                _logger.LogWarning("Received array node with no elements");
-                await Task.Delay(100, cancellationToken).ConfigureAwait(false);
-                continue;
+            ArrayNode message;
+            if (_finishedObserved) {
+                // ScribeHold fork (#2081): once SnapshotState=Finished has been observed, bound the next
+                // read to a short timeout instead of the long SERVICE_READ_TIMEOUT_MS block. If the device
+                // sends its terminating DLMessageProcessMessage it arrives well inside the bound and is
+                // handled normally by the switch below; if the device instead holds the connection open
+                // after finishing (no FIN, no final message — the desync this fixes), the short read times
+                // out / returns empty and we complete gracefully as success. Finished is terminal, so this
+                // can never prematurely complete a still-transferring backup.
+                (message, bool finishedTimedOut) =
+                    await ReceiveFinalMessageAfterFinished(_internalCancellationTokenSource.Token).ConfigureAwait(false);
+                if (ShouldCompleteAfterFinished(finishedTimedOut, message.Count)) {
+                    _logger.LogInformation(
+                        "Backup reported SnapshotState=Finished and the connection was held open with no terminating message; completing gracefully (#2081)");
+                    Completed?.Invoke(this, new BackupResultEventArgs(FailedFiles, false, false));
+                    return ResultCode.Success;
+                }
+            }
+            else {
+                message = await ReceiveMessage(_internalCancellationTokenSource.Token).ConfigureAwait(false);
+                if (message.Count == 0) {
+                    _logger.LogWarning("Received array node with no elements");
+                    await Task.Delay(100, cancellationToken).ConfigureAwait(false);
+                    continue;
+                }
             }
 
             string command = message[0].AsStringNode().Value;
@@ -771,6 +824,53 @@ internal sealed class DeviceLinkService : IDisposable {
             return [];
         }
         return message.AsArrayNode();
+    }
+
+    /// <summary>
+    /// ScribeHold fork (#2081): the pure decision for the post-Finished read — complete the backup
+    /// gracefully as success when the short final read either timed out (<paramref name="finishedTimedOut"/>)
+    /// or returned an empty message (<paramref name="messageCount"/> == 0). Both mean the device reported
+    /// the terminal Finished state and then sent nothing more on the held-open connection. A non-empty
+    /// message (<paramref name="messageCount"/> &gt; 0) within the bound is a real terminating message and
+    /// is handled by the normal switch instead. Pure + internal so the fork regression test exercises the
+    /// exact branch logic without a live socket.
+    /// </summary>
+    internal static bool ShouldCompleteAfterFinished(bool finishedTimedOut, int messageCount) {
+        return finishedTimedOut || messageCount == 0;
+    }
+
+    /// <summary>
+    /// ScribeHold fork (#2081): the post-Finished final read. Reads the next DeviceLink message with a
+    /// short <see cref="FINISHED_FINAL_READ_TIMEOUT_MS"/> bound rather than the long
+    /// <see cref="SERVICE_READ_TIMEOUT_MS"/> stream block, so a device that has already reported the
+    /// terminal Finished state but holds the connection open (no FIN, no terminating message) releases
+    /// the loop in ~5 s instead of blocking ~10 min and then failing.
+    /// </summary>
+    /// <param name="cancellationToken">The loop's (internal-linked) cancellation token.</param>
+    /// <returns>
+    /// The received message and a flag: <c>finishedTimedOut == true</c> when the short bound elapsed
+    /// (or the stream itself surfaced a timeout / a 0-byte FIN with no plist) — i.e. the device finished
+    /// but sent nothing more, so the loop should complete gracefully. When a real message arrives within
+    /// the bound the flag is <c>false</c> and the message is handled normally (e.g. the terminating
+    /// DLMessageProcessMessage). A genuine caller-requested cancellation is rethrown, never swallowed.
+    /// </returns>
+    private async Task<(ArrayNode message, bool finishedTimedOut)> ReceiveFinalMessageAfterFinished(CancellationToken cancellationToken) {
+        using CancellationTokenSource finalReadTimeoutCts = new CancellationTokenSource(FINISHED_FINAL_READ_TIMEOUT_MS);
+        using CancellationTokenSource linkedCts =
+            CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, finalReadTimeoutCts.Token);
+        try {
+            ArrayNode message = await ReceiveMessage(linkedCts.Token).ConfigureAwait(false);
+            return (message, false);
+        }
+        catch (OperationCanceledException) when (finalReadTimeoutCts.IsCancellationRequested && !cancellationToken.IsCancellationRequested) {
+            // Short bound elapsed: the device finished but sent nothing more on the held-open connection.
+            return ([], true);
+        }
+        catch (TimeoutException) {
+            // The underlying ServiceConnection stream read timed out (the device finished and went silent
+            // without closing) — same conclusion as the short bound elapsing.
+            return ([], true);
+        }
     }
 
     public async Task SendProcessMessage(PropertyNode message, CancellationToken cancellationToken) {
