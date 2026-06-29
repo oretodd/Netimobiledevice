@@ -40,11 +40,18 @@ public sealed class Mobilebackup2Service(
     private bool _passcodeRequired;
 
     /// <summary>
-    /// Cumulative throughput stats from the last Backup() invocation. Populated just before
-    /// the DeviceLinkService is disposed, so the caller can log them from the caller's own
-    /// logger after Backup returns. Null if Backup was never called.
+    /// ScribeHold fork: cumulative throughput stats from the last Backup() invocation. Populated
+    /// just before the DeviceLinkService is disposed, so the caller can log them from the caller's
+    /// own logger after Backup returns. Null if Backup was never called.
     /// </summary>
     public (long RxBytes, TimeSpan RxTime, long WxBytes, TimeSpan WxTime)? LastBackupThroughputStats { get; private set; }
+
+    /// <summary>
+    /// ScribeHold fork: optional delegate to classify whether a backup file should be discarded
+    /// (bytes drained but not written to disk). Set before calling <see cref="Backup"/> to enable
+    /// zero-disk-write optimization. When null, all files are written normally.
+    /// </summary>
+    public Func<string, bool>? ShouldDiscardFile { get; set; }
 
     /// <summary>
     /// iTunes files to be inserted into the Info.plist file.
@@ -103,13 +110,6 @@ public sealed class Mobilebackup2Service(
     /// Event raised for signaling different kinds of the backup status.
     /// </summary>
     public event EventHandler<StatusEventArgs>? Status;
-
-    /// <summary>
-    /// Optional delegate to classify whether a backup file should be discarded (bytes drained
-    /// but not written to disk). Set before calling <see cref="Backup"/> to enable zero-disk-write
-    /// optimization. When null, all files are written normally.
-    /// </summary>
-    public Func<string, bool>? ShouldDiscardFile { get; set; }
 
     private static bool BackupExists(string backupDirectory, string identifier) {
         string deviceDirectory = Path.Combine(backupDirectory, identifier);
@@ -440,10 +440,11 @@ public sealed class Mobilebackup2Service(
             }
         }
         finally {
-            // Send CancelBackup to cleanly terminate the backup session on the device side.
-            // On successful completion the device has already closed its end of the connection,
-            // so the write may throw SocketError 10053 (WSAECONNABORTED) or hang indefinitely
-            // on a half-closed SSL socket. Use a 5-second timeout to prevent hanging forever.
+            // ScribeHold fork: send CancelBackup to cleanly terminate the backup session on the
+            // device side. On successful completion the device has already closed its end of the
+            // connection, so the write may throw SocketError 10053 (WSAECONNABORTED) or hang
+            // indefinitely on a half-closed SSL socket. Use a 5-second timeout to prevent hanging
+            // forever, and scope the catches so we don't swallow unexpected exceptions.
             try {
                 using var cancelBackupCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
                 cancelBackupCts.CancelAfter(TimeSpan.FromSeconds(5));
@@ -456,7 +457,7 @@ public sealed class Mobilebackup2Service(
             catch (IOException) { }
             catch (OperationCanceledException) { }
 
-            // Capture throughput stats before dl is disposed. Exposed to the
+            // ScribeHold fork: capture throughput stats before dl is disposed. Exposed to the
             // caller via LastBackupThroughputStats so they can log under their own category.
             // Runs regardless of CancelBackup outcome so stats are never lost.
             LastBackupThroughputStats = dl.GetAndResetThroughputStats();

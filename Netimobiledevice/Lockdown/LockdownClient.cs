@@ -30,37 +30,27 @@ public abstract class LockdownClient : LockdownServiceProvider, IDisposable {
     /// The internal logger
     /// </summary>
     private readonly ILogger _logger;
-    private readonly ConnectionMedium _medium;
     private readonly ushort _port;
     private readonly string _sessionId;
     private string _systemBuid;
 
     /// <summary>
-    /// Set by <see cref="ValidatePairing"/> when the device ACCEPTED the StartSession handshake (so a
-    /// valid pair record exists and the device considers us paired) but then ABORTED the SSL
-    /// re-validation of the lockdown CONTROL connect (<see cref="ServiceConnection.StartSsl"/> returned
-    /// <c>false</c> on a connection abort/reset). In that state the device is already paired — a fresh
-    /// <c>PairDevice</c> would be wrong (it requires a user Trust prompt the device is not offering) — so
-    /// <see cref="HandleAutoPair"/> leaves the (identity-readable, non-SSL) client usable instead of
-    /// escalating to <see cref="FatalPairingException"/>. ScribeHold #1958 seam e1.
+    /// ScribeHold fork (Hook B): the connection medium for this client. Defaults to Tcp; the
+    /// usbmux subclass assigns Usbmux so the pair record is saved back to usbmuxd after Pair().
+    /// Upstream declared this as an unassigned readonly field that always read Tcp, so SavePairRecord
+    /// to usbmuxd never fired. Making it settable from the subclass fixes that latent correctness bug.
     /// </summary>
-    private bool _sslReValidationAbortedWhilePaired;
+    protected ConnectionMedium Medium { get; set; } = ConnectionMedium.Tcp;
 
     /// <summary>
-    /// Set by <see cref="ValidatePairing"/> when the device ACCEPTED the <c>StartSession</c> handshake —
-    /// i.e. it recognised our <c>HostID</c>/<c>SystemBUID</c> and considers the pair record valid. This is
-    /// the authoritative "the pair record is good" signal, independent of whether the device subsequently
-    /// declined the control-connect SSL re-validation (which #1958 seam e1 records in
-    /// <see cref="_sslReValidationAbortedWhilePaired"/> and which clears <see cref="IsPaired"/> to keep the
-    /// device on the Connected-but-degraded list without a "Unknown / Unknown Model" display).
-    ///
-    /// Trusted services such as mobilebackup2 negotiate their OWN SSL on the data socket, so a
-    /// StartSession-validated device with a present pair record + escrow bag is backup-capable even when
-    /// the lockdown CONTROL connect declined SSL re-validation. <see cref="GetServiceConnectionAttributes"/>
-    /// gates on THIS signal (not the display-driven <see cref="IsPaired"/>) so the seam e1 display fix no
-    /// longer forces the trusted-service path to <see cref="NotPairedException"/>. ScribeHold #1965.
+    /// ScribeHold fork (Hook A): true once a pair record has been validated via a successful
+    /// StartSession + control-channel SSL handshake. Unlike <see cref="IsPaired"/>, this is NOT
+    /// cleared when a later control-channel SSL re-validation is declined — a declined re-validation
+    /// does not unpair the device, and the mb2 data socket opens its own independent SSL connection.
+    /// Used to gate trusted service starts so a transient SSL decline cannot block a backup whose
+    /// pair record was already proven valid.
     /// </summary>
-    private bool _pairRecordValidatedViaStartSession;
+    public bool PairRecordValidated { get; private set; }
 
     protected readonly DirectoryInfo? _pairingRecordsCacheDirectory;
     /// <summary>
@@ -168,37 +158,12 @@ public abstract class LockdownClient : LockdownServiceProvider, IDisposable {
         };
     }
 
-    /// <summary>
-    /// Decides whether starting a TRUSTED lockdown service (e.g. mobilebackup2) must be blocked with
-    /// <see cref="NotPairedException"/>. A trusted-service start is blocked ONLY when the connection is
-    /// trusted AND the device is neither <paramref name="isPaired"/> nor StartSession-validated with a
-    /// present pair record.
-    ///
-    /// <para>
-    /// This is the load-bearing #1965 decision. Before #1965 the gate keyed solely on
-    /// <paramref name="isPaired"/>, but #1958 seam e1 deliberately clears <c>IsPaired</c> when the device
-    /// declines the control-connect SSL re-validation (to keep the device on the Connected list without a
-    /// "Unknown" display). That same cleared flag wrongly forced an actually-paired device to throw
-    /// <see cref="NotPairedException"/> on every backup. A device that ACCEPTED <c>StartSession</c> has a
-    /// valid pair record and is backup-capable — mobilebackup2 negotiates its OWN SSL on the data socket —
-    /// so the StartSession-validated signal (with a present pair record) keeps the trusted path open even
-    /// when the control-connect SSL re-validation was declined.
-    /// </para>
-    /// </summary>
-    /// <param name="useTrustedConnection">Whether the requested service requires a trusted connection.</param>
-    /// <param name="isPaired">The display-driven <see cref="IsPaired"/> flag (seam e1 may clear this).</param>
-    /// <param name="pairRecordValidatedViaStartSession">Whether <c>StartSession</c> was accepted this connect.</param>
-    /// <param name="hasPairRecord">Whether a pair record is present (needed for the escrow bag).</param>
-    internal static bool IsTrustedServiceStartBlocked(bool useTrustedConnection, bool isPaired, bool pairRecordValidatedViaStartSession, bool hasPairRecord) {
-        if (!useTrustedConnection) {
-            return false;
-        }
-        bool pairValidForTrustedService = isPaired || (pairRecordValidatedViaStartSession && hasPairRecord);
-        return !pairValidForTrustedService;
-    }
-
     private DictionaryNode GetServiceConnectionAttributes(string name, bool useEscrowBag, bool useTrustedConnection) {
-        if (IsTrustedServiceStartBlocked(useTrustedConnection, IsPaired, _pairRecordValidatedViaStartSession, _pairRecord != null)) {
+        // ScribeHold fork (Hook A): gate on PairRecordValidated, not IsPaired. A prior successful
+        // StartSession proves the pair record is valid; a later declined control-channel SSL
+        // re-validation flips IsPaired=false but does not invalidate the pair record. The mb2 data
+        // socket opens its own SSL connection, so blocking here on IsPaired wrongly fails the backup.
+        if (!PairRecordValidated && useTrustedConnection) {
             throw new NotPairedException();
         }
 
@@ -209,9 +174,7 @@ public abstract class LockdownClient : LockdownServiceProvider, IDisposable {
             options.Add("EscrowBag", _pairRecord["EscrowBag"]);
         }
 
-        Logger.LogInformation("[mb2-diag] StartService request for '{Service}' — sending on control connection (medium={Medium})", name, _medium);
         DictionaryNode response = Request("StartService", options).AsDictionaryNode();
-        Logger.LogInformation("[mb2-diag] StartService response received for '{Service}'", name);
         if (response.ContainsKey("Error")) {
             string error = response["Error"].AsStringNode().Value;
             if (error == "PasswordProtected") {
@@ -366,7 +329,7 @@ public abstract class LockdownClient : LockdownServiceProvider, IDisposable {
         _pairRecord = newPairRecord;
         WriteStorageFile($"{Udid}.plist", PropertyList.SaveAsByteArray(_pairRecord, PlistFormat.Xml));
 
-        if (_medium == ConnectionMedium.Usbmux) {
+        if (Medium == ConnectionMedium.Usbmux) {
             byte[] recordData = PropertyList.SaveAsByteArray(_pairRecord, PlistFormat.Xml);
 
             UsbmuxConnection mux = UsbmuxConnection.Create(logger: Logger);
@@ -386,8 +349,6 @@ public abstract class LockdownClient : LockdownServiceProvider, IDisposable {
     }
 
     private bool ValidatePairing() {
-        _sslReValidationAbortedWhilePaired = false;
-        _pairRecordValidatedViaStartSession = false;
         if (_pairRecord == null && !string.IsNullOrEmpty(Identifier)) {
             try {
                 FetchPairRecord();
@@ -423,10 +384,6 @@ public abstract class LockdownClient : LockdownServiceProvider, IDisposable {
                 { "SystemBUID", new StringNode(_systemBuid) }
             };
             startSession = Request("StartSession", options).AsDictionaryNode();
-            // The device accepted StartSession: it recognises this HostID/SystemBUID and considers the
-            // pair record valid. Record that authoritatively so trusted services (mobilebackup2) can
-            // proceed even if the control-connect SSL re-validation below is declined (ScribeHold #1965).
-            _pairRecordValidatedViaStartSession = true;
         }
         catch (LockdownException ex) {
             if (ex.LockdownError == LockdownError.InvalidHostID) {
@@ -439,23 +396,31 @@ public abstract class LockdownClient : LockdownServiceProvider, IDisposable {
             }
         }
 
-        if (startSession.TryGetValue("EnableSessionSSL", out PropertyNode? enableSessionSslNode) && enableSessionSslNode.AsBooleanNode().Value) {
+        bool enableSessionSsl = startSession.TryGetValue("EnableSessionSSL", out PropertyNode? enableSessionSslNode) && enableSessionSslNode.AsBooleanNode().Value;
+        // ScribeHold fork (#2068): log the StartSession outcome on the lockdown control channel — whether
+        // the device asked for session SSL, and (below) whether the handshake succeeded. The per-handshake
+        // TLS version/cipher is logged by ServiceConnection.StartSsl itself. Debug-gated, free when off.
+        if (_logger.IsEnabled(LogLevel.Debug)) {
+            _logger.LogDebug("StartSession ok: EnableSessionSSL={EnableSessionSSL}", enableSessionSsl);
+        }
+        if (enableSessionSsl) {
             X509Certificate2 sslCert = CertificateGenerator.LoadCertificate(
                 Encoding.UTF8.GetString(_pairRecord["HostCertificate"].AsDataNode().Value),
                 Encoding.UTF8.GetString(_pairRecord["HostPrivateKey"].AsDataNode().Value)
             );
             bool? startedSSL = _service?.StartSsl(sslCert);
             IsPaired = startedSSL == true;
-            // StartSession was accepted (the device knows this HostID/pair record) but the SSL
-            // re-validation was declined/aborted by the device — record it so HandleAutoPair does NOT
-            // force a destructive re-pair on an already-paired device (ScribeHold #1958 seam e1).
-            if (startedSSL == false) {
-                _sslReValidationAbortedWhilePaired = true;
+            if (_logger.IsEnabled(LogLevel.Debug)) {
+                _logger.LogDebug("StartSession control-channel SSL handshake result: {Result}", startedSSL == true ? "ok" : "failed");
             }
         }
 
         // Reload data after pairing
         if (IsPaired) {
+            // ScribeHold fork (Hook A): a successful StartSession + SSL handshake proves the pair
+            // record is valid. Latch PairRecordValidated so a later declined SSL re-validation
+            // (which flips IsPaired back to false) does not block a backup whose trust is intact.
+            PairRecordValidated = true;
             _allValues = GetValue()?.AsDictionaryNode() ?? [];
             Udid = _allValues["UniqueDeviceID"].AsStringNode().Value;
         }
@@ -475,19 +440,6 @@ public abstract class LockdownClient : LockdownServiceProvider, IDisposable {
 
     protected virtual void HandleAutoPair(bool autoPair, float timeout) {
         if (ValidatePairing()) {
-            return;
-        }
-
-        // The device accepted StartSession (it IS paired) but aborted the SSL re-validation of the
-        // lockdown CONTROL connect. Re-pairing here would be wrong: the device is already paired and is
-        // not offering the user Trust prompt PairDevice needs — it would either throw or, on the merged
-        // build, leave the device "Unknown / disappeared". Return with the (non-SSL, identity-readable)
-        // client instead so identity reads succeed and the device stays Connected-but-degraded
-        // (ScribeHold #1958 seam e1). Trusted services (mobilebackup2) are NO LONGER blocked here even
-        // though IsPaired == false: GetServiceConnectionAttributes now gates on the StartSession-validated
-        // signal (_pairRecordValidatedViaStartSession) so a StartSession-validated device with a present
-        // pair record stays backup-capable (ScribeHold #1965).
-        if (_sslReValidationAbortedWhilePaired) {
             return;
         }
 
@@ -723,10 +675,8 @@ public abstract class LockdownClient : LockdownServiceProvider, IDisposable {
 
     public override ServiceConnection StartLockdownService(string name, bool useEscrowBag = false, bool useTrustedConnection = true) {
         DictionaryNode attr = GetServiceConnectionAttributes(name, useEscrowBag, useTrustedConnection).AsDictionaryNode();
-        ushort servicePort = (ushort) attr["Port"].AsIntegerNode().Value;
-        Logger.LogInformation("[mb2-diag] StartService '{Service}' -> port {Port}; opening service connection", name, servicePort);
-        ServiceConnection serviceConnection = CreateServiceConnection(servicePort);
-        Logger.LogInformation("[mb2-diag] Service connection to '{Service}' on port {Port} opened", name, servicePort);
+        LogStartServiceResponse(name, useEscrowBag, attr);
+        ServiceConnection serviceConnection = CreateServiceConnection((ushort) attr["Port"].AsIntegerNode().Value);
 
         if (attr.TryGetValue("EnableServiceSSL", out PropertyNode? enableServiceSsl) && enableServiceSsl?.AsBooleanNode().Value == true) {
             if (_pairRecord == null) {
@@ -736,21 +686,17 @@ public abstract class LockdownClient : LockdownServiceProvider, IDisposable {
                 Encoding.UTF8.GetString(_pairRecord["HostCertificate"].AsDataNode().Value),
                 Encoding.UTF8.GetString(_pairRecord["HostPrivateKey"].AsDataNode().Value)
             );
-            Logger.LogInformation("[mb2-diag] Starting SSL handshake for '{Service}' on port {Port}", name, servicePort);
             bool startedSSL = serviceConnection.StartSsl(sslCert);
-            Logger.LogInformation("[mb2-diag] SSL handshake for '{Service}' on port {Port} returned {Result}", name, servicePort, startedSSL);
             if (!startedSSL) {
                 throw new FatalPairingException("Failed starting SSL, assuming pairing issue");
             }
-        }
-        else {
-            Logger.LogInformation("[mb2-diag] Service '{Service}' on port {Port} does not require SSL", name, servicePort);
         }
         return serviceConnection;
     }
 
     public override async Task<ServiceConnection> StartLockdownServiceAsync(string name, bool useEscrowBag = false, bool useTrustedConnection = true) {
         DictionaryNode attr = GetServiceConnectionAttributes(name, useEscrowBag, useTrustedConnection).AsDictionaryNode();
+        LogStartServiceResponse(name, useEscrowBag, attr);
         ServiceConnection serviceConnection = await CreateServiceConnectionAsync((ushort) attr["Port"].AsIntegerNode().Value).ConfigureAwait(false);
 
         if (attr.TryGetValue("EnableServiceSSL", out PropertyNode? enableServiceSsl) && enableServiceSsl?.AsBooleanNode().Value == true) {
@@ -770,6 +716,26 @@ public abstract class LockdownClient : LockdownServiceProvider, IDisposable {
     }
 
     /// <summary>
+    /// ScribeHold fork (#2068): log the lockdown StartService response so a WiFi version-exchange
+    /// wedge self-explains — the negotiated Port, whether the device requested EnableServiceSSL, and
+    /// whether the escrow bag was accepted (a rejected escrow bag would surface an Error key here, not
+    /// a silent FIN downstream). Debug-gated, so it is free when EnableDiagnosticLogging is off.
+    /// </summary>
+    private void LogStartServiceResponse(string name, bool useEscrowBag, DictionaryNode attr) {
+        if (!_logger.IsEnabled(LogLevel.Debug)) {
+            return;
+        }
+
+        ulong port = attr.TryGetValue("Port", out PropertyNode? portNode) ? portNode.AsIntegerNode().Value : 0;
+        bool enableServiceSsl = attr.TryGetValue("EnableServiceSSL", out PropertyNode? sslNode) && sslNode.AsBooleanNode().Value;
+        string error = attr.TryGetValue("Error", out PropertyNode? errorNode) ? errorNode.AsStringNode().Value : "<none>";
+
+        _logger.LogDebug(
+            "StartService(\"{Service}\", useEscrowBag={UseEscrowBag}): Port={Port} EnableServiceSSL={EnableServiceSSL} Error={Error}",
+            name, useEscrowBag, port, enableServiceSsl, error);
+    }
+
+    /// <summary>
     /// Try to unpair the device.
     /// </summary>
     public virtual void Unpair() {
@@ -780,6 +746,10 @@ public abstract class LockdownClient : LockdownServiceProvider, IDisposable {
             };
             Request("Unpair", options, true);
             IsPaired = false;
+            // ScribeHold fork (Hook A): an explicit unpair invalidates the pair record, so the
+            // latched validation must be cleared too — otherwise GetServiceConnectionAttributes
+            // would still pass the !PairRecordValidated gate for a device that is no longer paired.
+            PairRecordValidated = false;
             _pairRecord = null;
         }
     }
@@ -795,6 +765,10 @@ public abstract class LockdownClient : LockdownServiceProvider, IDisposable {
             };
             await RequestAsync("Unpair", options, true).ConfigureAwait(false);
             IsPaired = false;
+            // ScribeHold fork (Hook A): an explicit unpair invalidates the pair record, so the
+            // latched validation must be cleared too — otherwise GetServiceConnectionAttributes
+            // would still pass the !PairRecordValidated gate for a device that is no longer paired.
+            PairRecordValidated = false;
             _pairRecord = null;
         }
     }

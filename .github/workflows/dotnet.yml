@@ -13,9 +13,9 @@ jobs:
   test:
     runs-on: windows-latest
     steps:
-    - uses: actions/checkout@v6.0.2
+    - uses: actions/checkout@v6.0.3
     - name: Setup .NET
-      uses: actions/setup-dotnet@v5.2.0
+      uses: actions/setup-dotnet@v5.3.0
       with:
         dotnet-version: 6.0.x
     - name: Setup MSBuild
@@ -31,9 +31,9 @@ jobs:
     needs: test
     if: github.ref == 'refs/heads/main'
     steps:
-      - uses: actions/checkout@v6.0.2
+      - uses: actions/checkout@v6.0.3
       - name: Setup .NET
-        uses: actions/setup-dotnet@v5.2.0
+        uses: actions/setup-dotnet@v5.3.0
         with:
           dotnet-version: 6.0.x
       - name: Setup MSBuild

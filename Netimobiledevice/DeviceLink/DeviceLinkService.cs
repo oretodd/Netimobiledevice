@@ -26,6 +26,15 @@ internal sealed class DeviceLinkService : IDisposable {
     // between passcode-accepted and the first PROGRESS-TICK. The original 5-minute value was
     // on the wrong side of that variance and produced spurious TimeoutException failures.
     private const int SERVICE_READ_TIMEOUT_MS = 10 * 60 * 1000;
+    // ScribeHold fork (#2081): once the device has reported SnapshotState=Finished (the terminal
+    // backup state), the DlLoop switches its next ReceiveMessage from the long SERVICE_READ_TIMEOUT_MS
+    // block to this short bound. On a healthy session the device immediately sends the terminating
+    // DLMessageProcessMessage and this read returns it well inside 5 s; on the desync this fix targets
+    // (device Finished but holds the TCP connection OPEN — no FIN, no final message — observed live on
+    // WiFi, #2081) the read instead times out quickly and the loop completes gracefully as success
+    // rather than blocking ~10 min and then failing. Kept short so a stuck-but-finished session is
+    // released promptly without risking a premature exit on a still-arriving final message.
+    private const int FINISHED_FINAL_READ_TIMEOUT_MS = 5 * 1000;
 
     private readonly ServiceConnection _service;
     private readonly string _rootPath;
@@ -37,18 +46,29 @@ internal sealed class DeviceLinkService : IDisposable {
     private bool _discarding;
     private CancellationTokenSource _internalCancellationTokenSource;
 
-    // Throughput instrumentation — accumulates time spent in the USB receive call vs. the disk
-    // write call during UploadFiles. Used to diagnose whether backup speed is USB-bound or
-    // disk-bound. Read/reset via GetAndResetThroughputStats().
+    // ScribeHold fork (#2081): set true once the device reports SnapshotState=Finished — the terminal
+    // backup state. Consulted by DlLoop to switch its next ReceiveMessage from the long
+    // SERVICE_READ_TIMEOUT_MS block to a short FINISHED_FINAL_READ_TIMEOUT_MS bound, so a device that
+    // finishes but holds the connection open (no FIN, no terminating DLMessageProcessMessage — observed
+    // live on WiFi, #2081) completes gracefully as success instead of hanging at 100% for ~10 min and
+    // then failing. Only ever transitions false→true (a backup never un-finishes), so the early-exit
+    // can engage ONLY after the terminal state was genuinely observed — a still-transferring backup is
+    // structurally unaffected.
+    private bool _finishedObserved;
+
+    // ScribeHold fork: throughput instrumentation — accumulates time spent in the USB/network
+    // receive call vs. the disk write call during UploadFiles. Used to diagnose whether backup
+    // speed is transfer-bound or disk-bound. Read/reset via GetAndResetThroughputStats().
     private long _rxBytes;
     private long _rxTicks;
     private long _wxBytes;
     private long _wxTicks;
 
     /// <summary>
-    /// Optional delegate to classify whether a file should be discarded (bytes drained but not
-    /// written to disk). When null, all files are written normally. When set, called once per
-    /// file at the start of the first chunk using the device-side path. Returns true = discard.
+    /// ScribeHold fork: optional delegate to classify whether a file should be discarded (bytes
+    /// drained but not written to disk). When null, all files are written normally. When set,
+    /// called once per file at the start of the first chunk using the device-side path.
+    /// Returns true = discard.
     /// </summary>
     public Func<string, bool>? ShouldDiscardFile { get; set; }
 
@@ -121,6 +141,7 @@ internal sealed class DeviceLinkService : IDisposable {
             { DeviceLinkMessage.Disconnect, DisconnectAsync },
             { DeviceLinkMessage.DownloadFiles, DownloadFiles },
             { DeviceLinkMessage.GetFreeDiskSpace, GetFreeDiskSpace },
+            { DeviceLinkMessage.PurgeDiskSpace, GetFreeDiskSpace },
             { DeviceLinkMessage.MoveFiles, MoveItems },
             { DeviceLinkMessage.MoveItems, MoveItems },
             { DeviceLinkMessage.RemoveFiles, RemoveItems },
@@ -138,6 +159,18 @@ internal sealed class DeviceLinkService : IDisposable {
         }
         _fileStream?.Close();
         _fileStream = null;
+    }
+
+    /// <summary>
+    /// ScribeHold fork (data-corruption GATE, #2046): removes any pre-existing file at the given
+    /// local path so the upcoming whole-file transfer replaces it instead of appending onto a stale
+    /// partial left by an interrupted prior backup session. No-op when the path does not exist.
+    /// Internal + static so the receive loop and the fork regression test exercise identical logic.
+    /// </summary>
+    internal static void DeleteStalePartial(string localPath) {
+        if (!string.IsNullOrEmpty(localPath) && File.Exists(localPath)) {
+            File.Delete(localPath);
+        }
     }
 
     /// <summary>
@@ -335,58 +368,29 @@ internal sealed class DeviceLinkService : IDisposable {
     /// <param name="msg">The message received from the device.</param>
     /// <returns>The number of items moved.</returns>
     private async Task MoveItems(ArrayNode msg, CancellationToken cancellationToken) {
-        // [DISK-DIAG] Per-invocation counters — see SoliMessage issue #912.
-        // These tell us whether device-driven MoveItems is responsible for the
-        // mid-backup D: free-space oscillation observed in PerfMon.
-        var moves = msg[1].AsDictionaryNode();
-        int moveCount = 0;
-        int destOverwriteCount = 0;
-        long destOverwriteBytes = 0;
-        int movesApplied = 0;
-        _logger.LogInformation("[DISK-DIAG] MoveItems invoked: {Count} moves requested by device", moves.Count);
-
-        foreach (KeyValuePair<string, PropertyNode> move in moves) {
+        foreach (KeyValuePair<string, PropertyNode> move in msg[1].AsDictionaryNode()) {
             if (cancellationToken.IsCancellationRequested) {
                 break;
             }
-            moveCount++;
 
             string newPath = move.Value.AsStringNode().Value;
             if (!string.IsNullOrEmpty(newPath)) {
                 FileInfo newFile = new FileInfo(Path.Combine(_rootPath, newPath));
                 if (newFile.Exists) {
-                    // [DISK-DIAG] Destination exists — device wants us to overwrite.
-                    // Capture size so we know how many bytes are being released here.
-                    long overwrittenBytes = 0;
                     if (newFile.Attributes.HasFlag(FileAttributes.Directory)) {
-                        try {
-                            overwrittenBytes = new DirectoryInfo(newFile.FullName)
-                                .EnumerateFiles("*", SearchOption.AllDirectories)
-                                .Sum(f => { try { return f.Length; } catch { return 0L; } });
-                        }
-                        catch { /* size probe is best-effort */ }
                         new DirectoryInfo(newFile.FullName).Delete(true);
                     }
                     else {
-                        try { overwrittenBytes = newFile.Length; } catch { /* best-effort */ }
                         newFile.Delete();
                     }
-                    destOverwriteCount++;
-                    destOverwriteBytes += overwrittenBytes;
-                    _logger.LogInformation("[DISK-DIAG] MoveItems overwrite: dest={NewPath} existed ({Bytes} bytes) — deleted before rename",
-                        newPath, overwrittenBytes);
                 }
 
                 FileInfo oldFile = new FileInfo(Path.Combine(_rootPath, move.Key));
                 if (oldFile.Exists) {
                     oldFile.MoveTo(newFile.FullName);
-                    movesApplied++;
                 }
             }
         }
-
-        _logger.LogInformation("[DISK-DIAG] MoveItems complete: {MoveCount} moves requested, {Applied} applied, {OverwriteCount} destinations overwritten, {OverwriteBytes} bytes released via overwrite",
-            moveCount, movesApplied, destOverwriteCount, destOverwriteBytes);
 
         if (!cancellationToken.IsCancellationRequested) {
             await SendStatusReport(0, string.Empty, cancellationToken: cancellationToken).ConfigureAwait(false);
@@ -458,6 +462,17 @@ internal sealed class DeviceLinkService : IDisposable {
         string snapshotState = $"{status.SnapshotState}";
         Status?.Invoke(this, new StatusEventArgs(snapshotState, status));
         _logger.LogDebug("OnStatus: {message}", snapshotState);
+
+        // ScribeHold fork (#2081): latch the terminal Finished state. The device sends this in the
+        // Status.plist transfer right before it expects the host to tear the connection down. When the
+        // device instead holds the connection open (no FIN, no terminating DLMessageProcessMessage),
+        // DlLoop consults this latch to do one short-timeout final read and complete gracefully rather
+        // than blocking on the long read until it times out and fails (#2081). Latch-once: a backup
+        // never transitions out of Finished, so this can only enable the short-read AFTER the terminal
+        // state was actually observed.
+        if (status.SnapshotState == SnapshotState.Finished) {
+            _finishedObserved = true;
+        }
     }
 
     private async Task<ResultCode> ReadCode(CancellationToken cancellationToken) {
@@ -517,17 +532,7 @@ internal sealed class DeviceLinkService : IDisposable {
     /// <param name="msg">The message received from the device.</param>
     /// <returns>The number of items removed.</returns>
     private async Task RemoveItems(ArrayNode message, CancellationToken cancellationToken) {
-        // [DISK-DIAG] Per-invocation counters — see SoliMessage issue #912.
-        // These tell us whether device-driven RemoveItems is responsible for the
-        // mid-backup D: free-space recovery observed in PerfMon during long backups.
         ArrayNode removes = message[1].AsArrayNode();
-        int filesDeleted = 0;
-        long fileBytesReleased = 0;
-        int dirsDeleted = 0;
-        long dirBytesReleased = 0;
-        int notFoundCount = 0;
-        _logger.LogInformation("[DISK-DIAG] RemoveItems invoked: {Count} paths requested by device", removes.Count);
-
         foreach (StringNode filename in removes.Cast<StringNode>()) {
             if (cancellationToken.IsCancellationRequested) {
                 break;
@@ -539,29 +544,10 @@ internal sealed class DeviceLinkService : IDisposable {
             else {
                 string path = Path.Combine(_rootPath, filename.Value);
                 if (File.Exists(path)) {
-                    long size = 0;
-                    try { size = new FileInfo(path).Length; } catch { /* best-effort */ }
                     File.Delete(path);
-                    filesDeleted++;
-                    fileBytesReleased += size;
-                    _logger.LogInformation("[DISK-DIAG] RemoveItems file: {Path} ({Bytes} bytes)", filename.Value, size);
                 }
                 else if (Directory.Exists(path)) {
-                    long size = 0;
-                    try {
-                        size = new DirectoryInfo(path)
-                            .EnumerateFiles("*", SearchOption.AllDirectories)
-                            .Sum(f => { try { return f.Length; } catch { return 0L; } });
-                    }
-                    catch { /* best-effort */ }
                     Directory.Delete(path, true);
-                    dirsDeleted++;
-                    dirBytesReleased += size;
-                    _logger.LogInformation("[DISK-DIAG] RemoveItems dir: {Path} ({Bytes} bytes)", filename.Value, size);
-                }
-                else {
-                    notFoundCount++;
-                    _logger.LogDebug("[DISK-DIAG] RemoveItems target not found: {Path}", filename.Value);
                 }
             }
 
@@ -569,9 +555,6 @@ internal sealed class DeviceLinkService : IDisposable {
                 await SendStatusReport(0, string.Empty, cancellationToken: cancellationToken).ConfigureAwait(false);
             }
         }
-
-        _logger.LogInformation("[DISK-DIAG] RemoveItems complete: {FilesDeleted} files ({FileBytes} bytes), {DirsDeleted} dirs ({DirBytes} bytes), {NotFound} not found. Total released: {TotalBytes} bytes",
-            filesDeleted, fileBytesReleased, dirsDeleted, dirBytesReleased, notFoundCount, fileBytesReleased + dirBytesReleased);
     }
 
     /// <summary>
@@ -658,15 +641,23 @@ internal sealed class DeviceLinkService : IDisposable {
                 ResultCode code = await ReadCode(cancellationToken).ConfigureAwait(false);
                 size -= sizeof(ResultCode);
 
-                if (backupFile.LocalPath.Contains("Status.plist") && File.Exists(backupFile.LocalPath)) {
-                    File.Delete(backupFile.LocalPath);
-                }
-
-                // Classify once per file (at first chunk). If discarding, skip File.OpenWrite
-                // and drain all chunks without writing. _fileStream stays null for discarded files.
+                // ScribeHold fork: classify once per file (at first chunk). If discarding, skip
+                // File.OpenWrite and drain all chunks without writing. _fileStream stays null for
+                // discarded files.
                 if (_fileStream == null && !_discarding) {
                     _discarding = ShouldDiscardFile?.Invoke(backupFile.DevicePath) ?? false;
                     if (!_discarding) {
+                        // ScribeHold fork (data-corruption GATE, #2046): delete any pre-existing
+                        // file at the LocalPath before opening the write stream. When a prior backup
+                        // session was interrupted mid-file, a partial copy can remain on disk; the
+                        // device re-sends the WHOLE file. File.OpenWrite + Seek(End) below would
+                        // APPEND the re-send onto that partial (partial bytes + full bytes), silently
+                        // corrupting the backup. Removing the stale file first makes the re-send a
+                        // clean replacement. Generalizes the prior Status.plist-only delete-guard to
+                        // every file (BackupFile.LocalPath is deterministic). Only runs at the start
+                        // of a new file (_fileStream == null) -- the in-session multi-chunk append
+                        // path below (_fileStream != null) is untouched.
+                        DeleteStalePartial(backupFile.LocalPath);
                         _fileStream = File.OpenWrite(backupFile.LocalPath);
                         _fileStream.Seek(0, SeekOrigin.End);
                     }
@@ -676,8 +667,8 @@ internal sealed class DeviceLinkService : IDisposable {
                 }
 
                 while (size > 0 && code == ResultCode.FileData) {
-                    // Instrumentation: time the USB receive and disk write separately so the
-                    // caller can diagnose whether the backup is USB-bound or disk-bound. We
+                    // ScribeHold fork: time the transfer receive and disk write separately so the
+                    // caller can diagnose whether the backup is transfer-bound or disk-bound. We
                     // measure only the buffer-sized chunk transfers here (the dominant path);
                     // metadata ReadInt32/ReadCode calls are excluded as they are negligible.
                     long rxStart = Stopwatch.GetTimestamp();
@@ -738,9 +729,9 @@ internal sealed class DeviceLinkService : IDisposable {
 
 
     /// <summary>
-    /// Returns cumulative receive/write throughput counters and resets them to zero. Intended
-    /// for diagnostic logging at the end of a backup session to determine whether transfer time
-    /// is dominated by USB receive or disk write.
+    /// ScribeHold fork: returns cumulative receive/write throughput counters and resets them to
+    /// zero. Intended for diagnostic logging at the end of a backup session to determine whether
+    /// transfer time is dominated by the transfer receive or the disk write.
     /// </summary>
     public (long rxBytes, TimeSpan rxTime, long wxBytes, TimeSpan wxTime) GetAndResetThroughputStats() {
         long rxBytes = Interlocked.Exchange(ref _rxBytes, 0);
@@ -762,42 +753,64 @@ internal sealed class DeviceLinkService : IDisposable {
     public async Task<ResultCode> DlLoop(CancellationToken cancellationToken = default) {
         Started?.Invoke(this, new BackupStartedEventArgs(this._iosVersion));
         FailedFiles.Clear();
+        // ScribeHold fork (#2081): reset the Finished latch per loop so a reused service instance never
+        // carries a prior session's terminal state into a new backup.
+        _finishedObserved = false;
 
         _internalCancellationTokenSource = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         while (!cancellationToken.IsCancellationRequested) {
-            ArrayNode message = await ReceiveMessage(_internalCancellationTokenSource.Token).ConfigureAwait(false);
-            if (message.Count == 0) {
-                _logger.LogWarning("Received array node with no elements");
-                await Task.Delay(100, cancellationToken).ConfigureAwait(false);
-                continue;
+            ArrayNode message;
+            if (_finishedObserved) {
+                // ScribeHold fork (#2081): once SnapshotState=Finished has been observed, bound the next
+                // read to a short timeout instead of the long SERVICE_READ_TIMEOUT_MS block. If the device
+                // sends its terminating DLMessageProcessMessage it arrives well inside the bound and is
+                // handled normally by the switch below; if the device instead holds the connection open
+                // after finishing (no FIN, no final message — the desync this fixes), the short read times
+                // out / returns empty and we complete gracefully as success. Finished is terminal, so this
+                // can never prematurely complete a still-transferring backup.
+                (message, bool finishedTimedOut) =
+                    await ReceiveFinalMessageAfterFinished(_internalCancellationTokenSource.Token).ConfigureAwait(false);
+                if (ShouldCompleteAfterFinished(finishedTimedOut, message.Count)) {
+                    _logger.LogInformation(
+                        "Backup reported SnapshotState=Finished and the connection was held open with no terminating message; completing gracefully (#2081)");
+                    Completed?.Invoke(this, new BackupResultEventArgs(FailedFiles, false, false));
+                    return ResultCode.Success;
+                }
+            }
+            else {
+                message = await ReceiveMessage(_internalCancellationTokenSource.Token).ConfigureAwait(false);
+                if (message.Count == 0) {
+                    _logger.LogWarning("Received array node with no elements");
+                    await Task.Delay(100, cancellationToken).ConfigureAwait(false);
+                    continue;
+                }
             }
 
             string command = message[0].AsStringNode().Value;
             _logger.LogDebug("Command recieved: {command}", command);
-            if (command == DeviceLinkMessage.ProcessMessage) {
-                ulong errorCode = message[1].AsDictionaryNode()["ErrorCode"].AsIntegerNode().Value;
-                if (errorCode != (ulong) ResultCode.Success) {
-                    string errorPlist = PropertyList.SaveAsString(message[1], PlistFormat.Xml);
-                    // Surface the daemon errno as a typed subtype so callers can react to a specific code
-                    // without parsing the serialized plist. Existing catch (DeviceLinkException) is unaffected
-                    // (DeviceLinkServiceException : DeviceLinkException). e.g. errno 208 = device auto-locked
-                    // mid-backup, which the host can recover from rather than treating as fatal.
-                    throw new DeviceLinkServiceException((int) errorCode, $"Device link error (ErrorCode {errorCode}): {errorPlist}");
+            switch (command) {
+                case DeviceLinkMessage.ProcessMessage: {
+                    if (message[1].AsDictionaryNode()["ErrorCode"].AsIntegerNode().Value != (ulong) ResultCode.Success) {
+                        throw new DeviceLinkException($"Device link error: {PropertyList.SaveAsString(message[1], PlistFormat.Xml)}");
+                    }
+                    Completed?.Invoke(this, new BackupResultEventArgs(FailedFiles, false, false));
+                    return ResultCode.Success;
                 }
-                Completed?.Invoke(this, new BackupResultEventArgs(FailedFiles, false, false));
-                return ResultCode.Success;
-            }
-            else if (command == DeviceLinkMessage.GetFreeDiskSpace) {
-                // We don't do anything specific for this command we just don't want to update progress as there isn't any attached to this message.
-            }
-            else if (command == DeviceLinkMessage.PurgeDiskSpace) {
-                throw new DiskSpacePurgeException($"Device requested {message[1].AsIntegerNode().SignedValue} bytes of disk space, but the host could not free enough space.");
-            }
-            else if (command == DeviceLinkMessage.UploadFiles) {
-                UpdateProgressForMessage(message[2].AsRealNode());
-            }
-            else {
-                UpdateProgressForMessage(message[3].AsRealNode());
+
+                case DeviceLinkMessage.UploadFiles: {
+                    UpdateProgressForMessage(message[2].AsRealNode());
+                    break;
+                }
+
+                case DeviceLinkMessage.GetFreeDiskSpace: {
+                    // We don't do anything specific for this, so just skip
+                    break;
+                }
+
+                default: {
+                    UpdateProgressForMessage(message[3].AsRealNode());
+                    break;
+                }
             }
 
             await DeviceLinkHandlers[command](message, _internalCancellationTokenSource.Token).ConfigureAwait(false);
@@ -811,6 +824,53 @@ internal sealed class DeviceLinkService : IDisposable {
             return [];
         }
         return message.AsArrayNode();
+    }
+
+    /// <summary>
+    /// ScribeHold fork (#2081): the pure decision for the post-Finished read — complete the backup
+    /// gracefully as success when the short final read either timed out (<paramref name="finishedTimedOut"/>)
+    /// or returned an empty message (<paramref name="messageCount"/> == 0). Both mean the device reported
+    /// the terminal Finished state and then sent nothing more on the held-open connection. A non-empty
+    /// message (<paramref name="messageCount"/> &gt; 0) within the bound is a real terminating message and
+    /// is handled by the normal switch instead. Pure + internal so the fork regression test exercises the
+    /// exact branch logic without a live socket.
+    /// </summary>
+    internal static bool ShouldCompleteAfterFinished(bool finishedTimedOut, int messageCount) {
+        return finishedTimedOut || messageCount == 0;
+    }
+
+    /// <summary>
+    /// ScribeHold fork (#2081): the post-Finished final read. Reads the next DeviceLink message with a
+    /// short <see cref="FINISHED_FINAL_READ_TIMEOUT_MS"/> bound rather than the long
+    /// <see cref="SERVICE_READ_TIMEOUT_MS"/> stream block, so a device that has already reported the
+    /// terminal Finished state but holds the connection open (no FIN, no terminating message) releases
+    /// the loop in ~5 s instead of blocking ~10 min and then failing.
+    /// </summary>
+    /// <param name="cancellationToken">The loop's (internal-linked) cancellation token.</param>
+    /// <returns>
+    /// The received message and a flag: <c>finishedTimedOut == true</c> when the short bound elapsed
+    /// (or the stream itself surfaced a timeout / a 0-byte FIN with no plist) — i.e. the device finished
+    /// but sent nothing more, so the loop should complete gracefully. When a real message arrives within
+    /// the bound the flag is <c>false</c> and the message is handled normally (e.g. the terminating
+    /// DLMessageProcessMessage). A genuine caller-requested cancellation is rethrown, never swallowed.
+    /// </returns>
+    private async Task<(ArrayNode message, bool finishedTimedOut)> ReceiveFinalMessageAfterFinished(CancellationToken cancellationToken) {
+        using CancellationTokenSource finalReadTimeoutCts = new CancellationTokenSource(FINISHED_FINAL_READ_TIMEOUT_MS);
+        using CancellationTokenSource linkedCts =
+            CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, finalReadTimeoutCts.Token);
+        try {
+            ArrayNode message = await ReceiveMessage(linkedCts.Token).ConfigureAwait(false);
+            return (message, false);
+        }
+        catch (OperationCanceledException) when (finalReadTimeoutCts.IsCancellationRequested && !cancellationToken.IsCancellationRequested) {
+            // Short bound elapsed: the device finished but sent nothing more on the held-open connection.
+            return ([], true);
+        }
+        catch (TimeoutException) {
+            // The underlying ServiceConnection stream read timed out (the device finished and went silent
+            // without closing) — same conclusion as the short bound elapsing.
+            return ([], true);
+        }
     }
 
     public async Task SendProcessMessage(PropertyNode message, CancellationToken cancellationToken) {
@@ -832,26 +892,60 @@ internal sealed class DeviceLinkService : IDisposable {
     /// <param name="versionMajor">The major version number to check.</param>
     /// <param name="versionMinor">The minor version number to check.</param>
     public async Task VersionExchange(ulong versionMajor, ulong versionMinor, CancellationToken cancellationToken) {
-        // Get DLMessageVersionExchange from device.
-        // ReceiveMessage returns an EMPTY array when the device sends nothing (ReceivePlistAsync read 0
-        // bytes — common on the FIRST mobilebackup2 DeviceLink read over WiFi against an idle device: the
-        // relay accepts the connection but the version-exchange reply never materialises). Guard the array
-        // BEFORE indexing [0] so this surfaces as a clean DeviceLinkException the backup retry path can
-        // handle, instead of an ArgumentOutOfRangeException that crashes the attempt (ScribeHold #1932).
-        ArrayNode versionExchangeMessage = await ReceiveMessage(cancellationToken);
-        if (versionExchangeMessage.Count == 0) {
-            // #1932 guard behaviour retained unchanged (empty 0-byte read -> clean exception, same
-            // message). The thrown type is refined to EmptyDeviceLinkReplyException — still a
-            // DeviceLinkException, so every existing catch is unaffected — so the WiFi stale-escrow
-            // wedge (#1945) can be classified without fragile message-string matching.
-            throw new EmptyDeviceLinkReplyException("Didn't receive a DLMessageVersionExchange from device (empty reply)");
+        // ScribeHold fork (#2068): this is the exact step where the "empty-reply-FIN" wedge bites.
+        // Trace each sub-step with elapsed-ms timing (Debug-gated, free when off) so a live failure
+        // self-explains: FIN-before-reply vs partial vs malformed plist, and WHERE the ~1s wedge
+        // diverges from a healthy ~fast handshake.
+        bool diag = _logger.IsEnabled(LogLevel.Debug);
+        Stopwatch stopwatch = diag ? Stopwatch.StartNew() : new Stopwatch();
+
+        // ScribeHold fork (#2077): arm the service-channel plaintext dump for the version-exchange
+        // window ONLY. While armed, a 0-byte/short read on the mb2 channel (the FIN point) dumps the
+        // decrypted partial bytes + classifies close_notify-vs-RST. We disarm in the finally below the
+        // moment version exchange ends, BEFORE the transfer phase carries user content on the same SSL
+        // stream. We also log the host's DLVersionExchange offer (the supported version the host WOULD
+        // send in DLVersionsOk) so a USB-vs-WiFi diff can compare what each transport offers (AC4).
+        _service.BeginVersionExchangeWindow();
+        if (diag) {
+            _logger.LogDebug(
+                "DeviceLink VersionExchange: host DLVersionExchange offer (would send DLVersionsOk {Major}.{Minor}); hostBytesSentBeforeFirstRead={HostBytesSent}",
+                versionMajor, versionMinor, _service.HostBytesSent);
         }
+        try {
+            await VersionExchangeCore(versionMajor, versionMinor, diag, stopwatch, cancellationToken).ConfigureAwait(false);
+        }
+        finally {
+            // ScribeHold fork (#2077): close the dump window — the transfer phase that follows carries
+            // user message content and must never be dumped.
+            _service.EndVersionExchangeWindow();
+        }
+    }
+
+    /// <summary>
+    /// ScribeHold fork (#2077): the body of <see cref="VersionExchange"/>, extracted so the
+    /// version-exchange plaintext-dump window can be opened/closed around it with a try/finally
+    /// without nesting the whole flow. Behavior is identical to the prior inline body.
+    /// </summary>
+    private async Task VersionExchangeCore(ulong versionMajor, ulong versionMinor, bool diag, Stopwatch stopwatch, CancellationToken cancellationToken) {
+        if (diag) {
+            _logger.LogDebug("DeviceLink VersionExchange: awaiting DLMessageVersionExchange from device (expect {Major}.{Minor})", versionMajor, versionMinor);
+        }
+
+        // Get DLMessageVersionExchange from device
+        ArrayNode versionExchangeMessage = await ReceiveMessage(cancellationToken);
+        if (diag) {
+            _logger.LogDebug(
+                "DeviceLink VersionExchange: received {Count}-element message after {ElapsedMs}ms: {Message}",
+                versionExchangeMessage.Count, stopwatch.ElapsedMilliseconds, DescribePlist(versionExchangeMessage));
+        }
+        if (versionExchangeMessage.Count < 3) {
+            // FIN-before-reply / malformed: ReceiveMessage returns [] when ReceivePlistAsync read 0 bytes.
+            throw new DeviceLinkException("DLMessageVersionExchange has unexpected format (size < 3)");
+        }
+
         string dlMessage = versionExchangeMessage[0].AsStringNode().Value;
         if (string.IsNullOrEmpty(dlMessage) || dlMessage != "DLMessageVersionExchange") {
             throw new DeviceLinkException("Didn't receive DLMessageVersionExchange from device");
-        }
-        if (versionExchangeMessage.Count < 3) {
-            throw new DeviceLinkException("DLMessageVersionExchange has unexpected format");
         }
 
         // Get major and minor version number
@@ -865,21 +959,57 @@ internal sealed class DeviceLinkService : IDisposable {
         }
 
         // The version is ok so send reply
+        if (diag) {
+            _logger.LogDebug("DeviceLink VersionExchange: device offered {Major}.{Minor}; sending DLVersionsOk at {ElapsedMs}ms", vMajor, vMinor, stopwatch.ElapsedMilliseconds);
+        }
         _service.SendPlist(new ArrayNode {
             new StringNode("DLMessageVersionExchange"),
             new StringNode("DLVersionsOk"),
             new IntegerNode(versionMajor)
         }, PlistFormat.Binary);
 
-        // Receive DeviceReady message (same empty-reply guard as the version exchange above).
+        // Receive DeviceReady message
+        if (diag) {
+            _logger.LogDebug("DeviceLink VersionExchange: awaiting DLMessageDeviceReady at {ElapsedMs}ms", stopwatch.ElapsedMilliseconds);
+        }
         ArrayNode messageDeviceReady = await ReceiveMessage(cancellationToken);
+        if (diag) {
+            _logger.LogDebug(
+                "DeviceLink VersionExchange: received {Count}-element reply after {ElapsedMs}ms: {Message}",
+                messageDeviceReady.Count, stopwatch.ElapsedMilliseconds, DescribePlist(messageDeviceReady));
+        }
         if (messageDeviceReady.Count == 0) {
-            // Same empty-reply guard refinement as the version-exchange read above (#1932 / #1945).
-            throw new EmptyDeviceLinkReplyException("Didn't receive a DLMessageDeviceReady from device (empty reply)");
+            // FIN after our DLVersionsOk reply but before DeviceReady — the device accepted the
+            // version but tore down the connection (distinct from the pre-reply FIN above).
+            throw new DeviceLinkException("Device link didn't return ready state (DLMessageDeviceReady); received empty reply");
         }
         dlMessage = messageDeviceReady[0].AsStringNode().Value;
         if (string.IsNullOrEmpty(dlMessage) || dlMessage != "DLMessageDeviceReady") {
             throw new DeviceLinkException("Device link didn't return ready state (DLMessageDeviceReady)");
+        }
+        if (diag) {
+            _logger.LogDebug("DeviceLink VersionExchange: completed (DeviceReady) in {ElapsedMs}ms", stopwatch.ElapsedMilliseconds);
+        }
+    }
+
+    /// <summary>
+    /// ScribeHold fork (#2068): render a DeviceLink array message as a compact, log-safe string for
+    /// the diagnostic trace. The first element (the DLMessage* type tag) is the discriminator we care
+    /// about; an empty array means a 0-byte/FIN read returned nothing.
+    /// </summary>
+    private static string DescribePlist(ArrayNode message) {
+        if (message.Count == 0) {
+            return "<empty / 0-byte read>";
+        }
+        try {
+            return string.Join(", ", message.Select(static n => n switch {
+                StringNode s => $"\"{s.Value}\"",
+                IntegerNode i => i.Value.ToString(System.Globalization.CultureInfo.InvariantCulture),
+                _ => n.GetType().Name
+            }));
+        }
+        catch (Exception) {
+            return $"<{message.Count} elements>";
         }
     }
 }

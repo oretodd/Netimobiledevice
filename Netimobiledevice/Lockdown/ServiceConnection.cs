@@ -36,6 +36,20 @@ public class ServiceConnection : IDisposable {
     /// property instead
     /// </summary>
     private SslStream? _sslStream;
+    private int _timeout = Timeout.Infinite;
+
+    // ScribeHold fork (#2077): cumulative count of payload bytes the HOST has written on this
+    // connection. At the version-exchange FIN the dump reports this so a wedge proves whether the
+    // host sent ANYTHING before the device FIN'd (DeviceLink has the device speak first, so a healthy
+    // flow has 0 host bytes before the first read — a non-zero count would be a stray host write).
+    private long _bytesSent;
+    // ScribeHold fork (#2077): when true, a 0-byte / short read at the version-exchange step may hex
+    // dump the decrypted bytes it returned. The window is opened by DeviceLinkService.VersionExchange
+    // and closed (in a finally) the moment version exchange ends, BEFORE the transfer phase. The same
+    // SSL stream later carries the backup transfer (user message content); gating the hex dump on this
+    // flag makes it structurally impossible to dump that content — the safety bound is in code, not
+    // discipline. Default false: nothing dumps unless a version exchange explicitly armed it.
+    private bool _versionExchangeWindow;
 
     public UsbmuxdDevice? MuxDevice { get; private set; }
 
@@ -47,98 +61,47 @@ public class ServiceConnection : IDisposable {
 
     public Stream Stream => _sslStream != null ? _sslStream : _networkStream;
 
-    private ServiceConnection(Socket sock, ILogger logger, UsbmuxdDevice? muxDevice = null) {
+    private ServiceConnection(Socket sock, int timeout, ILogger logger, UsbmuxdDevice? muxDevice = null) {
         _logger = logger;
-        _networkStream = new NetworkStream(sock, true);
+        _timeout = timeout;
+        _networkStream = new NetworkStream(sock, true) {
+            ReadTimeout = _timeout,
+            WriteTimeout = _timeout
+        };
 
         // Usbmux connections contain additional information associated with the current connection
         MuxDevice = muxDevice;
     }
 
-    /// <summary>
-    /// Apply the keepalive budget shared by every relay socket (usbmux-over-USB and TCP-over-WiFi alike).
-    /// Both transports carry the same multiplexed device data channel, so both must outlast the
-    /// multi-minute heads-down bursts iOS produces while servicing it — otherwise the local TCP stack
-    /// aborts a healthy relay socket and the bulk read throws IOException(SocketException 10053/10054).
-    /// Budget ~= 120 + 10*30 = ~7 min, kept under DeviceLinkService's 10-min read timeout. (#1857)
-    /// </summary>
-    private static void ConfigureKeepAlive(Socket sock) {
-        sock.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.KeepAlive, true);
-        sock.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.TcpKeepAliveTime, 120);
-        sock.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.TcpKeepAliveInterval, 30);
-        sock.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.TcpKeepAliveRetryCount, 10);
-    }
-
-    /// <summary>
-    /// Hard ceiling on a TCP-over-WiFi connect. A bare <c>Socket.Connect</c> has NO connect timeout, so a
-    /// secondary lockdown-service connect to a WiFi device whose network socket has gone idle (Apple drops
-    /// the mobdev2 TCP relay after ~1-3 min of inactivity) blocks the calling thread for the OS default —
-    /// tens of seconds to effectively forever. ScribeHold opens these secondary connects synchronously
-    /// from the backup worker (BackupKeepSet/Mobilebackup2Service -> StartLockdownService), so an unbounded
-    /// connect wedges the whole backup in Backup_Initializing with no passcode and no progress (#1926). The
-    /// primary lockdown connect is already bounded by WiFiLockdownConnectionFactory; this bounds every
-    /// SUBSEQUENT per-service TCP connect the same way so a stalled endpoint fails fast and loud instead.
-    /// </summary>
-    private static readonly TimeSpan TcpConnectTimeout = TimeSpan.FromSeconds(10);
-
-    private static Socket ConnectTcpBounded(IPAddress ip, ushort port, ILogger? logger = null) {
-        Socket sock = new Socket(SocketType.Stream, ProtocolType.IP);
-        try {
-            // ConnectAsync + a timeout gives the bounded connect that Socket.Connect lacks. On timeout the
-            // socket is disposed (cancelling the in-flight connect) and a SocketException(TimedOut) is
-            // thrown — the same shape callers already handle as a failed connect.
-            using var cts = new CancellationTokenSource(TcpConnectTimeout);
-            sock.ConnectAsync(ip, port, cts.Token).AsTask().GetAwaiter().GetResult();
-            return sock;
-        }
-        catch (OperationCanceledException) {
-            sock.Dispose();
-            // OBSERVATION-ONLY (#1936): name the layer + the timeout VALUE before the (unchanged) throw, so
-            // an L3 unicast-62078 reachability timeout is loud and queryable. Does not change the timeout
-            // budget or the throw shape.
-            (logger ?? NullLogger.Instance).LogWarning(
-                "WiFi TCP connect to {Ip}:{Port} timed out after {TimeoutMs}ms (L3 unicast 62078 reachability)",
-                ip, port, (long) TcpConnectTimeout.TotalMilliseconds);
-            throw new SocketException((int) SocketError.TimedOut);
-        }
-        catch {
-            sock.Dispose();
-            throw;
-        }
-    }
-
-    internal static ServiceConnection CreateUsingTcp(string hostname, ushort port, ILogger? logger = null) {
-        IPAddress ip = IPAddress.Parse(hostname);
-        Socket sock = ConnectTcpBounded(ip, port, logger);
-        ConfigureKeepAlive(sock);
-        return new ServiceConnection(sock, logger ?? NullLogger.Instance);
-    }
-
-    internal static async Task<ServiceConnection> CreateUsingTcpAsync(string hostname, ushort port, ILogger? logger = null) {
+    internal static ServiceConnection CreateUsingTcp(string hostname, ushort port, int timeout = 10_000, ILogger? logger = null) {
         IPAddress ip = IPAddress.Parse(hostname);
         Socket sock = new Socket(SocketType.Stream, ProtocolType.IP);
-        try {
-            using var cts = new CancellationTokenSource(TcpConnectTimeout);
-            await sock.ConnectAsync(ip, port, cts.Token).ConfigureAwait(false);
-        }
-        catch (OperationCanceledException) {
-            sock.Dispose();
-            // OBSERVATION-ONLY (#1936): mirror the synchronous path — name the layer + timeout value before
-            // the unchanged throw. Does not change the timeout budget or throw shape.
-            (logger ?? NullLogger.Instance).LogWarning(
-                "WiFi TCP connect to {Ip}:{Port} timed out after {TimeoutMs}ms (L3 unicast 62078 reachability)",
-                ip, port, (long) TcpConnectTimeout.TotalMilliseconds);
-            throw new SocketException((int) SocketError.TimedOut);
-        }
-        catch {
-            sock.Dispose();
-            throw;
-        }
-        ConfigureKeepAlive(sock);
-        return new ServiceConnection(sock, logger ?? NullLogger.Instance);
+        sock.Connect(ip, port);
+        return new ServiceConnection(sock, timeout, logger ?? NullLogger.Instance);
     }
 
-    internal static ServiceConnection CreateUsingUsbmux(string udid, ushort port, UsbmuxdConnectionType? connectionType = null, string usbmuxAddress = "", ILogger? logger = null) {
+    internal static async Task<ServiceConnection> CreateUsingTcpAsync(string hostname, ushort port, int timeout = 10_000, ILogger? logger = null) {
+        IPAddress ip = IPAddress.Parse(hostname);
+        Socket sock = new Socket(SocketType.Stream, ProtocolType.IP);
+
+        using (CancellationTokenSource cts = new CancellationTokenSource(TimeSpan.FromMilliseconds(timeout))) {
+            try {
+                await sock.ConnectAsync(ip, port).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) {
+                sock.Dispose();
+                throw new SocketException((int) SocketError.TimedOut);
+            }
+            catch {
+                sock.Dispose();
+                throw;
+            }
+        }
+
+        return new ServiceConnection(sock, timeout, logger ?? NullLogger.Instance);
+    }
+
+    internal static ServiceConnection CreateUsingUsbmux(string udid, ushort port, UsbmuxdConnectionType? connectionType = null, string usbmuxAddress = "", int timeout = 10_000, ILogger? logger = null) {
         UsbmuxdDevice? targetDevice = Usbmux.GetDevice(udid, connectionType: connectionType, usbmuxAddress: usbmuxAddress);
         if (targetDevice == null) {
             if (!string.IsNullOrEmpty(udid)) {
@@ -147,11 +110,18 @@ public class ServiceConnection : IDisposable {
             throw new NoDeviceConnectedException();
         }
         Socket sock = targetDevice.Connect(port, usbmuxAddress: usbmuxAddress, logger);
-        ConfigureKeepAlive(sock);
-        return new ServiceConnection(sock, logger ?? NullLogger.Instance, targetDevice);
+        // ScribeHold fork (#1857): keepalive budget must outlast the multi-minute heads-down bursts
+        // usbmuxd produces while servicing the multiplexed device data channel — otherwise the local
+        // TCP stack aborts a healthy relay socket and the bulk read throws IOException(10053/10054).
+        // Budget ~= 120 + 10*30 = ~7 min, kept under DeviceLinkService's 10-min read timeout.
+        sock.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.KeepAlive, true);
+        sock.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.TcpKeepAliveTime, 120);
+        sock.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.TcpKeepAliveInterval, 30);
+        sock.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.TcpKeepAliveRetryCount, 10);
+        return new ServiceConnection(sock, timeout, logger ?? NullLogger.Instance, targetDevice);
     }
 
-    internal static async Task<ServiceConnection> CreateUsingUsbmuxAsync(string udid, ushort port, UsbmuxdConnectionType? connectionType = null, string usbmuxAddress = "", ILogger? logger = null) {
+    internal static async Task<ServiceConnection> CreateUsingUsbmuxAsync(string udid, ushort port, UsbmuxdConnectionType? connectionType = null, string usbmuxAddress = "", int timeout = 10_000, ILogger? logger = null) {
         UsbmuxdDevice? targetDevice = Usbmux.GetDevice(udid, connectionType: connectionType, usbmuxAddress: usbmuxAddress);
         if (targetDevice == null) {
             if (!string.IsNullOrEmpty(udid)) {
@@ -160,8 +130,15 @@ public class ServiceConnection : IDisposable {
             throw new NoDeviceConnectedException();
         }
         Socket sock = await targetDevice.ConnectAsync(port, usbmuxAddress: usbmuxAddress, logger).ConfigureAwait(false);
-        ConfigureKeepAlive(sock);
-        return new ServiceConnection(sock, logger ?? NullLogger.Instance, targetDevice);
+        // ScribeHold fork (#1857): keepalive budget must outlast the multi-minute heads-down bursts
+        // usbmuxd produces while servicing the multiplexed device data channel — otherwise the local
+        // TCP stack aborts a healthy relay socket and the bulk read throws IOException(10053/10054).
+        // Budget ~= 120 + 10*30 = ~7 min, kept under DeviceLinkService's 10-min read timeout.
+        sock.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.KeepAlive, true);
+        sock.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.TcpKeepAliveTime, 120);
+        sock.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.TcpKeepAliveInterval, 30);
+        sock.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.TcpKeepAliveRetryCount, 10);
+        return new ServiceConnection(sock, timeout, logger ?? NullLogger.Instance, targetDevice);
     }
 
     private bool UserCertificateValidationCallback(object sender, X509Certificate? certificate, X509Chain? chain, SslPolicyErrors sslPolicyErrors) {
@@ -194,10 +171,25 @@ public class ServiceConnection : IDisposable {
 
             int bytesRead = Stream.Read(buffer, totalBytesRead, readSize);
             if (bytesRead == 0) {
-                _logger.LogError("Read zero bytes so the connection has been broken");
+                // ScribeHold fork (#2068): the device sent a 0-byte read (FIN). Log WHERE in the
+                // expected payload it died so a wedge self-explains: a FIN at offset 0 of a 4-byte
+                // length-prefix read is the "empty-reply-FIN at version-exchange" signature, while a
+                // FIN partway through a payload read is a truncated/partial reply.
+                _logger.LogError(
+                    "Read zero bytes so the connection has been broken (FIN at offset {Offset}/{Expected} bytes)",
+                    totalBytesRead, length);
+                // ScribeHold fork (#2077): version-exchange-window-bounded plaintext dump + close
+                // classification (see ReceiveAsync for the full rationale).
+                LogVersionExchangeFin(buffer, totalBytesRead, length);
                 break;
             }
             totalBytesRead += bytesRead;
+        }
+
+        // ScribeHold fork (#2068): wire-level read trace, gated to Debug (Netimobiledevice category
+        // is pinned to Warning unless EnableDiagnosticLogging raises it), so it is free when off.
+        if (_logger.IsEnabled(LogLevel.Debug)) {
+            _logger.LogDebug("ServiceConnection.Receive read {Read}/{Expected} bytes", totalBytesRead, length);
         }
 
         if (totalBytesRead < buffer.Length) {
@@ -228,19 +220,22 @@ public class ServiceConnection : IDisposable {
                     try {
                         bytesRead = await Stream.ReadAsync(buffer.AsMemory(totalBytesRead, readSize), linkedCancellationTokenSource.Token).ConfigureAwait(false);
                         if (bytesRead == 0) {
-                            _logger.LogError("Read zero bytes so the connection has been broken");
+                            // ScribeHold fork (#2068): record WHERE the FIN landed — offset 0 of a 4-byte
+                            // length-prefix read is the empty-reply-FIN-at-version-exchange signature.
+                            _logger.LogError(
+                                "Read zero bytes so the connection has been broken (FIN at offset {Offset}/{Expected} bytes)",
+                                totalBytesRead, length);
+                            // ScribeHold fork (#2077): at the version-exchange window only, dump the
+                            // decrypted partial bytes (if any), confirm whether the host had sent
+                            // anything first, and classify the close as graceful (close_notify / clean
+                            // FIN) vs a hard RST — the decisive USB-vs-WiFi signal. Bounded to the
+                            // version-exchange window so transfer-phase user content is never dumped.
+                            LogVersionExchangeFin(buffer, totalBytesRead, length);
                             break;
                         }
                     }
                     catch (OperationCanceledException) {
                         if (localTaskComplete.IsCancellationRequested) {
-                            // OBSERVATION-ONLY (#1936): the WiFi lockdown CONTROL-channel read budget fired.
-                            // Name the layer + the value before the (unchanged) throw so an L4 lockdown
-                            // handshake/control timeout is loud and queryable. Stream.ReadTimeout is safe to
-                            // read here — this branch only runs when it was != -1.
-                            _logger.LogWarning(
-                                "WiFi lockdown control read timed out after {TimeoutMs}ms (L4 lockdown handshake/control)",
-                                Stream.ReadTimeout);
                             throw new TimeoutException("Timeout waiting for message from service");
                         }
                         throw;
@@ -252,6 +247,11 @@ public class ServiceConnection : IDisposable {
             }
 
             totalBytesRead += bytesRead;
+        }
+
+        // ScribeHold fork (#2068): wire-level read trace (Debug-gated, free when off).
+        if (_logger.IsEnabled(LogLevel.Debug)) {
+            _logger.LogDebug("ServiceConnection.ReceiveAsync read {Read}/{Expected} bytes", totalBytesRead, length);
         }
 
         if (totalBytesRead < buffer.Length) {
@@ -306,10 +306,16 @@ public class ServiceConnection : IDisposable {
 
     public void Send(ReadOnlySpan<byte> data) {
         Stream.Write(data);
+        // ScribeHold fork (#2077): track total host-sent payload bytes so the version-exchange FIN
+        // dump can prove whether the host wrote anything before the device FIN'd (it should not —
+        // DeviceLink has the device speak first).
+        Interlocked.Add(ref _bytesSent, data.Length);
     }
 
     public async Task SendAsync(ReadOnlyMemory<byte> data, CancellationToken cancellationToken) {
         await Stream.WriteAsync(data, cancellationToken).ConfigureAwait(false);
+        // ScribeHold fork (#2077): see Send — count host-sent bytes for the FIN dump.
+        Interlocked.Add(ref _bytesSent, data.Length);
     }
 
     public void SendPlist(PropertyNode data, PlistFormat format = PlistFormat.Xml) {
@@ -330,11 +336,7 @@ public class ServiceConnection : IDisposable {
 
     public PropertyNode? SendReceivePlist(PropertyNode data) {
         SendPlist(data);
-        int rt = SafeTimeout(() => Stream.ReadTimeout);
-        _logger.LogTrace("[mb2-diag] SendReceivePlist: sent request, blocking on synchronous read (ReadTimeout={ReadTimeout}ms, ssl={Ssl})", rt, _sslStream != null);
-        PropertyNode? result = ReceivePlist();
-        _logger.LogTrace("[mb2-diag] SendReceivePlist: read completed");
-        return result;
+        return ReceivePlist();
     }
 
     public async Task<PropertyNode?> SendReceivePlistAsync(PropertyNode data, CancellationToken cancellationToken) {
@@ -346,80 +348,46 @@ public class ServiceConnection : IDisposable {
     /// Set a value in milliseconds, that determines how long the service connection will attempt to read/write for before timing out
     /// </summary>
     /// <param name="timeout">A value in milliseconds that detemines how long the service connection will wait before timing out</param>
-    public void SetTimeout(int timeout = -1) {
+    public void SetTimeout(int timeout = Timeout.Infinite) {
+        // Update the internal timeout
+        _timeout = timeout;
+
+        // Update the currently active stream to use these timeouts.
         Stream.ReadTimeout = timeout;
         Stream.WriteTimeout = timeout;
     }
-
-    /// <summary>
-    /// Hard ceiling on the synchronous SSL handshake (<see cref="SslStream.AuthenticateAsClient(string)"/>).
-    /// The handshake reads from the underlying socket with NO timeout of its own, so when a WiFi device
-    /// accepts the secondary mobilebackup2 service TCP connection but never completes the TLS handshake
-    /// (its lockdown relay went idle, or it is mid-reauthorising the wireless session), the backup worker
-    /// thread blocks here FOREVER and the backup wedges in Backup_Initializing with no passcode and no
-    /// progress — the connect is bounded but the handshake was not (ScribeHold #1926, deeper layer). A
-    /// finite handshake deadline makes a stalled handshake throw so the attempt fails fast and retries.
-    /// </summary>
-    private static readonly TimeSpan SslHandshakeTimeout = TimeSpan.FromSeconds(30);
 
     public bool StartSsl(X509Certificate2 certificate) {
         if (_networkStream == null) {
             throw new InvalidOperationException("Network stream is null");
         }
-        // Carry any read/write timeout configured on the pre-SSL network stream forward to the SSL stream:
-        // SslStream defaults to an infinite timeout and does NOT inherit the inner stream's, so a control
-        // channel that set a finite SetTimeout before the handshake would silently lose it once SSL starts
-        // and could then block forever on a stalled read (ScribeHold #1926). -1 (infinite) is preserved as
-        // -1, so the bulk data channel is unaffected.
-        int readTimeout = SafeTimeout(() => _networkStream.ReadTimeout);
-        int writeTimeout = SafeTimeout(() => _networkStream.WriteTimeout);
         _networkStream.Flush();
 
-        _sslStream = new SslStream(_networkStream, true, UserCertificateValidationCallback, null, EncryptionPolicy.RequireEncryption);
+        // ScribeHold fork (#1999): the SSL trust handshake must NOT carry the finite data-read
+        // timeout (default 10_000 ms from the re-fork's ServiceConnection ctor). The device shows
+        // a trust/passcode dialog during AuthenticateAsClient that legitimately takes longer than
+        // 10 s; a finite stream timeout makes the host abort the relay socket (SocketException
+        // 10053) and the handshake fails. Run the handshake with Timeout.Infinite (matching the
+        // working marketing behavior), then restore _timeout so the subsequent #1857 bulk-read
+        // budget — set explicitly via SetTimeout by DeviceLinkService — is preserved.
+        _sslStream = new SslStream(_networkStream, true, UserCertificateValidationCallback, null, EncryptionPolicy.RequireEncryption) {
+            ReadTimeout = Timeout.Infinite,
+            WriteTimeout = Timeout.Infinite
+        };
         try {
-            SslClientAuthenticationOptions authOptions = new() {
-                TargetHost = string.Empty,
-                ClientCertificates = [certificate],
-                EnabledSslProtocols = SslProtocols.None,
-                CertificateRevocationCheckMode = X509RevocationMode.NoCheck
-            };
-            // Bound the handshake: AuthenticateAsClient has no timeout, so use the cancellable async
-            // overload with a deadline and block on it. On timeout the socket read is cancelled and we
-            // surface it as a failed handshake (the same shape callers already treat as a pairing/connect
-            // failure), instead of hanging the backup thread indefinitely.
-            using var handshakeCts = new CancellationTokenSource(SslHandshakeTimeout);
-            _sslStream.AuthenticateAsClientAsync(authOptions, handshakeCts.Token).GetAwaiter().GetResult();
+            // TLS v1.2 is supported since iOS 5 so we should specify this as a minimum
+            _sslStream.AuthenticateAsClient(string.Empty, [certificate], SslProtocols.None, false);
         }
-        catch (AuthenticationException ex) {
+        catch (Exception ex) {
             _logger.LogError(ex, "SSL authentication failed");
             return false;
         }
-        catch (OperationCanceledException) {
-            _logger.LogError("SSL handshake timed out after {TimeoutSeconds}s on the service connection", SslHandshakeTimeout.TotalSeconds);
-            return false;
-        }
-        catch (Exception ex) when (IsHandshakeConnectionAbort(ex)) {
-            _logger.LogError(ex, "SSL handshake aborted by the device on the service connection (connection abort/reset)");
-            return false;
+        finally {
+            RestoreStreamTimeoutAfterHandshake();
         }
 
-        if (readTimeout != Timeout.Infinite) {
-            _sslStream.ReadTimeout = readTimeout;
-        }
-        if (writeTimeout != Timeout.Infinite) {
-            _sslStream.WriteTimeout = writeTimeout;
-        }
+        LogSslHandshakeResult();
         return true;
-    }
-
-    /// <summary>Read a stream timeout property defensively (NetworkStream throws if no timeout is set).</summary>
-    private static int SafeTimeout(Func<int> get) {
-        try {
-            return get();
-        }
-        catch {
-            return Timeout.Infinite;
-        }
     }
 
     public async Task<bool> StartSslAsync(X509Certificate2 certificate) {
@@ -428,56 +396,173 @@ public class ServiceConnection : IDisposable {
         }
         await _networkStream.FlushAsync().ConfigureAwait(false);
 
-        _sslStream = new SslStream(_networkStream, true, UserCertificateValidationCallback, null, EncryptionPolicy.RequireEncryption);
+        // ScribeHold fork (#1999): see StartSsl — handshake runs with Timeout.Infinite so the
+        // trust/passcode dialog (which can exceed the 10 s data-read default) cannot abort the
+        // socket, then _timeout is restored for the subsequent #1857-protected data reads.
+        _sslStream = new SslStream(_networkStream, true, UserCertificateValidationCallback, null, EncryptionPolicy.RequireEncryption) {
+            ReadTimeout = Timeout.Infinite,
+            WriteTimeout = Timeout.Infinite
+        };
         try {
-            // TLS v1.2 is supported since iOS 5 so we should specify this as a minimum.
-            // Bound the handshake symmetrically with the synchronous StartSsl (#1926): an unbounded
-            // handshake on a fresh per-service WiFi socket wedges the backup forever. Any caller that
-            // switches to the async StartLockdownService path must get the same protection.
-            SslClientAuthenticationOptions authOptions = new() {
-                TargetHost = string.Empty,
-                ClientCertificates = [certificate],
-                EnabledSslProtocols = SslProtocols.Tls12 | SslProtocols.Tls13,
-                CertificateRevocationCheckMode = X509RevocationMode.NoCheck
-            };
-            using var handshakeCts = new CancellationTokenSource(SslHandshakeTimeout);
-            await _sslStream.AuthenticateAsClientAsync(authOptions, handshakeCts.Token).ConfigureAwait(false);
+            // TLS v1.2 is supported since iOS 5 so we should specify this as a minimum
+            await _sslStream.AuthenticateAsClientAsync(string.Empty, [certificate], SslProtocols.Tls12 | SslProtocols.Tls13, false);
         }
         catch (AuthenticationException ex) {
             _logger.LogError(ex, "SSL authentication failed");
             return false;
         }
-        catch (OperationCanceledException) {
-            _logger.LogError("SSL handshake timed out after {TimeoutSeconds}s on the service connection", SslHandshakeTimeout.TotalSeconds);
-            return false;
-        }
-        catch (Exception ex) when (IsHandshakeConnectionAbort(ex)) {
-            _logger.LogError(ex, "SSL handshake aborted by the device on the service connection (connection abort/reset)");
-            return false;
+        finally {
+            RestoreStreamTimeoutAfterHandshake();
         }
 
+        LogSslHandshakeResult();
         return true;
     }
 
     /// <summary>
-    /// True when <paramref name="ex"/> represents the device tearing down the TLS handshake mid-flight:
-    /// a <see cref="SocketException"/> with <see cref="SocketError.ConnectionAborted"/> (WSAECONNABORTED,
-    /// 10053) or <see cref="SocketError.ConnectionReset"/> (WSAECONNRESET, 10054) — thrown directly by
-    /// <c>AuthenticateAsClientAsync</c> or wrapped inside an <see cref="IOException"/>. An already-paired
-    /// device that declines the autopair SSL RE-VALIDATION of the lockdown CONTROL connect surfaces this
-    /// signature (ScribeHold #1958, confirmed independent of host VPN and of trust freshness by the
-    /// Wave-1 bisect). It is treated as a recoverable handshake FAILURE (StartSsl returns <c>false</c>),
-    /// NOT a fatal connect abort, so identity-only consumers keep a usable client.
+    /// ScribeHold fork (#2068): on a successful handshake, log the negotiated TLS version and cipher
+    /// suite (Debug-gated, free when the Netimobiledevice category is at its default Warning level).
+    /// This distinguishes "SSL ok" from "SSL handshake threw" when diagnosing a version-exchange FIN.
     /// </summary>
-    internal static bool IsHandshakeConnectionAbort(Exception ex)
-    {
-        for (Exception? current = ex; current is not null; current = current.InnerException) {
-            if (current is SocketException socketEx &&
-                (socketEx.SocketErrorCode == SocketError.ConnectionAborted ||
-                 socketEx.SocketErrorCode == SocketError.ConnectionReset)) {
-                return true;
-            }
+    private void LogSslHandshakeResult() {
+        if (_sslStream == null || !_logger.IsEnabled(LogLevel.Debug)) {
+            return;
         }
-        return false;
+        _logger.LogDebug(
+            "SSL handshake established: protocol={Protocol} cipher={Cipher}",
+            _sslStream.SslProtocol, _sslStream.NegotiatedCipherSuite);
+    }
+
+    /// <summary>
+    /// Restore the configured data-read timeout (<see cref="_timeout"/>) onto the active SSL stream
+    /// once the trust handshake has completed. The handshake itself runs with
+    /// <see cref="Timeout.Infinite"/> so the device's trust/passcode dialog cannot abort the socket
+    /// (#1999), but bulk data reads must keep the finite budget (#1857) that DeviceLinkService and
+    /// the other services rely on via <see cref="SetTimeout"/>.
+    /// </summary>
+    private void RestoreStreamTimeoutAfterHandshake() {
+        if (_sslStream == null) {
+            return;
+        }
+        _sslStream.ReadTimeout = _timeout;
+        _sslStream.WriteTimeout = _timeout;
+    }
+
+    /// <summary>
+    /// ScribeHold fork (#2077): arm the version-exchange plaintext dump. Called by
+    /// <see cref="Netimobiledevice.DeviceLink.DeviceLinkService"/> immediately before the first
+    /// DeviceLink read on the mb2 service channel (where the empty-reply-FIN wedge bites). While the
+    /// window is open, a 0-byte / short read MAY hex-dump the decrypted bytes it returned. The window
+    /// MUST be closed (via <see cref="EndVersionExchangeWindow"/>, in a finally) the moment version
+    /// exchange ends — the same SSL stream then carries the backup transfer (user message content),
+    /// which must NEVER be dumped.
+    /// </summary>
+    public void BeginVersionExchangeWindow() {
+        _versionExchangeWindow = true;
+    }
+
+    /// <summary>
+    /// ScribeHold fork (#2077): disarm the version-exchange plaintext dump. After this returns, a
+    /// 0-byte read on the transfer phase only emits the #2068 byte-count trace (no payload), so user
+    /// content on the same SSL stream is structurally unable to be dumped.
+    /// </summary>
+    public void EndVersionExchangeWindow() {
+        _versionExchangeWindow = false;
+    }
+
+    /// <summary>
+    /// ScribeHold fork (#2077): cumulative count of payload bytes the host has written on this
+    /// connection. Exposed so callers (and the diagnostic trace) can confirm the host did not send a
+    /// stray byte before the device-speaks-first DeviceLink read.
+    /// </summary>
+    public long HostBytesSent => Interlocked.Read(ref _bytesSent);
+
+    /// <summary>
+    /// ScribeHold fork (#2077): the decisive version-exchange-FIN dump. Runs ONLY inside the
+    /// version-exchange window (armed by <see cref="BeginVersionExchangeWindow"/>) and only when
+    /// Debug logging is enabled (the Netimobiledevice category is pinned to Warning unless
+    /// EnableDiagnosticLogging raises it), so it is free and silent when the diagnostic switch is off.
+    /// Surfaces, at the exact FIN: (1) whether the host had written anything before the first read
+    /// (AC1), (2) the decrypted partial bytes the SSL read returned, length + hex (AC2), and (3)
+    /// whether the device closed gracefully (close_notify / clean FIN) or hard-RST the socket (AC3).
+    /// </summary>
+    /// <param name="buffer">The receive buffer; the first <paramref name="bytesRead"/> bytes are the decrypted partial.</param>
+    /// <param name="bytesRead">How many bytes were decrypted before the 0-byte read (0 at the canonical 0/4 FIN).</param>
+    /// <param name="expected">The number of bytes the read was waiting for (4 at the length-prefix FIN).</param>
+    private void LogVersionExchangeFin(byte[] buffer, int bytesRead, int expected) {
+        if (!_versionExchangeWindow || !_logger.IsEnabled(LogLevel.Debug)) {
+            return;
+        }
+
+        string partialHex = FormatHexPreview(buffer, bytesRead);
+        string closeKind = ClassifyConnectionClose();
+        _logger.LogDebug(
+            "VersionExchange FIN dump: hostBytesSentBeforeRead={HostBytesSent} decryptedPartial={Read}/{Expected} bytes hex=[{Hex}] close={Close}",
+            HostBytesSent, bytesRead, expected, partialHex, closeKind);
+    }
+
+    /// <summary>
+    /// ScribeHold fork (#2077): classify a 0-byte SSL read on the mb2 service channel as a graceful
+    /// close (TLS <c>close_notify</c> alert or a clean TCP FIN — the device deliberately tore the
+    /// channel down at the application layer) vs a hard <c>RST</c> (transport-level abort). This is THE
+    /// signal that separates "Apple's mb2 logic refused something" from "the socket was killed under
+    /// us". Probes the underlying <see cref="Socket"/>: a connected-but-readable-with-0-available
+    /// socket after an SslStream EOF is a graceful close; <see cref="Socket.Poll(int, SelectMode)"/>
+    /// surfacing an error condition, or a zero-byte send raising a connection-reset
+    /// <see cref="SocketException"/>, is an RST. Best-effort and exception-safe — diagnostics must
+    /// never throw into the read path.
+    /// </summary>
+    private string ClassifyConnectionClose() {
+        try {
+            Socket socket = _networkStream.Socket;
+
+            // SelectError surfaces an out-of-band/error condition (a received RST sets this).
+            bool errored = socket.Poll(0, SelectMode.SelectError);
+            if (errored) {
+                return "rst (socket error condition)";
+            }
+
+            // A zero-byte send forces the stack to surface a pending RST as ConnectionReset without
+            // moving any application data. On a graceful FIN this succeeds (the local side may still
+            // send) or reports a clean shutdown.
+            try {
+                socket.Send(Array.Empty<byte>(), 0, SocketFlags.None);
+            }
+            catch (SocketException sex) when (sex.SocketErrorCode is SocketError.ConnectionReset or SocketError.ConnectionAborted or SocketError.NetworkReset) {
+                return $"rst ({sex.SocketErrorCode})";
+            }
+
+            // Readable with nothing available, after an SslStream EOF, is the signature of a graceful
+            // peer close (close_notify or a clean FIN). We cannot tell close_notify from a bare FIN
+            // through the managed SslStream API, so report the graceful class explicitly.
+            bool readable = socket.Poll(0, SelectMode.SelectRead);
+            if (readable && socket.Available == 0) {
+                return "graceful (close_notify / clean FIN — no RST)";
+            }
+
+            return socket.Connected ? "graceful (peer EOF, socket still connected)" : "graceful (peer EOF, socket closed)";
+        }
+        catch (ObjectDisposedException) {
+            return "unknown (socket disposed)";
+        }
+        catch (SocketException sex) {
+            return $"unknown ({sex.SocketErrorCode})";
+        }
+    }
+
+    /// <summary>
+    /// ScribeHold fork (#2077): render up to <paramref name="count"/> bytes of a buffer as a
+    /// space-separated lowercase hex preview, capped so a stray large read can never balloon the log.
+    /// "&lt;none&gt;" for an empty/0-byte read (the canonical version-exchange FIN). Pure + static so
+    /// the fork regression test exercises identical formatting.
+    /// </summary>
+    internal static string FormatHexPreview(byte[] buffer, int count) {
+        if (buffer == null || count <= 0) {
+            return "<none>";
+        }
+        const int maxBytes = 64;
+        int take = Math.Min(count, Math.Min(buffer.Length, maxBytes));
+        string hex = BitConverter.ToString(buffer, 0, take).Replace('-', ' ').ToLowerInvariant();
+        return count > take ? $"{hex} … (+{count - take} more)" : hex;
     }
 }

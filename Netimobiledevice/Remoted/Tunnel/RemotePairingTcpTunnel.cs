@@ -1,4 +1,5 @@
 ﻿using Netimobiledevice.EndianBitConversion;
+using Netimobiledevice.Serialisation;
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
@@ -8,8 +9,7 @@ using System.Threading.Tasks;
 
 namespace Netimobiledevice.Remoted.Tunnel;
 
-public class RemotePairingTcpTunnel : RemotePairingTunnel
-{
+public class RemotePairingTcpTunnel : RemotePairingTunnel {
     private const int REQUESTED_MTU = 16000;
     private const int IPV6_HEADER_SIZE = 40;
 
@@ -20,18 +20,15 @@ public class RemotePairingTcpTunnel : RemotePairingTunnel
     private readonly Stream _stream;
     private Task? _sockReadTask;
 
-    public RemotePairingTcpTunnel(Stream stream) : base()
-    {
+    public RemotePairingTcpTunnel(Stream stream) : base() {
         _stream = stream;
     }
 
-    public override void Close()
-    {
+    public override void Close() {
         _stream.Close();
     }
 
-    public async Task SockReadTask()
-    {
+    public async Task SockReadTask() {
         try {
             while (true) {
                 try {
@@ -41,7 +38,9 @@ public class RemotePairingTcpTunnel : RemotePairingTunnel
                     ushort ipv6Length = EndianBitConverter.BigEndian.ToUInt16(ipv6Header, 4);
                     byte[] ipv6Body = new byte[ipv6Length];
                     await _stream.ReadExactlyAsync(ipv6Body);
-                    Tun?.Write([.. LoopbackHeader, .. ipv6Header, .. ipv6Body]);
+                    if (OperatingSystem.IsWindows()) {
+                        Tun?.Write([.. LoopbackHeader, .. ipv6Header, .. ipv6Body]);
+                    }
                 }
                 catch (Exception ex) {
                     Debug.WriteLine(ex);
@@ -54,8 +53,7 @@ public class RemotePairingTcpTunnel : RemotePairingTunnel
         }
     }
 
-    public override EstablishTunnelResponse RequestTunnelEstablish()
-    {
+    public override EstablishTunnelResponse RequestTunnelEstablish() {
         Dictionary<string, object> message = new Dictionary<string, object>() {
             { "type", "clientHandshakeRequest" },
             { "mtu", REQUESTED_MTU }
@@ -64,19 +62,17 @@ public class RemotePairingTcpTunnel : RemotePairingTunnel
 
         byte[] buffer = new byte[REQUESTED_MTU];
         _stream.ReadExactly(buffer);
+
         string jsonString = CDTunnelPacket.Parse(buffer).JsonBody;
-        return JsonSerializer.Deserialize<EstablishTunnelResponse>(jsonString, new JsonSerializerOptions {
-            PropertyNameCaseInsensitive = true
-        });
+        EstablishTunnelResponse? response = JsonSerializer.Deserialize(jsonString, InternalJsonSerialisationContext.Default.EstablishTunnelResponse);
+        return response is null ? throw new NetimobiledeviceException("EstablishTunnelResponse is null") : response;
     }
 
-    public override async Task SendPacketToDevice(byte[] packet)
-    {
+    public override async Task SendPacketToDevice(byte[] packet) {
         await _stream.WriteAsync(packet);
     }
 
-    public override void StartTunnel(string address, uint mtu)
-    {
+    public override void StartTunnel(string address, uint mtu) {
         base.StartTunnel(address, mtu);
         _sockReadTask = Task.Run(() => SockReadTask());
     }

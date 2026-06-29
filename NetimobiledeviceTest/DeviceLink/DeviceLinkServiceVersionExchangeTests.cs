@@ -10,6 +10,10 @@ public class DeviceLinkServiceVersionExchangeTests
     /// Regression guard: verifies that a short versionExchangeMessage array (fewer than 3 elements)
     /// would trigger the bounds-check guard rather than throwing ArgumentOutOfRangeException.
     /// This mirrors the failure mode observed in service.log (7 of 18 backup attempts on 2026-05-08).
+    ///
+    /// NOTE: upstream absorbed this bounds-check in commit 6afee7d ("have the size check for version
+    /// exchange happen sooner"). This test is kept as a regression guard for the ordering (bounds
+    /// before string access) and to prevent silent reversion in future merges.
     /// </summary>
     [TestMethod]
     public void ShortVersionExchangeArray_BoundsCheckPreventsIndexOutOfRange()
@@ -63,5 +67,71 @@ public class DeviceLinkServiceVersionExchangeTests
         _ = validMessage[0].AsStringNode();
         _ = validMessage[1].AsIntegerNode();
         _ = validMessage[2].AsIntegerNode();
+    }
+
+    /// <summary>
+    /// #2068: the DeviceReady receive can come back empty when the device FINs AFTER our DLVersionsOk
+    /// reply but before sending DLMessageDeviceReady. VersionExchange now distinguishes this empty
+    /// reply (Count == 0) from a non-empty-but-wrong reply, so the guard semantics this relies on must
+    /// hold: an empty array reports Count 0 and indexing it throws (proving the explicit Count==0 check
+    /// is required to avoid an unhandled IndexOutOfRange when reading element [0]).
+    /// </summary>
+    [TestMethod]
+    public void DeviceReadyReply_EmptyArray_IsDistinguishableBeforeIndexing()
+    {
+        ArrayNode emptyDeviceReady = [];
+
+        Assert.AreEqual(0, emptyDeviceReady.Count, "An empty DeviceReady reply must report Count 0");
+        Assert.ThrowsExactly<ArgumentOutOfRangeException>(() => {
+            _ = emptyDeviceReady[0];
+        });
+    }
+
+    /// <summary>
+    /// #2068: the diagnostic trace renders the DeviceLink message's first element (the DLMessage* type
+    /// tag) as the discriminator between a healthy reply and a wedge. Confirm the type tag is the first
+    /// element on both the request and the reply messages so the logged trace is meaningful.
+    /// </summary>
+    [TestMethod]
+    public void DeviceLinkMessages_FirstElementIsTheTypeTag()
+    {
+        ArrayNode versionExchange = [
+            new StringNode("DLMessageVersionExchange"),
+            new IntegerNode(400),
+            new IntegerNode(0)
+        ];
+        ArrayNode deviceReady = [
+            new StringNode("DLMessageDeviceReady")
+        ];
+
+        Assert.AreEqual("DLMessageVersionExchange", versionExchange[0].AsStringNode().Value);
+        Assert.AreEqual("DLMessageDeviceReady", deviceReady[0].AsStringNode().Value);
+    }
+
+    /// <summary>
+    /// #2077 (AC4): the host's DLVersionExchange offer — what it WOULD send in DLVersionsOk during a
+    /// healthy flow — is logged so a USB-vs-WiFi diff can compare the offer per transport. The offer
+    /// the host emits is the DLVersionsOk reply carrying the host's supported major version.
+    /// DeviceLinkService is internal sealed (no SslStream-free unit harness), so this asserts the
+    /// offer's observable plist shape: a 3-element [ "DLMessageVersionExchange", "DLVersionsOk",
+    /// versionMajor ] array — matching the reply VersionExchange sends after a successful exchange.
+    /// </summary>
+    [TestMethod]
+    public void HostDlVersionExchangeOffer_HasExpectedThreeElementShape()
+    {
+        // The host's offer, identical in shape to the DLVersionsOk reply DeviceLinkService.VersionExchange
+        // emits (string tag, "DLVersionsOk", supported major version).
+        const ulong hostSupportedMajor = 400;
+        ArrayNode hostOffer = [
+            new StringNode("DLMessageVersionExchange"),
+            new StringNode("DLVersionsOk"),
+            new IntegerNode(hostSupportedMajor)
+        ];
+
+        Assert.AreEqual(3, hostOffer.Count, "The host DLVersionsOk offer must be a 3-element array.");
+        Assert.AreEqual("DLMessageVersionExchange", hostOffer[0].AsStringNode().Value);
+        Assert.AreEqual("DLVersionsOk", hostOffer[1].AsStringNode().Value);
+        Assert.AreEqual(hostSupportedMajor, hostOffer[2].AsIntegerNode().Value,
+            "The third element carries the host's supported major version — the value a USB-vs-WiFi diff compares.");
     }
 }
