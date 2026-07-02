@@ -1,0 +1,184 @@
+using System.Diagnostics;
+using Microsoft.Extensions.Logging.Abstractions;
+using Netimobiledevice.DeviceLink;
+using Netimobiledevice.Plist;
+
+namespace NetimobiledeviceTest.DeviceLink;
+
+/// <summary>
+/// Fork tests for the DlLoop inter-message silence bound (#2181).
+///
+/// Background: between mb2 messages, <c>DlLoop</c> historically waited on the coarse ~10-minute
+/// <c>SERVICE_READ_TIMEOUT_MS</c> stream read. When a USB device went silent BETWEEN messages (the
+/// wedge), the loop blocked for up to ten minutes before surfacing anything. The fix adds a USB-tight
+/// inter-message silence bound (seconds): if the gap between messages exceeds it, a bounded,
+/// classifiable <see cref="DeviceLinkInterMessageTimeoutException"/> is raised — a transport-drop
+/// SIGNAL that FEEDS reconnect-and-resume — rather than a ten-minute hang. WiFi keeps its loose
+/// behavior (no added bound).
+///
+/// These tests pin the pure gate (<see cref="DeviceLinkService.ShouldApplyInterMessageBound"/>) that
+/// decides whether the bound applies, and the properties of the bounded transport-drop signal, without
+/// a live socket.
+/// </summary>
+[TestClass]
+public class DeviceLinkInterMessageBoundTests
+{
+    private static readonly TimeSpan TightUsbBound = TimeSpan.FromSeconds(30);
+
+    [TestMethod]
+    [Description("USB transport with a positive bound applies the inter-message silence bound.")]
+    public void Usb_WithPositiveBound_AppliesBound()
+    {
+        Assert.IsTrue(
+            DeviceLinkService.ShouldApplyInterMessageBound(isUsbTransport: true, bound: TightUsbBound),
+            "On USB the tight inter-message bound must be applied so a between-message silence trips in seconds, feeding reconnect-and-resume.");
+    }
+
+    [TestMethod]
+    [Description("WiFi transport does NOT apply the inter-message bound — loose WiFi loop timing is preserved.")]
+    public void WiFi_DoesNotApplyBound()
+    {
+        Assert.IsFalse(
+            DeviceLinkService.ShouldApplyInterMessageBound(isUsbTransport: false, bound: TightUsbBound),
+            "WiFi keeps its loose behavior; the inter-message bound must never be applied on WiFi (no WiFi regression, no added WiFi resilience).");
+    }
+
+    [TestMethod]
+    [Description("A non-positive bound disables the inter-message bound even on USB (a misconfigured host cannot wedge on a zero bound).")]
+    public void Usb_WithNonPositiveBound_DoesNotApplyBound()
+    {
+        Assert.IsFalse(
+            DeviceLinkService.ShouldApplyInterMessageBound(isUsbTransport: true, bound: TimeSpan.Zero),
+            "A zero bound must fall back to the plain read path, not apply a 0-length (instantly-tripping) bound.");
+        Assert.IsFalse(
+            DeviceLinkService.ShouldApplyInterMessageBound(isUsbTransport: true, bound: TimeSpan.FromSeconds(-5)),
+            "A negative bound must likewise be treated as disabled.");
+    }
+
+    [TestMethod]
+    [Description("The bounded transport-drop signal derives from TimeoutException (existing generic timeout handling still catches it) and carries its bound.")]
+    public void InterMessageTimeout_IsBoundedClassifiableSignal()
+    {
+        DeviceLinkInterMessageTimeoutException ex = new(TightUsbBound);
+
+        Assert.IsInstanceOfType<TimeoutException>(ex,
+            "The inter-message timeout must derive from TimeoutException so any existing generic timeout handling still catches it as a bounded (not terminal) condition.");
+        Assert.AreEqual(TightUsbBound, ex.Bound,
+            "The signal carries the bound that was exceeded so a consumer can log/classify it.");
+        Assert.IsTrue(ex.Message.Contains("30", StringComparison.Ordinal),
+            "The message names the bound in seconds for diagnostics.");
+    }
+
+    [TestMethod]
+    [Description("The inter-message timeout is a DISTINCT type from the coarse stream TimeoutException, so a consumer can classify a between-message wedge as a transient transport drop.")]
+    public void InterMessageTimeout_IsDistinctFromPlainTimeout()
+    {
+        DeviceLinkInterMessageTimeoutException interMessage = new(TightUsbBound);
+        TimeoutException plainStreamTimeout = new("Timeout waiting for message from service");
+
+        Assert.IsInstanceOfType<DeviceLinkInterMessageTimeoutException>(interMessage);
+        Assert.IsNotInstanceOfType<DeviceLinkInterMessageTimeoutException>(plainStreamTimeout,
+            "A plain stream TimeoutException must NOT be mistaken for the bounded inter-message drop signal — the dedicated type is what lets the coordinator route a between-message wedge into reconnect-and-resume.");
+    }
+
+    // ── End-to-end timing behavior (the read function is injected — no live socket) ─────────────
+
+    /// <summary>A read that never returns — models a device that has gone silent between messages.</summary>
+    private static Func<CancellationToken, Task<ArrayNode>> NeverReturnsRead()
+        => async ct => {
+            await Task.Delay(Timeout.Infinite, ct).ConfigureAwait(false);
+            return [];
+        };
+
+    [TestMethod]
+    [Timeout(5000)]
+    [Description("(b) A simulated mid-loop inter-message silence trips the USB bound DETERMINISTICALLY in ~the bound, NOT at the 10min read timeout.")]
+    public async Task UsbSilence_TripsBoundQuickly_NotAtTenMinuteReadTimeout()
+    {
+        // A tight test bound stands in for the USB-tight production value; the device never replies.
+        TimeSpan bound = TimeSpan.FromMilliseconds(200);
+        Stopwatch sw = Stopwatch.StartNew();
+
+        DeviceLinkInterMessageTimeoutException ex = await Assert.ThrowsExactlyAsync<DeviceLinkInterMessageTimeoutException>(
+            () => DeviceLinkService.ReceiveWithInterMessageBoundAsync(
+                isUsbTransport: true, bound, NeverReturnsRead(), NullLogger.Instance, CancellationToken.None),
+            "A USB between-message silence must trip the inter-message bound, not hang on the long read.");
+        sw.Stop();
+
+        Assert.AreEqual(bound, ex.Bound, "The raised signal carries the bound that tripped.");
+        // The whole point: it fires near the bound, in seconds — provably not the ~10-minute
+        // SERVICE_READ_TIMEOUT_MS. A generous ceiling keeps the assertion deterministic on a loaded CI
+        // box while still being three orders of magnitude below ten minutes.
+        Assert.IsTrue(sw.Elapsed < TimeSpan.FromSeconds(4),
+            $"The bound must trip in ~the bound (elapsed {sw.ElapsedMilliseconds}ms), far below the 10-minute read timeout.");
+    }
+
+    [TestMethod]
+    [Timeout(5000)]
+    [Description("On WiFi, the bounded-read helper does NOT impose the bound — a silent read is NOT converted into an inter-message timeout (loose WiFi preserved).")]
+    public async Task WiFiSilence_DoesNotTripInterMessageBound()
+    {
+        // WiFi + a silent read: the helper must defer to the plain read with no added bound. We prove
+        // it does not raise the inter-message signal within a window that WOULD have tripped a USB
+        // bound of the same length, then cancel to end the test.
+        TimeSpan wouldBeBound = TimeSpan.FromMilliseconds(200);
+        using CancellationTokenSource callerCts = new();
+
+        Func<CancellationToken, Task<ArrayNode>> read = async ct => {
+            await Task.Delay(Timeout.Infinite, ct).ConfigureAwait(false);
+            return [];
+        };
+
+        Task<ArrayNode> pending = DeviceLinkService.ReceiveWithInterMessageBoundAsync(
+            isUsbTransport: false, wouldBeBound, read, NullLogger.Instance, callerCts.Token);
+
+        // Wait well past the would-be bound; on WiFi nothing should have tripped.
+        await Task.Delay(500).ConfigureAwait(false);
+        Assert.IsFalse(pending.IsCompleted,
+            "On WiFi the read must still be pending (no inter-message bound applied); it only ends on a real read or caller cancellation.");
+
+        callerCts.Cancel();
+        // TaskCanceledException derives from OperationCanceledException; assert the base type
+        // (non-exactly) so the caller-cancellation classification is what matters, not the exact subtype.
+        Exception ex = await Assert.ThrowsAsync<OperationCanceledException>(() => pending,
+            "A WiFi read ends via the caller's own cancellation, never a synthetic inter-message timeout.");
+        Assert.IsNotInstanceOfType<DeviceLinkInterMessageTimeoutException>(ex,
+            "A WiFi read is never converted into the bounded inter-message transport-drop signal.");
+    }
+
+    [TestMethod]
+    [Timeout(5000)]
+    [Description("A genuine CALLER cancellation is propagated as OperationCanceledException, never reclassified as an inter-message timeout.")]
+    public async Task CallerCancellation_IsNotReclassifiedAsInterMessageTimeout()
+    {
+        TimeSpan bound = TimeSpan.FromSeconds(30); // large, so the bound does NOT fire during the test
+        using CancellationTokenSource callerCts = new();
+
+        Task<ArrayNode> pending = DeviceLinkService.ReceiveWithInterMessageBoundAsync(
+            isUsbTransport: true, bound, NeverReturnsRead(), NullLogger.Instance, callerCts.Token);
+
+        callerCts.Cancel();
+
+        // TaskCanceledException : OperationCanceledException — assert the base type non-exactly.
+        Exception ex = await Assert.ThrowsAsync<OperationCanceledException>(() => pending,
+            "A caller-requested cancellation must surface as OperationCanceledException.");
+        Assert.IsNotInstanceOfType<DeviceLinkInterMessageTimeoutException>(ex,
+            "A caller cancellation must NOT be reclassified as the bounded inter-message transport-drop signal.");
+    }
+
+    [TestMethod]
+    [Timeout(5000)]
+    [Description("When a message arrives within the bound, it is returned normally (the bound does not interfere with a responsive device).")]
+    public async Task MessageArrivesWithinBound_IsReturnedNormally()
+    {
+        TimeSpan bound = TimeSpan.FromSeconds(30);
+        ArrayNode expected = [new StringNode("DLMessageProcessMessage")];
+
+        Func<CancellationToken, Task<ArrayNode>> read = _ => Task.FromResult(expected);
+
+        ArrayNode actual = await DeviceLinkService.ReceiveWithInterMessageBoundAsync(
+            isUsbTransport: true, bound, read, NullLogger.Instance, CancellationToken.None);
+
+        Assert.AreSame(expected, actual, "A message that arrives within the bound must be returned unchanged.");
+    }
+}
