@@ -18,6 +18,28 @@ namespace Netimobiledevice.DeviceLink;
 
 public delegate void SendFileErrorEventHandler(DictionaryNode errorNode, string fileName);
 
+/// <summary>
+/// ScribeHold fork (#2181): raised when the DlLoop inter-message silence bound trips — the device
+/// went silent BETWEEN mb2 messages for longer than the (transport-aware, USB-tight) bound. This is a
+/// BOUNDED, CLASSIFIABLE transport-drop signal that FEEDS reconnect-and-resume, NOT a terminal
+/// failure. It derives from <see cref="TimeoutException"/> so any existing generic timeout handling
+/// still catches it, while the dedicated type lets the coordinator classify it as a transient drop
+/// (the same class as a USB socket bump) rather than a genuine device failure. It is raised only for
+/// USB (WiFi keeps its loose behavior); it fires in SECONDS instead of waiting the ~10-minute
+/// <c>SERVICE_READ_TIMEOUT_MS</c> stream read.
+/// </summary>
+public sealed class DeviceLinkInterMessageTimeoutException : TimeoutException
+{
+    public DeviceLinkInterMessageTimeoutException(TimeSpan bound)
+        : base($"Device went silent between DeviceLink messages for longer than the inter-message bound ({bound.TotalSeconds:0.###}s)")
+    {
+        Bound = bound;
+    }
+
+    /// <summary>The inter-message silence bound that was exceeded.</summary>
+    public TimeSpan Bound { get; }
+}
+
 internal sealed class DeviceLinkService : IDisposable {
     private const int BULK_OPERATION_ERROR = -13;
     private const uint FILE_TRANSFER_TERMINATOR = 0x00;
@@ -35,6 +57,15 @@ internal sealed class DeviceLinkService : IDisposable {
     // rather than blocking ~10 min and then failing. Kept short so a stuck-but-finished session is
     // released promptly without risking a premature exit on a still-arriving final message.
     private const int FINISHED_FINAL_READ_TIMEOUT_MS = 5 * 1000;
+
+    // ScribeHold fork (#2181): the USB-tight inter-message silence bound the DlLoop applies BETWEEN
+    // messages. A gap longer than this — the device going silent between mb2 messages — is a wedge
+    // signal that trips in SECONDS and FEEDS reconnect-and-resume, instead of relying on the coarse
+    // ~10-minute SERVICE_READ_TIMEOUT_MS stream read. This is the library-carried USB-tight fallback
+    // (matches BackupConfiguration.UsbInterMessageSilenceBoundSec = 30 default, Task 3); the host may
+    // override it via SetUsbInterMessageSilenceBound so the real threshold originates in config.
+    // WiFi keeps its loose behavior (the bound is applied only when the transport is USB).
+    private static readonly TimeSpan DefaultUsbInterMessageSilenceBound = TimeSpan.FromSeconds(30);
 
     private readonly ServiceConnection _service;
     private readonly string _rootPath;
@@ -63,6 +94,16 @@ internal sealed class DeviceLinkService : IDisposable {
     private long _rxTicks;
     private long _wxBytes;
     private long _wxTicks;
+
+    // ScribeHold fork (#2181): the response-guarantee owner. Hands each handled message a fresh
+    // IDeviceLinkResponseGuarantee bound to SendStatusReport, so exactly-one-terminating-response
+    // (even under mid-handler cancellation) lives in one testable place instead of scattered
+    // if (!IsCancellationRequested) { send } guards.
+    private readonly DeviceLinkResponseGuarantees _responseGuarantees;
+
+    // ScribeHold fork (#2181): the active USB inter-message silence bound. USB-tight library default;
+    // overridable by the host from BackupConfiguration.UsbInterMessageSilenceBoundSec (Task 3).
+    private TimeSpan _usbInterMessageSilenceBound = DefaultUsbInterMessageSilenceBound;
 
     /// <summary>
     /// ScribeHold fork: optional delegate to classify whether a file should be discarded (bytes
@@ -131,6 +172,11 @@ internal sealed class DeviceLinkService : IDisposable {
 
         _internalCancellationTokenSource = new CancellationTokenSource();
 
+        // ScribeHold fork (#2181): bind the response-guarantee owner to SendStatusReport. Every
+        // handler that owes a DLMessageStatusResponse gets its terminating send through this single
+        // path, so exactly-one-response (even under mid-handler cancellation) is enforced in one place.
+        _responseGuarantees = new DeviceLinkResponseGuarantees(SendStatusReport);
+
         // Adjust the timeout to be long enough to handle device with a large amount of data
         _service.SetTimeout(SERVICE_READ_TIMEOUT_MS);
 
@@ -149,6 +195,27 @@ internal sealed class DeviceLinkService : IDisposable {
             { DeviceLinkMessage.UploadFiles, UploadFiles }
         };
     }
+
+    /// <summary>
+    /// ScribeHold fork (#2181): override the USB inter-message silence bound from the host
+    /// configuration (BackupConfiguration.UsbInterMessageSilenceBoundSec, Task 3). The library carries
+    /// a USB-tight default so it is safe standalone; when hosted, the real threshold originates in
+    /// config and is applied here. A non-positive value is ignored (the library default is kept) so a
+    /// misconfigured host can never disable the bound. Only affects USB transport; WiFi stays loose.
+    /// </summary>
+    public void SetUsbInterMessageSilenceBound(TimeSpan bound) {
+        if (bound > TimeSpan.Zero) {
+            _usbInterMessageSilenceBound = bound;
+        }
+    }
+
+    /// <summary>
+    /// ScribeHold fork (#2181): true when this device-link session runs over USB (usbmux), false for
+    /// WiFi/network (TCP lockdown). The inter-message silence bound is applied ONLY on USB so the
+    /// tight, feed-recovery behavior never regresses the loose WiFi loop timing. A pure-TCP connection
+    /// (no MuxDevice) is treated as WiFi; a usbmux Network connection is likewise WiFi.
+    /// </summary>
+    private bool IsUsbTransport => _service.MuxDevice?.ConnectionType == Usbmuxd.UsbmuxdConnectionType.Usb;
 
     private void CloseFileStream() {
         try {
@@ -179,14 +246,19 @@ internal sealed class DeviceLinkService : IDisposable {
     /// <param name="msg">The message received from the device.</param>
     /// <returns>Always 0.</returns>
     private async Task ContentsOfDirectory(ArrayNode msg, CancellationToken cancellationToken) {
+        // ScribeHold fork (#2181): the response-guarantee ensures exactly one terminating
+        // DLMessageStatusResponse is sent even if cancellation trips mid-enumeration. The loop body
+        // honors cancellation (ThrowIfCancellationRequested), and if that throws before the explicit
+        // send below, the guarantee's DisposeAsync discharges the response on CancellationToken.None
+        // before the OperationCanceledException propagates — the device is never left blocking.
+        await using IDeviceLinkResponseGuarantee guard = _responseGuarantees.Create();
+
         string path = Path.Combine(_rootPath, msg[1].AsStringNode().Value);
         DictionaryNode dirList = [];
         DirectoryInfo dir = new DirectoryInfo(path);
         if (dir.Exists) {
             foreach (FileSystemInfo entry in dir.GetFileSystemInfos()) {
-                if (cancellationToken.IsCancellationRequested) {
-                    break;
-                }
+                cancellationToken.ThrowIfCancellationRequested();
                 DictionaryNode entryDict = new DictionaryNode {
                     { "DLFileModificationDate", new DateNode(entry.LastWriteTime) },
                     { "DLFileSize", new IntegerNode(entry is FileInfo fileInfo ? fileInfo.Length : 0L) },
@@ -196,9 +268,7 @@ internal sealed class DeviceLinkService : IDisposable {
             }
         }
 
-        if (!cancellationToken.IsCancellationRequested) {
-            await SendStatusReport(0, null, dirList, cancellationToken).ConfigureAwait(false);
-        }
+        await guard.SendTerminatingStatusAsync(0, null, dirList, cancellationToken).ConfigureAwait(false);
     }
 
     /// <summary>
@@ -207,6 +277,10 @@ internal sealed class DeviceLinkService : IDisposable {
     /// <param name="msg">The message received from the device.</param>
     /// <returns>The errno result of the operation.</returns>
     private async Task CopyItem(ArrayNode msg, CancellationToken cancellationToken) {
+        // ScribeHold fork (#2181): route the terminating response through the guarantee so a throw
+        // mid-copy still discharges exactly one DLMessageStatusResponse before propagating.
+        await using IDeviceLinkResponseGuarantee guard = _responseGuarantees.Create();
+
         FileInfo source = new FileInfo(Path.Combine(_rootPath, msg[1].AsStringNode().Value));
         FileInfo dest = new FileInfo(Path.Combine(_rootPath, msg[2].AsStringNode().Value));
         if (source.Attributes.HasFlag(FileAttributes.Directory)) {
@@ -215,7 +289,7 @@ internal sealed class DeviceLinkService : IDisposable {
         else {
             source.CopyTo(dest.FullName);
         }
-        await SendStatusReport(0, string.Empty, cancellationToken: cancellationToken).ConfigureAwait(false);
+        await guard.SendTerminatingStatusAsync(0, string.Empty, null, cancellationToken).ConfigureAwait(false);
     }
 
     /// <summary>
@@ -224,9 +298,12 @@ internal sealed class DeviceLinkService : IDisposable {
     /// <param name="msg">The message received from the device.</param>
     /// <returns>The errno result of the operation.</returns>
     private async Task CreateDirectory(ArrayNode msg, CancellationToken cancellationToken) {
+        // ScribeHold fork (#2181): terminating response through the guarantee (exactly-once even on throw).
+        await using IDeviceLinkResponseGuarantee guard = _responseGuarantees.Create();
+
         string newDirPath = Path.Combine(_rootPath, msg[1].AsStringNode().Value);
         Directory.CreateDirectory(newDirPath);
-        await SendStatusReport(0, string.Empty, cancellationToken: cancellationToken).ConfigureAwait(false);
+        await guard.SendTerminatingStatusAsync(0, string.Empty, null, cancellationToken).ConfigureAwait(false);
     }
 
     /// <summary>
@@ -287,13 +364,16 @@ internal sealed class DeviceLinkService : IDisposable {
     /// </summary>
     /// <param name="msg">The message received from the device.</param>
     private async Task DownloadFiles(ArrayNode msg, CancellationToken cancellationToken) {
+        // ScribeHold fork (#2181): the DLMessageStatusResponse at the end is what the device blocks on.
+        // Route it through the guarantee so a cancellation mid-transfer still discharges exactly one
+        // terminating response (on CancellationToken.None via DisposeAsync) before propagating.
+        await using IDeviceLinkResponseGuarantee guard = _responseGuarantees.Create();
+
         DictionaryNode errList = [];
         ArrayNode files = msg[1].AsArrayNode();
         foreach (StringNode filename in files.Cast<StringNode>()) {
             _logger.LogDebug("Sending file: {filename}", filename);
-            if (cancellationToken.IsCancellationRequested) {
-                break;
-            }
+            cancellationToken.ThrowIfCancellationRequested();
             await SendPath(filename.Value, cancellationToken).ConfigureAwait(false);
 
             string filePath = Path.Combine(_rootPath, filename.Value);
@@ -327,10 +407,10 @@ internal sealed class DeviceLinkService : IDisposable {
 
         await _service.SendAsync(BitConverter.GetBytes(FILE_TRANSFER_TERMINATOR), cancellationToken).ConfigureAwait(false);
         if (errList.Count == 0) {
-            await SendStatusReport(0, cancellationToken: cancellationToken).ConfigureAwait(false);
+            await guard.SendTerminatingStatusAsync(0, null, null, cancellationToken).ConfigureAwait(false);
         }
         else {
-            await SendStatusReport(BULK_OPERATION_ERROR, "Multi status", errList, cancellationToken).ConfigureAwait(false);
+            await guard.SendTerminatingStatusAsync(BULK_OPERATION_ERROR, "Multi status", errList, cancellationToken).ConfigureAwait(false);
         }
     }
 
@@ -341,6 +421,9 @@ internal sealed class DeviceLinkService : IDisposable {
     /// <param name="respectFreeSpaceValue">Whether the device should abide by the freeSpace value passed or ignore it</param>
     /// <returns>0 on success, -1 on error.</returns>
     private async Task GetFreeDiskSpace(ArrayNode msg, CancellationToken cancellationToken) {
+        // ScribeHold fork (#2181): terminating response through the guarantee (exactly-once even on throw).
+        await using IDeviceLinkResponseGuarantee guard = _responseGuarantees.Create();
+
         IntegerNode spaceItem = new IntegerNode(long.MaxValue);
         if (_performBackupSizeCheck) {
             long freeSpace = 0;
@@ -359,7 +442,7 @@ internal sealed class DeviceLinkService : IDisposable {
             }
             spaceItem = new IntegerNode(freeSpace);
         }
-        await SendStatusReport(0, null, spaceItem, cancellationToken).ConfigureAwait(false);
+        await guard.SendTerminatingStatusAsync(0, null, spaceItem, cancellationToken).ConfigureAwait(false);
     }
 
     /// <summary>
@@ -368,10 +451,14 @@ internal sealed class DeviceLinkService : IDisposable {
     /// <param name="msg">The message received from the device.</param>
     /// <returns>The number of items moved.</returns>
     private async Task MoveItems(ArrayNode msg, CancellationToken cancellationToken) {
+        // ScribeHold fork (#2181): the terminating DLMessageStatusResponse is guaranteed even if
+        // cancellation trips mid-move — the loop body throws on cancel, and DisposeAsync discharges the
+        // response on CancellationToken.None before propagating. Eliminates the wedge-source
+        // if (!IsCancellationRequested) { send } ... break shape (device left blocking on cancel).
+        await using IDeviceLinkResponseGuarantee guard = _responseGuarantees.Create();
+
         foreach (KeyValuePair<string, PropertyNode> move in msg[1].AsDictionaryNode()) {
-            if (cancellationToken.IsCancellationRequested) {
-                break;
-            }
+            cancellationToken.ThrowIfCancellationRequested();
 
             string newPath = move.Value.AsStringNode().Value;
             if (!string.IsNullOrEmpty(newPath)) {
@@ -392,9 +479,7 @@ internal sealed class DeviceLinkService : IDisposable {
             }
         }
 
-        if (!cancellationToken.IsCancellationRequested) {
-            await SendStatusReport(0, string.Empty, cancellationToken: cancellationToken).ConfigureAwait(false);
-        }
+        await guard.SendTerminatingStatusAsync(0, string.Empty, null, cancellationToken).ConfigureAwait(false);
     }
 
     private void OnSendFileError(DictionaryNode errorReport, string fileName) {
@@ -532,11 +617,19 @@ internal sealed class DeviceLinkService : IDisposable {
     /// <param name="msg">The message received from the device.</param>
     /// <returns>The number of items removed.</returns>
     private async Task RemoveItems(ArrayNode message, CancellationToken cancellationToken) {
+        // ScribeHold fork (#2181): a single DLMessageRemoveItems/RemoveFiles message owes exactly ONE
+        // terminating DLMessageStatusResponse (as in libimobiledevice's mb2_handle_remove_files, which
+        // removes every item then sends one status at the end). The prior fork shape sent one status
+        // PER item and, worse, break-ed out of the loop on cancellation WITHOUT sending the final
+        // response — leaving the device blocked forever (the silent wedge). Route the single
+        // terminating response through the guarantee: the loop body honors cancellation (throws), and
+        // DisposeAsync discharges the response on CancellationToken.None before the cancellation
+        // propagates, so exactly one response is always sent.
+        await using IDeviceLinkResponseGuarantee guard = _responseGuarantees.Create();
+
         ArrayNode removes = message[1].AsArrayNode();
         foreach (StringNode filename in removes.Cast<StringNode>()) {
-            if (cancellationToken.IsCancellationRequested) {
-                break;
-            }
+            cancellationToken.ThrowIfCancellationRequested();
 
             if (string.IsNullOrEmpty(filename.Value)) {
                 _logger.LogWarning("Empty file to remove.");
@@ -550,11 +643,9 @@ internal sealed class DeviceLinkService : IDisposable {
                     Directory.Delete(path, true);
                 }
             }
-
-            if (!cancellationToken.IsCancellationRequested) {
-                await SendStatusReport(0, string.Empty, cancellationToken: cancellationToken).ConfigureAwait(false);
-            }
         }
+
+        await guard.SendTerminatingStatusAsync(0, string.Empty, null, cancellationToken).ConfigureAwait(false);
     }
 
     /// <summary>
@@ -617,6 +708,12 @@ internal sealed class DeviceLinkService : IDisposable {
     /// <param name="msg">The message received from the device.</param>
     /// <returns>The number of files processed.</returns>
     private async Task UploadFiles(ArrayNode msg, CancellationToken cancellationToken) {
+        // ScribeHold fork (#2181): the terminating DLMessageStatusResponse after the transfer loop is
+        // what the device blocks on. Route it through the guarantee so a cancellation that trips while
+        // receiving files still discharges exactly one terminating response (on CancellationToken.None
+        // via DisposeAsync) before propagating — the device is never left blocking.
+        await using IDeviceLinkResponseGuarantee guard = _responseGuarantees.Create();
+
         long startTicks = DateTime.UtcNow.Ticks;
 
         long backupTotalSize = (long) msg[3].AsIntegerNode().Value;
@@ -722,9 +819,7 @@ internal sealed class DeviceLinkService : IDisposable {
             }
         }
 
-        if (!cancellationToken.IsCancellationRequested) {
-            await SendStatusReport(0, cancellationToken: cancellationToken).ConfigureAwait(false);
-        }
+        await guard.SendTerminatingStatusAsync(0, null, null, cancellationToken).ConfigureAwait(false);
     }
 
 
@@ -778,7 +873,13 @@ internal sealed class DeviceLinkService : IDisposable {
                 }
             }
             else {
-                message = await ReceiveMessage(_internalCancellationTokenSource.Token).ConfigureAwait(false);
+                // ScribeHold fork (#2181): on USB, bound the wait for the next inter-message read to a
+                // tight silence bound (seconds) instead of only the coarse ~10-minute
+                // SERVICE_READ_TIMEOUT_MS. A device going silent BETWEEN messages then trips a bounded,
+                // classifiable transport-drop signal (DeviceLinkInterMessageTimeoutException) that FEEDS
+                // reconnect-and-resume, rather than wedging until the long read finally times out. WiFi
+                // keeps its loose behavior (the bound is applied only on USB).
+                message = await ReceiveMessageWithInterMessageBound(_internalCancellationTokenSource.Token).ConfigureAwait(false);
                 if (message.Count == 0) {
                     _logger.LogWarning("Received array node with no elements");
                     await Task.Delay(100, cancellationToken).ConfigureAwait(false);
@@ -824,6 +925,69 @@ internal sealed class DeviceLinkService : IDisposable {
             return [];
         }
         return message.AsArrayNode();
+    }
+
+    /// <summary>
+    /// ScribeHold fork (#2181): read the next inter-message DeviceLink message, applying the USB-tight
+    /// inter-message silence bound. On USB, if the device stays silent between messages longer than
+    /// <see cref="_usbInterMessageSilenceBound"/>, this raises a
+    /// <see cref="DeviceLinkInterMessageTimeoutException"/> — a bounded, classifiable transport-drop
+    /// signal that FEEDS reconnect-and-resume — in seconds, instead of blocking on the coarse
+    /// ~10-minute stream read. On WiFi (or when the bound is non-positive) it defers to the plain
+    /// <see cref="ReceiveMessage"/> path with no added bound, preserving loose WiFi loop timing. A
+    /// genuine caller-requested cancellation is always propagated, never reclassified as an
+    /// inter-message timeout.
+    /// </summary>
+    private Task<ArrayNode> ReceiveMessageWithInterMessageBound(CancellationToken cancellationToken) {
+        return ReceiveWithInterMessageBoundAsync(
+            IsUsbTransport, _usbInterMessageSilenceBound, ReceiveMessage, _logger, cancellationToken);
+    }
+
+    /// <summary>
+    /// ScribeHold fork (#2181): the transport-aware inter-message bounded read, static with the read
+    /// function injected so the TIMING behavior is unit-testable without a live socket. When the bound
+    /// does not apply (WiFi, or a non-positive bound), it defers to <paramref name="read"/> with no
+    /// added bound (loose WiFi loop timing preserved). When it applies (USB, positive bound), it bounds
+    /// the wait: if the bound elapses before a message arrives — and the caller did NOT request
+    /// cancellation — it raises a bounded <see cref="DeviceLinkInterMessageTimeoutException"/> in
+    /// seconds (feeding reconnect-and-resume) instead of blocking on the coarse ~10-minute stream read.
+    /// A genuine caller cancellation is always propagated as-is, never reclassified.
+    /// </summary>
+    internal static async Task<ArrayNode> ReceiveWithInterMessageBoundAsync(
+        bool isUsbTransport,
+        TimeSpan bound,
+        Func<CancellationToken, Task<ArrayNode>> read,
+        ILogger logger,
+        CancellationToken cancellationToken) {
+        if (!ShouldApplyInterMessageBound(isUsbTransport, bound)) {
+            return await read(cancellationToken).ConfigureAwait(false);
+        }
+
+        using CancellationTokenSource interMessageCts = new CancellationTokenSource(bound);
+        using CancellationTokenSource linkedCts =
+            CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, interMessageCts.Token);
+        try {
+            return await read(linkedCts.Token).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (interMessageCts.IsCancellationRequested && !cancellationToken.IsCancellationRequested) {
+            // The USB inter-message bound elapsed (not a caller cancellation): the device went silent
+            // between messages. Surface the bounded transport-drop signal so the coordinator can
+            // reconnect-and-resume rather than wait out the long read.
+            logger.LogWarning(
+                "USB inter-message silence bound ({BoundSec}s) tripped between DeviceLink messages; surfacing a bounded transport-drop signal for reconnect-and-resume (#2181)",
+                bound.TotalSeconds);
+            throw new DeviceLinkInterMessageTimeoutException(bound);
+        }
+    }
+
+    /// <summary>
+    /// ScribeHold fork (#2181): the pure decision for whether the USB inter-message silence bound
+    /// applies — true only on USB transport with a positive bound. WiFi (loose) and a non-positive
+    /// (disabled) bound both return false so the plain read path with no added bound is used. Pure +
+    /// internal so the fork regression test exercises the transport/bound gating without a live socket.
+    /// </summary>
+    internal static bool ShouldApplyInterMessageBound(bool isUsbTransport, TimeSpan bound) {
+        return isUsbTransport && bound > TimeSpan.Zero;
     }
 
     /// <summary>
