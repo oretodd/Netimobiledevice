@@ -1,5 +1,6 @@
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
+using Netimobiledevice.DeviceLink;
 using Netimobiledevice.EndianBitConversion;
 using Netimobiledevice.Plist;
 using Netimobiledevice.Usbmuxd;
@@ -28,15 +29,28 @@ public class ServiceConnection : IDisposable {
     private readonly ILogger _logger;
     /// <summary>
     /// The initial stream used for the ServiceConnection until the SSL stream starts, unless you specifically need to use this stream
-    /// you should use the Stream property instead
+    /// you should use the Stream property instead.
+    /// ScribeHold fork (#2182): no longer <c>readonly</c> so the session-preserving reconnect seam
+    /// (<see cref="AdoptTransportFrom"/>) can swap the underlying socket BENEATH this same
+    /// ServiceConnection instance on a transport drop -- the mb2 session is not recreated, so the
+    /// passcode grant survives a USB hiccup.
     /// </summary>
-    private readonly NetworkStream _networkStream;
+    private NetworkStream _networkStream;
     /// <summary>
-    /// The main stream once SSL is established, unless you specifically need to use this stream you should use the Stream 
+    /// The main stream once SSL is established, unless you specifically need to use this stream you should use the Stream
     /// property instead
     /// </summary>
     private SslStream? _sslStream;
     private int _timeout = Timeout.Infinite;
+
+    /// <summary>
+    /// ScribeHold fork (#2182): the transport-timeout policy this connection delegates to for the
+    /// keepalive budget, the SSL-handshake watchdog bound, and (read by Task 1) the DlLoop
+    /// inter-message silence bound. Defaults to <see cref="TransportTimeoutPolicy.UsbTight"/> so a
+    /// standalone submodule consumer is safe; the hosting ScribeHold.Service overrides the concrete
+    /// thresholds from <c>BackupConfiguration</c> via <see cref="TimeoutPolicy"/>.
+    /// </summary>
+    private TransportTimeoutPolicy _timeoutPolicy = TransportTimeoutPolicy.UsbTight;
 
     // ScribeHold fork (#2077): cumulative count of payload bytes the HOST has written on this
     // connection. At the version-exchange FIN the dump reports this so a wedge proves whether the
@@ -60,6 +74,19 @@ public class ServiceConnection : IDisposable {
     }
 
     public Stream Stream => _sslStream != null ? _sslStream : _networkStream;
+
+    /// <summary>
+    /// ScribeHold fork (#2182): the transport-timeout policy this connection delegates to (keepalive
+    /// budget, SSL-handshake watchdog bound, DlLoop inter-message silence bound). Defaults to
+    /// <see cref="TransportTimeoutPolicy.UsbTight"/>. The hosting ScribeHold.Service assigns a policy
+    /// derived from <c>BackupConfiguration</c> (Task 3) so USB is tight and WiFi stays loose; a
+    /// standalone consumer inherits the USB-tight default. There are no inline "USB vs WiFi" branches
+    /// in this class -- every transport-sensitive bound comes from the held policy.
+    /// </summary>
+    public TransportTimeoutPolicy TimeoutPolicy {
+        get => _timeoutPolicy;
+        set => _timeoutPolicy = value ?? throw new ArgumentNullException(nameof(value));
+    }
 
     private ServiceConnection(Socket sock, int timeout, ILogger logger, UsbmuxdDevice? muxDevice = null) {
         _logger = logger;
@@ -110,14 +137,12 @@ public class ServiceConnection : IDisposable {
             throw new NoDeviceConnectedException();
         }
         Socket sock = targetDevice.Connect(port, usbmuxAddress: usbmuxAddress, logger);
-        // ScribeHold fork (#1857): keepalive budget must outlast the multi-minute heads-down bursts
-        // usbmuxd produces while servicing the multiplexed device data channel — otherwise the local
-        // TCP stack aborts a healthy relay socket and the bulk read throws IOException(10053/10054).
-        // Budget ~= 120 + 10*30 = ~7 min, kept under DeviceLinkService's 10-min read timeout.
-        sock.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.KeepAlive, true);
-        sock.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.TcpKeepAliveTime, 120);
-        sock.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.TcpKeepAliveInterval, 30);
-        sock.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.TcpKeepAliveRetryCount, 10);
+        // ScribeHold fork (#1857/#2182): keepalive budget must outlast the multi-minute heads-down
+        // bursts usbmuxd produces while servicing the multiplexed device data channel — otherwise the
+        // local TCP stack aborts a healthy relay socket and the bulk read throws IOException(10053/
+        // 10054). The USB-tight budget (~120 + 10*30 = ~7 min, kept under DeviceLinkService's 10-min
+        // read timeout) now comes from the transport policy rather than inline literals.
+        ApplyKeepAlive(sock, TransportTimeoutPolicy.UsbTight);
         return new ServiceConnection(sock, timeout, logger ?? NullLogger.Instance, targetDevice);
     }
 
@@ -130,15 +155,23 @@ public class ServiceConnection : IDisposable {
             throw new NoDeviceConnectedException();
         }
         Socket sock = await targetDevice.ConnectAsync(port, usbmuxAddress: usbmuxAddress, logger).ConfigureAwait(false);
-        // ScribeHold fork (#1857): keepalive budget must outlast the multi-minute heads-down bursts
-        // usbmuxd produces while servicing the multiplexed device data channel — otherwise the local
-        // TCP stack aborts a healthy relay socket and the bulk read throws IOException(10053/10054).
-        // Budget ~= 120 + 10*30 = ~7 min, kept under DeviceLinkService's 10-min read timeout.
-        sock.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.KeepAlive, true);
-        sock.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.TcpKeepAliveTime, 120);
-        sock.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.TcpKeepAliveInterval, 30);
-        sock.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.TcpKeepAliveRetryCount, 10);
+        // ScribeHold fork (#1857/#2182): see CreateUsingUsbmux — the USB-tight keepalive budget comes
+        // from the transport policy so there is one source of truth for the #1857 budget.
+        ApplyKeepAlive(sock, TransportTimeoutPolicy.UsbTight);
         return new ServiceConnection(sock, timeout, logger ?? NullLogger.Instance, targetDevice);
+    }
+
+    /// <summary>
+    /// ScribeHold fork (#2182): apply the transport policy's TCP keepalive budget (#1857) to a usbmux
+    /// relay socket. Delegating to the policy keeps the keepalive Time/Interval/RetryCount in exactly
+    /// one place -- the <see cref="TransportTimeoutPolicy"/> -- instead of inline literals duplicated
+    /// across the sync/async factories.
+    /// </summary>
+    private static void ApplyKeepAlive(Socket sock, TransportTimeoutPolicy policy) {
+        sock.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.KeepAlive, true);
+        sock.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.TcpKeepAliveTime, policy.KeepAliveTimeSec);
+        sock.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.TcpKeepAliveInterval, policy.KeepAliveIntervalSec);
+        sock.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.TcpKeepAliveRetryCount, policy.KeepAliveRetryCount);
     }
 
     private bool UserCertificateValidationCallback(object sender, X509Certificate? certificate, X509Chain? chain, SslPolicyErrors sslPolicyErrors) {
@@ -146,12 +179,20 @@ public class ServiceConnection : IDisposable {
     }
 
     public void Close() {
+        // ScribeHold fork (#2182): after AdoptTransportFrom neutralizes a fresh wrapper, both streams
+        // are null and there is nothing to close — guard so disposing the discarded shell is a no-op
+        // rather than an NRE (the transplanted transport is owned by the adopting instance now).
+        if (_sslStream == null && _networkStream == null) {
+            return;
+        }
         Stream.Close();
     }
 
     public void Dispose() {
         Close();
-        Stream.Dispose();
+        if (_sslStream != null || _networkStream != null) {
+            Stream.Dispose();
+        }
         GC.SuppressFinalize(this);
     }
 
@@ -374,20 +415,75 @@ public class ServiceConnection : IDisposable {
             ReadTimeout = Timeout.Infinite,
             WriteTimeout = Timeout.Infinite
         };
+        // ScribeHold fork (#2182): the synchronous AuthenticateAsClient honors the stream's
+        // ReadTimeout, which is Infinite here (#1999), so a lost close_notify would hang forever.
+        // Run it on a worker and bound the WAIT with the policy's SSL-handshake watchdog (~60s); on
+        // a trip, tear down the handshake stream to unblock the worker and surface a bounded,
+        // classifiable transport-drop signal that FEEDS reconnect-and-resume. The watchdog bounds only
+        // the SSL wait — it does not clip the passcode/trust dialog window (#1999 intent preserved).
+        SslStream handshakeStream = _sslStream;
+        Task handshakeTask = Task.Run(() =>
+            handshakeStream.AuthenticateAsClient(string.Empty, [certificate], SslProtocols.None, false));
         try {
-            // TLS v1.2 is supported since iOS 5 so we should specify this as a minimum
-            _sslStream.AuthenticateAsClient(string.Empty, [certificate], SslProtocols.None, false);
+            if (!handshakeTask.Wait(_timeoutPolicy.SslHandshakeWatchdog)) {
+                // Watchdog tripped. Dispose the stream so the blocked AuthenticateAsClient unwinds,
+                // then surface the bounded signal. The task is observed below to avoid an unobserved
+                // exception when it finally faults on the torn-down stream.
+                RestoreStreamTimeoutAfterHandshake();
+                handshakeStream.Dispose();
+                // The SslStream was constructed with leaveInnerStreamOpen:true, so disposing it does
+                // NOT close _networkStream (which owns the socket). Null the disposed wrapper so a
+                // later Dispose()/Close() on the discarded shell routes through _networkStream and
+                // actually tears the socket down, rather than no-op'ing on the disposed SslStream and
+                // leaking the socket (#2182).
+                _sslStream = null;
+                ObserveFaultedHandshake(handshakeTask);
+                throw ThrowHandshakeWatchdogTimeout();
+            }
+            // Surface the handshake result/exception synchronously (unwrap AggregateException).
+            handshakeTask.GetAwaiter().GetResult();
+        }
+        catch (TimeoutException) {
+            throw;
         }
         catch (Exception ex) {
             _logger.LogError(ex, "SSL authentication failed");
+            RestoreStreamTimeoutAfterHandshake();
             return false;
         }
-        finally {
-            RestoreStreamTimeoutAfterHandshake();
-        }
+        RestoreStreamTimeoutAfterHandshake();
 
         LogSslHandshakeResult();
         return true;
+    }
+
+    /// <summary>
+    /// ScribeHold fork (#2182): build the bounded transport-drop signal raised when the SSL-handshake
+    /// watchdog trips (a lost close_notify / stalled handshake). A <see cref="TimeoutException"/> with
+    /// a distinct message so the coordinator classifies it as a recoverable transport drop
+    /// (reconnect-and-resume) rather than a terminal failure. Returns the exception so callers can
+    /// <c>throw</c> it and keep control-flow obvious.
+    /// </summary>
+    private TimeoutException ThrowHandshakeWatchdogTimeout() {
+        _logger.LogError(
+            "SSL handshake exceeded the {WatchdogSec}s watchdog bound (#2182) — treating as a recoverable transport drop",
+            _timeoutPolicy.SslHandshakeWatchdogSec);
+        return new TimeoutException(
+            $"SSL handshake exceeded the {_timeoutPolicy.SslHandshakeWatchdogSec}s watchdog bound (#2182)");
+    }
+
+    /// <summary>
+    /// ScribeHold fork (#2182): observe (and swallow) the fault of a handshake task that we abandoned
+    /// after the watchdog tore down its stream. Best-effort and non-throwing — the abandoned task
+    /// completing with an ObjectDisposedException/IOException on the disposed stream is expected and
+    /// must not surface as an unobserved-task exception.
+    /// </summary>
+    private static void ObserveFaultedHandshake(Task handshakeTask) {
+        _ = handshakeTask.ContinueWith(
+            static t => { _ = t.Exception; },
+            CancellationToken.None,
+            TaskContinuationOptions.OnlyOnFaulted | TaskContinuationOptions.ExecuteSynchronously,
+            TaskScheduler.Default);
     }
 
     public async Task<bool> StartSslAsync(X509Certificate2 certificate) {
@@ -403,13 +499,36 @@ public class ServiceConnection : IDisposable {
             ReadTimeout = Timeout.Infinite,
             WriteTimeout = Timeout.Infinite
         };
+        // ScribeHold fork (#2182): bound the handshake with the policy's SSL-handshake watchdog
+        // (~60s) so a lost close_notify during AuthenticateAsClient cannot hang forever at
+        // Timeout.Infinite. The watchdog is generous enough not to clip a legitimate trust dialog
+        // (#1999 intent preserved) yet bounded so a wedged handshake FEEDS reconnect-and-resume.
+        using CancellationTokenSource watchdog = new CancellationTokenSource(_timeoutPolicy.SslHandshakeWatchdog);
         try {
             // TLS v1.2 is supported since iOS 5 so we should specify this as a minimum
-            await _sslStream.AuthenticateAsClientAsync(string.Empty, [certificate], SslProtocols.Tls12 | SslProtocols.Tls13, false);
+            await _sslStream.AuthenticateAsClientAsync(
+                new SslClientAuthenticationOptions {
+                    TargetHost = string.Empty,
+                    ClientCertificates = [certificate],
+                    EnabledSslProtocols = SslProtocols.Tls12 | SslProtocols.Tls13,
+                    CertificateRevocationCheckMode = X509RevocationMode.NoCheck
+                },
+                watchdog.Token).ConfigureAwait(false);
         }
         catch (AuthenticationException ex) {
             _logger.LogError(ex, "SSL authentication failed");
             return false;
+        }
+        catch (OperationCanceledException) when (watchdog.IsCancellationRequested) {
+            // ScribeHold fork (#2182): the ~60s SSL-handshake watchdog tripped — the handshake stalled
+            // (e.g. a lost close_notify). Surface a bounded, classifiable transport-drop signal so the
+            // coordinator can reconnect-and-resume rather than hang forever. Dispose+null the aborted
+            // SslStream (leaveInnerStreamOpen:true, so it does not close the socket-owning
+            // _networkStream) so a later Dispose() on the discarded shell tears the socket down via
+            // _networkStream instead of no-op'ing on the aborted SslStream and leaking the socket.
+            _sslStream?.Dispose();
+            _sslStream = null;
+            throw ThrowHandshakeWatchdogTimeout();
         }
         finally {
             RestoreStreamTimeoutAfterHandshake();
@@ -446,6 +565,66 @@ public class ServiceConnection : IDisposable {
         }
         _sslStream.ReadTimeout = _timeout;
         _sslStream.WriteTimeout = _timeout;
+    }
+
+    /// <summary>
+    /// ScribeHold fork (#2182): the SESSION-PRESERVING RECONNECT SEAM. Swaps the underlying socket /
+    /// streams of THIS ServiceConnection for those of a freshly-established <paramref name="fresh"/>
+    /// connection to the same service, WITHOUT recreating this ServiceConnection instance. The mb2
+    /// session and its <c>Mobilebackup2Service</c> owner keep pointing at the same
+    /// <see cref="ServiceConnection"/>, so the passcode grant bound once per mb2 session
+    /// (<c>LocalAuthenticationUiPresented</c>) is NOT re-triggered — the grant survives a USB hiccup.
+    ///
+    /// The caller obtains <paramref name="fresh"/> from the lockdown service provider (which owns the
+    /// StartService + SSL logic), then hands it here. This method transplants the fresh transport in
+    /// and neutralizes the fresh wrapper so disposing it will NOT close the transplanted socket.
+    /// It is a narrow seam: it owns only the old-transport teardown and the new-transport attach; it
+    /// does not know about mb2 sessions, DeviceLink, or reconnection policy.
+    /// </summary>
+    /// <param name="fresh">A newly-established connection whose socket/streams are transplanted into this instance.</param>
+    public void AdoptTransportFrom(ServiceConnection fresh) {
+        ArgumentNullException.ThrowIfNull(fresh);
+        if (ReferenceEquals(fresh, this)) {
+            throw new InvalidOperationException("A ServiceConnection cannot adopt its own transport.");
+        }
+
+        // Tear down THIS connection's old transport. Best-effort: the old socket is very likely
+        // already broken (that is why we are reconnecting), so swallow teardown faults.
+        SslStream? oldSslStream = _sslStream;
+        NetworkStream oldNetworkStream = _networkStream;
+
+        // Transplant the fresh transport beneath the preserved instance.
+        _networkStream = fresh._networkStream;
+        _sslStream = fresh._sslStream;
+        MuxDevice = fresh.MuxDevice;
+
+        // Re-apply this connection's configured data-read timeout to the adopted stream so the
+        // #1857 bulk-read budget carries across the swap (SetTimeout writes the active stream).
+        SetTimeout(_timeout);
+
+        // Neutralize the fresh wrapper so its Dispose() cannot close the transplanted transport that
+        // this instance now owns. It is now an empty shell the caller can safely discard/dispose.
+        fresh._sslStream = null;
+        fresh._networkStream = null!;
+
+        // Now dispose the old transport (after the swap, so a fault here cannot leave the instance in
+        // a half-swapped state). Order: SSL stream first (it wraps the network stream), then network.
+        try {
+            oldSslStream?.Dispose();
+        }
+        catch {
+            // Old transport is expected to be broken during a reconnect — ignore teardown faults.
+        }
+        try {
+            oldNetworkStream?.Dispose();
+        }
+        catch {
+            // Ignore — see above.
+        }
+
+        if (_logger.IsEnabled(LogLevel.Debug)) {
+            _logger.LogDebug("ServiceConnection adopted a fresh transport (#2182 reconnect seam); mb2 session preserved");
+        }
     }
 
     /// <summary>
