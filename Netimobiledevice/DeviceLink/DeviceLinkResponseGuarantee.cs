@@ -45,7 +45,7 @@ public interface IDeviceLinkResponseGuarantee : IAsyncDisposable
 /// let a mid-handler cancel return WITHOUT responding, deadlocking the device against
 /// <see cref="DeviceLinkService.DlLoop"/> (the silent <c>Backup_Preparing</c> wedge).
 ///
-/// Lifecycle: created per handled message via <see cref="DeviceLinkResponseGuarantees.For"/>, used
+/// Lifecycle: created per handled message via <see cref="DeviceLinkResponseGuarantees.Create"/>, used
 /// with <c>await using</c> inside the handler. If the handler sends its response explicitly, dispose
 /// is a no-op; if the handler returns (or throws / is cancelled) WITHOUT responding,
 /// <see cref="DisposeAsync"/> discharges a default success terminating status on
