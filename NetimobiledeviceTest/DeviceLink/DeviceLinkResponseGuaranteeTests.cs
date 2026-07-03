@@ -206,4 +206,56 @@ public class DeviceLinkResponseGuaranteeTests
         Assert.AreEqual(2, callCount,
             "A failed explicit send must not latch; dispose retries the discharge so the response is still guaranteed.");
     }
+
+    // ── #2189: the dispose-fallback send is time-bounded so a wedged socket cannot hang teardown ──
+
+    [TestMethod]
+    [Description("#2189: a dispose-fallback send that hangs on a wedged socket is abandoned within the ~5s bound — DisposeAsync completes, it does not block forever.")]
+    public async Task DisposeFallbackSend_OnWedgedSocket_IsBoundedAndCompletes()
+    {
+        // Model the wedged socket: the sender blocks until ITS token is cancelled (the underlying
+        // WriteAsync ignores WriteTimeout, so without the #2189 bound this would never return and
+        // DisposeAsync — and the whole `await using` — would hang indefinitely).
+        DeviceLinkStatusSender wedged = async (errorCode, errorMessage, payload, ct) => {
+            var tcs = new TaskCompletionSource();
+            using (ct.Register(() => tcs.TrySetResult())) {
+                await tcs.Task.ConfigureAwait(false);
+            }
+            ct.ThrowIfCancellationRequested();
+        };
+        DeviceLinkResponseGuarantees guarantees = new(wedged);
+
+        // A handler that returns without responding, so DisposeAsync runs the fallback send. The whole
+        // dispose must complete well within a window that proves it is bounded (the bound is ~5s; give a
+        // generous ceiling so a slow CI box does not flake while still failing an unbounded hang).
+        async Task DisposeGuard()
+        {
+            await using IDeviceLinkResponseGuarantee guard = guarantees.Create();
+            // no explicit send — dispose discharges the (wedged) fallback
+        }
+
+        Task dispose = DisposeGuard();
+        Task completed = await Task.WhenAny(dispose, Task.Delay(TimeSpan.FromSeconds(30)));
+
+        Assert.AreSame(dispose, completed,
+            "DisposeAsync must return once the ~5s fallback bound elapses on a wedged socket — never hang teardown.");
+        await dispose; // must not throw: the dispose fallback swallows the timeout (best-effort discharge).
+    }
+
+    [TestMethod]
+    [Description("#2189: the dispose-fallback token is time-bounded but NOT pre-cancelled — on a responsive socket the response still goes out.")]
+    public async Task DisposeFallbackSend_OnResponsiveSocket_StillDischarges()
+    {
+        CapturingSender sender = new();
+        DeviceLinkResponseGuarantees guarantees = new(sender.Delegate);
+
+        await using (IDeviceLinkResponseGuarantee guard = guarantees.Create()) {
+            // no explicit send — dispose discharges the fallback on the bounded token
+        }
+
+        Assert.AreEqual(1, sender.Sent.Count,
+            "The bounded dispose fallback must still discharge exactly one terminating response on a responsive socket.");
+        Assert.IsFalse(sender.Sent[0].TokenWasCancelled,
+            "The ~5s bound must not pre-cancel the token — a healthy send completes long before the deadline.");
+    }
 }

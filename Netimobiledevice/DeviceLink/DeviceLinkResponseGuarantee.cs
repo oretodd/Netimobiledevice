@@ -86,23 +86,36 @@ public sealed class DeviceLinkResponseGuarantee : IDeviceLinkResponseGuarantee
     }
 
     /// <summary>
+    /// The hard upper bound on the dispose-fallback terminating send (#2189). The fallback deliberately
+    /// does NOT use the handler's (usually already-cancelled) token, but it must still not run
+    /// unbounded: the underlying <c>WriteAsync</c> ignores the stream's <c>WriteTimeout</c>, so on a
+    /// wedged socket — the very case that cancelled the handler — an untimed send hangs <c>DisposeAsync</c>
+    /// (and the whole <c>await using</c>) forever. A short deadline keeps the plan's "bounded,
+    /// always-completed sends" guarantee: the response is attempted, and if the socket is dead the send
+    /// is abandoned within this window rather than blocking the backup teardown indefinitely.
+    /// </summary>
+    private static readonly TimeSpan DisposeFallbackSendTimeout = TimeSpan.FromSeconds(5);
+
+    /// <summary>
     /// If the handler never sent its terminating response (returned early on a <c>break</c>, threw, or
-    /// was cancelled mid-body), discharge a default success terminating status on
-    /// <see cref="CancellationToken.None"/> so the device is never left blocking. Sent on
-    /// <see cref="CancellationToken.None"/> deliberately: the very reason the handler failed to respond
-    /// is usually that ITS token was cancelled, and the response must still go out before the
-    /// cancellation propagates.
+    /// was cancelled mid-body), discharge a default success terminating status so the device is never
+    /// left blocking. Sent on a fresh, time-bounded token — NOT the handler's token (which is usually
+    /// already cancelled, which is precisely why the handler failed to respond) — so the response still
+    /// goes out before the cancellation propagates, while a wedged socket cannot hang the dispose past
+    /// <see cref="DisposeFallbackSendTimeout"/> (#2189).
     /// </summary>
     public async ValueTask DisposeAsync()
     {
         if (Volatile.Read(ref _responded) != 1) {
+            using var timeoutCts = new CancellationTokenSource(DisposeFallbackSendTimeout);
             try {
-                await SendTerminatingStatusAsync(0, null, null, CancellationToken.None).ConfigureAwait(false);
+                await SendTerminatingStatusAsync(0, null, null, timeoutCts.Token).ConfigureAwait(false);
             }
             catch {
                 // Best-effort: the socket may already be gone (the same drop that cancelled the
-                // handler). We must never let the dispose fallback throw over the handler's own
-                // in-flight exception (e.g. the propagating OperationCanceledException).
+                // handler), or the ~5s bound elapsed on a wedged send. Either way we must never let the
+                // dispose fallback throw over the handler's own in-flight exception (e.g. the
+                // propagating OperationCanceledException) — swallow and release the gate.
             }
         }
         _sendGate.Dispose();
