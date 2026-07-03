@@ -36,6 +36,20 @@ public sealed class DeviceLinkInterMessageTimeoutException : TimeoutException
         Bound = bound;
     }
 
+    /// <summary>
+    /// ScribeHold fork (#2198, P1-2): a custom-message overload for the OTHER wedge shape that must
+    /// classify identically — the peer-FIN empty-message spin. On a peer FIN every length-prefix read
+    /// RETURNS 0 bytes instantly, so <c>ReceiveMessage</c> yields an empty message and NO read/CTS bound
+    /// can ever fire; the DlLoop previously logged "no elements", slept 100 ms and looped forever. The
+    /// spin now raises THIS same classifiable transport-drop signal so it rides the same
+    /// reconnect-and-resume path as the inter-message bound.
+    /// </summary>
+    public DeviceLinkInterMessageTimeoutException(string message, TimeSpan bound)
+        : base(message)
+    {
+        Bound = bound;
+    }
+
     /// <summary>The inter-message silence bound that was exceeded.</summary>
     public TimeSpan Bound { get; }
 }
@@ -80,7 +94,8 @@ public delegate Task<bool> DevicePresenceProbe(CancellationToken cancellationTok
 
 internal sealed class DeviceLinkService : IDisposable {
     private const int BULK_OPERATION_ERROR = -13;
-    private const uint FILE_TRANSFER_TERMINATOR = 0x00;
+    // #2198 (P1-6): the FILE_TRANSFER_TERMINATOR (empty dword) now lives on DownloadFilesObligation,
+    // which owns the composite terminator+status obligation.
     // ScribeHold fork: bumped 5 → 10 minutes. iOS's "build incremental diff" prep window on
     // large devices (iPhone 16 Pro Max heavy users, iOS 26.x) regularly takes 5–6 minutes
     // between passcode-accepted and the first PROGRESS-TICK. The original 5-minute value was
@@ -489,16 +504,24 @@ internal sealed class DeviceLinkService : IDisposable {
     /// </summary>
     /// <param name="msg">The message received from the device.</param>
     private async Task DownloadFiles(ArrayNode msg, CancellationToken cancellationToken) {
-        // ScribeHold fork (#2181): the DLMessageStatusResponse at the end is what the device blocks on.
-        // Route it through the guarantee so a cancellation mid-transfer still discharges exactly one
-        // terminating response (on CancellationToken.None via DisposeAsync) before propagating.
-        await using IDeviceLinkResponseGuarantee guard = _responseGuarantees.Create();
+        // ScribeHold fork (#2181/#2198 P1-6): DownloadFiles owes a COMPOSITE obligation — per-file
+        // framing completion, then the FILE_TRANSFER_TERMINATOR (empty dword), then exactly one
+        // terminating DLMessageStatusResponse, IN THAT ORDER. The #2181 guarantee alone covered only
+        // the status: a cancellation mid-file-loop made its dispose fallback send a status PLIST while
+        // the device was still in file-data framing — protocol desync on the very session the host then
+        // resumes. The obligation wraps terminator+status (plus any open file framing) as one
+        // exactly-once composite, discharged explicitly below or — bounded, in order — by its dispose.
+        await using DownloadFilesObligation obligation = new DownloadFilesObligation(
+            _service.SendAsync, SendPrefixed, _responseGuarantees.Create(), _logger);
 
         DictionaryNode errList = [];
         ArrayNode files = msg[1].AsArrayNode();
         foreach (StringNode filename in files.Cast<StringNode>()) {
             _logger.LogDebug("Sending file: {filename}", filename);
             cancellationToken.ThrowIfCancellationRequested();
+            // From the path send onward the device is in file-data framing for this file; the
+            // obligation's fallback must complete it with a per-file error code if we are interrupted.
+            obligation.BeginFileFraming(filename.Value);
             await SendPath(filename.Value, cancellationToken).ConfigureAwait(false);
 
             string filePath = Path.Combine(_rootPath, filename.Value);
@@ -519,6 +542,7 @@ internal sealed class DeviceLinkService : IDisposable {
 
                 byte[] buffer = [(byte) ResultCode.Success];
                 await SendPrefixed(buffer, buffer.Length, cancellationToken).ConfigureAwait(false);
+                obligation.EndFileFraming();
             }
             else {
                 ErrNo errorCode = ErrNo.ENOENT;
@@ -527,15 +551,16 @@ internal sealed class DeviceLinkService : IDisposable {
                 errList.Add(filename.Value, errReport);
                 await SendError(errReport, cancellationToken).ConfigureAwait(false);
                 OnSendFileError(errReport, filename.Value);
+                obligation.EndFileFraming();
             }
         }
 
-        await _service.SendAsync(BitConverter.GetBytes(FILE_TRANSFER_TERMINATOR), cancellationToken).ConfigureAwait(false);
+        await obligation.SendTerminatorAsync(cancellationToken).ConfigureAwait(false);
         if (errList.Count == 0) {
-            await guard.SendTerminatingStatusAsync(0, null, null, cancellationToken).ConfigureAwait(false);
+            await obligation.SendTerminatingStatusAsync(0, null, null, cancellationToken).ConfigureAwait(false);
         }
         else {
-            await guard.SendTerminatingStatusAsync(BULK_OPERATION_ERROR, "Multi status", errList, cancellationToken).ConfigureAwait(false);
+            await obligation.SendTerminatingStatusAsync(BULK_OPERATION_ERROR, "Multi status", errList, cancellationToken).ConfigureAwait(false);
         }
     }
 
@@ -1031,6 +1056,12 @@ internal sealed class DeviceLinkService : IDisposable {
         // ScribeHold fork (#2197, P0-E): per-exchange sequence counter for the DlLoop trace so a live run
         // is diagnosable in a single pass — each read is logged with seq#, command, elapsed and bytes.
         long dlLoopSeq = 0;
+        // ScribeHold fork (#2198, P1-2): consecutive-empty-message counter. On a peer FIN every read
+        // RETURNS (0 bytes → empty message) so no read bound or inter-message CTS can ever fire — the
+        // loop previously spun log/delay-100ms forever. A second consecutive empty message, or a single
+        // empty message with the socket probing dead (EOF/RST), raises the same classifiable
+        // transport-drop signal as the inter-message bound so it feeds reconnect-and-resume.
+        int consecutiveEmptyMessages = 0;
         while (!cancellationToken.IsCancellationRequested) {
             ArrayNode message;
             long readStartTicks = Stopwatch.GetTimestamp();
@@ -1066,10 +1097,26 @@ internal sealed class DeviceLinkService : IDisposable {
                 // hard-cap exhaustion.
                 message = await ReceiveMessageWithPreparingProbeAsync(_internalCancellationTokenSource.Token).ConfigureAwait(false);
                 if (message.Count == 0) {
+                    // ScribeHold fork (#2198, P1-2): an empty message is a 0-byte length-prefix read — the
+                    // signature of a peer FIN. Because the read RETURNED, no timeout can ever fire, so the
+                    // old log/delay/continue shape spun forever. A second consecutive empty message, or a
+                    // single one with the socket probing dead, is transport evidence: surface the bounded
+                    // transport-drop signal so the coordinator reconnects-and-resumes.
+                    consecutiveEmptyMessages++;
+                    bool transportDead = !_service.IsTransportHealthy();
+                    if (ShouldTreatEmptyMessagesAsTransportDrop(consecutiveEmptyMessages, transportDead)) {
+                        _logger.LogWarning(
+                            "Received {Count} consecutive empty DeviceLink message(s) (transportDead={TransportDead}) — peer FIN/EOF; surfacing a bounded transport-drop signal for reconnect-and-resume (#2198 P1-2)",
+                            consecutiveEmptyMessages, transportDead);
+                        throw new DeviceLinkInterMessageTimeoutException(
+                            $"Device link peer closed the connection (consecutive empty messages: {consecutiveEmptyMessages}, transportDead: {transportDead}) — classifying as a transport drop",
+                            _usbInterMessageSilenceBound);
+                    }
                     _logger.LogWarning("Received array node with no elements");
                     await Task.Delay(100, cancellationToken).ConfigureAwait(false);
                     continue;
                 }
+                consecutiveEmptyMessages = 0;
             }
 
             string command = message[0].AsStringNode().Value;
@@ -1361,6 +1408,19 @@ internal sealed class DeviceLinkService : IDisposable {
     /// </summary>
     internal static bool ShouldApplyInterMessageBound(bool isUsbTransport, TimeSpan bound) {
         return isUsbTransport && bound > TimeSpan.Zero;
+    }
+
+    /// <summary>
+    /// ScribeHold fork (#2198, P1-2): the pure decision for whether the DlLoop treats empty messages as
+    /// a transport drop instead of spinning. TRUE on the SECOND consecutive empty message (a peer FIN
+    /// makes every read return 0 bytes instantly, so a repeat is deterministic evidence, not a fluke),
+    /// or on the FIRST when the socket probe already reports the peer dead (EOF/RST). A single empty
+    /// message on a healthy transport is tolerated (the historical benign shape) — the counter resets on
+    /// any non-empty message. Pure + internal so the fork regression test exercises the boundary without
+    /// a live socket.
+    /// </summary>
+    internal static bool ShouldTreatEmptyMessagesAsTransportDrop(int consecutiveEmptyMessages, bool transportDead) {
+        return consecutiveEmptyMessages >= 2 || (consecutiveEmptyMessages >= 1 && transportDead);
     }
 
     /// <summary>

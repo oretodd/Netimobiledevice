@@ -23,6 +23,12 @@ namespace Netimobiledevice.Lockdown;
 public class ServiceConnection : IDisposable {
     private const int MAX_READ_SIZE = 32768;
 
+    // ScribeHold fork (#2198, P1-1): the async-send chunk size. SendAsync splits every payload into
+    // chunks of this size and bounds EACH chunk's write independently, so a slow-but-moving large send
+    // (e.g. a 128 MiB Manifest.db DownloadFiles chunk) is never clipped by a whole-payload bound — only
+    // a chunk that makes NO progress for the whole write bound trips the timeout.
+    private const int WRITE_CHUNK_SIZE = 64 * 1024;
+
     /// <summary>
     /// The internal logger
     /// </summary>
@@ -418,9 +424,73 @@ public class ServiceConnection : IDisposable {
     }
 
     public async Task SendAsync(ReadOnlyMemory<byte> data, CancellationToken cancellationToken) {
-        await Stream.WriteAsync(data, cancellationToken).ConfigureAwait(false);
-        // ScribeHold fork (#2077): see Send — count host-sent bytes for the FIN dump.
-        Interlocked.Add(ref _bytesSent, data.Length);
+        // ScribeHold fork (#2198, P1-1): bound every async write. Stream.WriteTimeout is SYNC-ONLY in
+        // .NET, so the prior bare WriteAsync was UNBOUNDED — a stalled backupd could park a mid-payload
+        // write forever (keepalive can't trip: the TCP peer is the local usbmuxd). The bound is applied
+        // PER ~64KB CHUNK with a fresh CTS per chunk (the same per-op CTS pattern ReceiveAsync uses), so
+        // a slow-but-moving large send never trips; only a chunk making no progress for the whole bound
+        // does. The bound resolves from the caller-set Stream.WriteTimeout when it is tighter, else the
+        // transport policy's WriteBoundSec; a policy of 0 (WiFiLoose) disables it entirely so WiFi async
+        // write behavior stays byte-for-byte untouched.
+        int writeBoundMs = ResolveWriteBoundMs();
+        if (writeBoundMs == Timeout.Infinite) {
+            await Stream.WriteAsync(data, cancellationToken).ConfigureAwait(false);
+            // ScribeHold fork (#2077): see Send — count host-sent bytes for the FIN dump.
+            Interlocked.Add(ref _bytesSent, data.Length);
+            return;
+        }
+
+        for (int offset = 0; offset < data.Length; offset += WRITE_CHUNK_SIZE) {
+            int chunkLength = Math.Min(WRITE_CHUNK_SIZE, data.Length - offset);
+            using CancellationTokenSource writeBoundCts = new CancellationTokenSource(writeBoundMs);
+            using CancellationTokenSource linkedCts =
+                CancellationTokenSource.CreateLinkedTokenSource(writeBoundCts.Token, cancellationToken);
+            try {
+                await Stream.WriteAsync(data.Slice(offset, chunkLength), linkedCts.Token).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (writeBoundCts.IsCancellationRequested && !cancellationToken.IsCancellationRequested) {
+                // The per-chunk write bound elapsed with NO caller cancellation: the peer stopped
+                // draining. Surface the bounded, classifiable send-timeout signal (a TimeoutException
+                // subtype) so the host's transient ladder routes it into reconnect-and-resume rather
+                // than the write parking forever.
+                TimeSpan bound = TimeSpan.FromMilliseconds(writeBoundMs);
+                _logger.LogError(
+                    "Async write made no progress for {BoundSec:0.###}s at offset {Offset}/{Total} bytes — surfacing a bounded send-timeout signal (#2198 P1-1)",
+                    bound.TotalSeconds, offset, data.Length);
+                throw new ServiceConnectionSendTimeoutException(bound);
+            }
+            // ScribeHold fork (#2077): see Send — count host-sent bytes for the FIN dump.
+            Interlocked.Add(ref _bytesSent, chunkLength);
+        }
+    }
+
+    /// <summary>
+    /// ScribeHold fork (#2198, P1-1): resolve the effective per-chunk async write bound in
+    /// milliseconds. The transport policy is the gate: <c>WriteBoundSec == 0</c> (the WiFi-loose value)
+    /// disables the bound entirely — <see cref="Timeout.Infinite"/> — preserving the prior unbounded
+    /// WiFi behavior. When the policy enables the bound (USB, ~60s), a caller-set
+    /// <c>Stream.WriteTimeout</c> that is TIGHTER than the policy is honored (mirroring ReceiveAsync,
+    /// which arms its per-op CTS from <c>Stream.ReadTimeout</c>); otherwise the policy bound applies —
+    /// the stream's usual 10-minute bulk timeout must not loosen the policy's fail-fast intent.
+    /// Internal so the fork regression test exercises the resolution without a live socket.
+    /// </summary>
+    internal int ResolveWriteBoundMs() {
+        if (_timeoutPolicy.WriteBoundSec <= 0) {
+            return Timeout.Infinite;
+        }
+        int policyMs = _timeoutPolicy.WriteBoundSec * 1000;
+        int streamMs;
+        try {
+            streamMs = Stream.CanTimeout ? Stream.WriteTimeout : Timeout.Infinite;
+        }
+        catch (InvalidOperationException) {
+            // A stream that does not support timeouts throws from WriteTimeout — treat as unset.
+            streamMs = Timeout.Infinite;
+        }
+        if (streamMs != Timeout.Infinite && streamMs > 0 && streamMs < policyMs) {
+            return streamMs;
+        }
+        return policyMs;
     }
 
     public void SendPlist(PropertyNode data, PlistFormat format = PlistFormat.Xml) {
