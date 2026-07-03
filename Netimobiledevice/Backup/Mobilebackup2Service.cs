@@ -37,7 +37,34 @@ public sealed class Mobilebackup2Service(
     private const string RSD_SERVICE_NAME = "com.apple.mobilebackup2.shim.remote";
 
     private CancellationTokenSource _internalCts = new CancellationTokenSource();
-    private bool _passcodeRequired;
+    // #2198 (P1-4): volatile — the flag is SET/CLEARED from the NotificationProxy listener thread and
+    // READ from the Backup task's wait loop; without volatile the reader could legally cache a stale
+    // value and never observe the clear (or the set).
+    private volatile bool _passcodeRequired;
+
+    /// <summary>
+    /// #2198 (P1-4): the interval between passcode-wait polls. Constant (was the inline 3000ms literal);
+    /// exposed for the wait-loop unit test via the injectable overload of
+    /// <see cref="WaitForPasscodeEntryAsync"/>.
+    /// </summary>
+    private static readonly TimeSpan PasscodePollInterval = TimeSpan.FromSeconds(3);
+
+    /// <summary>
+    /// #2198 (P1-4): the library-default passcode-wait deadline in SECONDS (5 minutes). Generous enough
+    /// for a user to pick up the device and type the passcode; bounded so a walked-away prompt cannot
+    /// park the backup forever.
+    /// </summary>
+    public const int DefaultPasscodeWaitMaxSec = 300;
+
+    /// <summary>
+    /// #2198 (P1-4): the deadline on the passcode wait. The prior wait had NO deadline — a user who
+    /// walked away from the device prompt parked the backup forever with no signal. When the prompt
+    /// stays unanswered past this deadline a dedicated <see cref="PasscodeWaitTimeoutException"/> is
+    /// raised so the host maps it to its EXISTING actionable passcode terminal (never a generic fatal).
+    /// The hosting ScribeHold.Service overrides it from configuration (<c>PasscodeWaitMaxSec</c>);
+    /// a non-positive value disables the deadline (the legacy unbounded wait).
+    /// </summary>
+    public TimeSpan PasscodeWaitMax { get; set; } = TimeSpan.FromSeconds(DefaultPasscodeWaitMaxSec);
 
     /// <summary>
     /// ScribeHold fork: cumulative throughput stats from the last Backup() invocation. Populated
@@ -450,10 +477,21 @@ public sealed class Mobilebackup2Service(
                         }
 
                         // Create Status.plist file if doesn't exist.
+                        // #2198 (P1-3): written ATOMICALLY (temp + move-overwrite) so an interrupted
+                        // write can never leave a torn Status.plist that poisons the next incremental
+                        // attempt; and an EXISTING torn/unparseable Status.plist is repaired to a clean
+                        // incremental baseline at attempt start (never silently degrading to FULL).
                         string statusPlistPath = Path.Combine(deviceDirectory, "Status.plist");
                         if (fullBackup || !File.Exists(statusPlistPath)) {
                             BackupStatus status = new BackupStatus() { IsFullBackup = fullBackup };
-                            await File.WriteAllBytesAsync(statusPlistPath, PropertyList.SaveAsByteArray(status.ToPlist(), PlistFormat.Binary), _internalCts.Token).ConfigureAwait(false);
+                            await AtomicFile.WriteAllBytesAsync(statusPlistPath, PropertyList.SaveAsByteArray(status.ToPlist(), PlistFormat.Binary), _internalCts.Token).ConfigureAwait(false);
+                        }
+                        else if (!IsStatusPlistReadable(statusPlistPath)) {
+                            Logger.LogWarning(
+                                "Status.plist at {StatusPath} is torn/unparseable — rewriting a clean incremental baseline (New/Finished); the backup stays INCREMENTAL, never degrading to full (#2198 P1-3)",
+                                statusPlistPath);
+                            BackupStatus repaired = new BackupStatus() { IsFullBackup = false };
+                            await AtomicFile.WriteAllBytesAsync(statusPlistPath, PropertyList.SaveAsByteArray(repaired.ToPlist(), PlistFormat.Binary), _internalCts.Token).ConfigureAwait(false);
                         }
 
                         DictionaryNode message = new DictionaryNode() {
@@ -462,10 +500,13 @@ public sealed class Mobilebackup2Service(
                             };
                         await dl.SendProcessMessage(message, cancellationToken).ConfigureAwait(false);
 
-                        // Wait for 3 seconds to see if the device passcode is requested and then keep waiting till the passcode has been entered
-                        do {
-                            await Task.Delay(3000, _internalCts.Token).ConfigureAwait(false);
-                        } while (_passcodeRequired);
+                        // Wait for 3 seconds to see if the device passcode is requested and then keep
+                        // waiting till the passcode has been entered — but never past the PasscodeWaitMax
+                        // deadline (#2198 P1-4): an unanswered prompt surfaces a dedicated
+                        // PasscodeWaitTimeoutException (an actionable terminal, never a generic fatal).
+                        await WaitForPasscodeEntryAsync(
+                            () => _passcodeRequired, PasscodePollInterval, PasscodeWaitMax, Logger,
+                            _internalCts.Token).ConfigureAwait(false);
 
                         return await dl.DlLoop(_internalCts.Token).ConfigureAwait(false);
                     }
@@ -546,7 +587,63 @@ public sealed class Mobilebackup2Service(
     private static bool IsResumeDropClass(Exception ex) {
         return ex is DeviceLinkInterMessageTimeoutException
             or DeviceLinkVersionExchangeTimeoutException
+            // #2198 (P1-1): a bounded per-chunk send timeout is the write-side twin of the inter-message
+            // read timeout — same drop-class, same quiet abandon, same reconnect-and-resume.
+            or ServiceConnectionSendTimeoutException
             or IOException;
+    }
+
+    /// <summary>
+    /// #2198 (P1-4): the bounded passcode wait, static with the flag/clock injected so the deadline
+    /// behavior is unit-testable without a live device. Polls <paramref name="passcodeRequired"/> every
+    /// <paramref name="pollInterval"/>; returns normally once the passcode prompt clears (or was never
+    /// shown). When the prompt stays raised past <paramref name="maxWait"/>, throws a dedicated
+    /// <see cref="PasscodeWaitTimeoutException"/> — an actionable user-action terminal, never a generic
+    /// fatal or a transient drop. A non-positive <paramref name="maxWait"/> disables the deadline
+    /// (legacy unbounded wait). A caller cancellation always propagates as-is.
+    /// </summary>
+    internal static async Task WaitForPasscodeEntryAsync(
+        Func<bool> passcodeRequired,
+        TimeSpan pollInterval,
+        TimeSpan maxWait,
+        ILogger logger,
+        CancellationToken cancellationToken) {
+        long waitStartTicks = System.Diagnostics.Stopwatch.GetTimestamp();
+        do {
+            await Task.Delay(pollInterval, cancellationToken).ConfigureAwait(false);
+            if (passcodeRequired() && IsPasscodeWaitExpired(System.Diagnostics.Stopwatch.GetElapsedTime(waitStartTicks), maxWait)) {
+                logger.LogError(
+                    "Device passcode prompt unanswered past the {MaxSec:0.###}s deadline — surfacing the actionable passcode terminal (#2198 P1-4)",
+                    maxWait.TotalSeconds);
+                throw new PasscodeWaitTimeoutException(maxWait);
+            }
+        } while (passcodeRequired());
+    }
+
+    /// <summary>
+    /// #2198 (P1-4): the pure deadline decision — expired only when a positive deadline is configured
+    /// and the elapsed wait has reached it. A non-positive deadline disables the bound (never expires),
+    /// preserving the legacy unbounded wait for a host that opts out. Pure + internal for the fork test.
+    /// </summary>
+    internal static bool IsPasscodeWaitExpired(TimeSpan waited, TimeSpan maxWait) {
+        return maxWait > TimeSpan.Zero && waited >= maxWait;
+    }
+
+    /// <summary>
+    /// #2198 (P1-3): true when the Status.plist at <paramref name="statusPlistPath"/> parses as a
+    /// well-formed status plist. A torn/truncated file (interrupted write) returns false so the caller
+    /// repairs it to a clean incremental baseline instead of handing the device a malformed plist.
+    /// </summary>
+    private bool IsStatusPlistReadable(string statusPlistPath) {
+        try {
+            DictionaryNode node = PropertyList.LoadFromByteArray(File.ReadAllBytes(statusPlistPath)).AsDictionaryNode();
+            BackupStatus.ParsePlist(node, Logger);
+            return true;
+        }
+        catch (Exception ex) {
+            Logger.LogDebug(ex, "Status.plist at {StatusPath} failed to parse (#2198 P1-3)", statusPlistPath);
+            return false;
+        }
     }
 
     private void NotificationProxy_ReceivedNotification(object? sender, ReceivedNotificationEventArgs e) {

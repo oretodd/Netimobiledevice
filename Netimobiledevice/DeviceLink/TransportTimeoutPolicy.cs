@@ -109,6 +109,19 @@ public sealed class TransportTimeoutPolicy
     public int PreparingHardCapSec { get; }
 
     /// <summary>
+    /// #2198 (P1-1): the PER-CHUNK bound in SECONDS applied to each async socket write in
+    /// <see cref="Netimobiledevice.Lockdown.ServiceConnection.SendAsync"/>. Async writes were previously
+    /// UNBOUNDED — <c>Stream.WriteTimeout</c> is sync-only in .NET, so a stalled <c>backupd</c> could park
+    /// a mid-Manifest.db 128 MiB DownloadFiles chunk write forever (the best-evidence mechanism of the
+    /// original 51-minute wedge; TCP keepalive cannot trip because the peer is the local usbmuxd). The
+    /// bound is PER ~64 KB CHUNK, not per whole send, so a slow-but-moving large send is never clipped —
+    /// each chunk gets a fresh bound. USB uses a tight (~60s) bound that surfaces a classifiable
+    /// send-timeout signal feeding reconnect-and-resume; <c>0</c> DISABLES the bound entirely (WiFi stays
+    /// loose/unbounded — its write behavior is untouched).
+    /// </summary>
+    public int WriteBoundSec { get; }
+
+    /// <summary>
     /// The keepalive budget in seconds implied by the keepalive settings
     /// (<c>Time + Interval * RetryCount</c>). Diagnostic/convenience; #1857 sized this to ~7 min on
     /// USB, kept under the DeviceLinkService bulk-read timeout.
@@ -137,6 +150,11 @@ public sealed class TransportTimeoutPolicy
     /// generous <paramref name="preparingSilenceBoundSec"/> (the cap can never be tighter than a single
     /// probe interval).
     /// </param>
+    /// <param name="writeBoundSec">
+    /// #2198 (P1-1): the per-~64KB-chunk async write bound (seconds). Defaults to
+    /// <see cref="DefaultWriteBoundSec"/> so existing callers stay non-breaking; <c>0</c> disables the
+    /// bound (unbounded writes — the WiFi-loose behavior). Negative values are rejected.
+    /// </param>
     public TransportTimeoutPolicy(
         int readTimeoutMs,
         int keepAliveTimeSec,
@@ -146,7 +164,8 @@ public sealed class TransportTimeoutPolicy
         int interMessageSilenceBoundSec,
         int preparingSilenceBoundSec = DefaultPreparingSilenceBoundSec,
         int versionExchangeBoundSec = DefaultVersionExchangeBoundSec,
-        int preparingHardCapSec = DefaultPreparingHardCapSec)
+        int preparingHardCapSec = DefaultPreparingHardCapSec,
+        int writeBoundSec = DefaultWriteBoundSec)
     {
         if (readTimeoutMs != Timeout.Infinite && readTimeoutMs <= 0) {
             throw new ArgumentOutOfRangeException(nameof(readTimeoutMs), readTimeoutMs, "Read timeout must be positive or Timeout.Infinite.");
@@ -175,6 +194,9 @@ public sealed class TransportTimeoutPolicy
         if (preparingHardCapSec < preparingSilenceBoundSec) {
             throw new ArgumentOutOfRangeException(nameof(preparingHardCapSec), preparingHardCapSec, "Preparing hard cap must be >= the generous Preparing silence bound.");
         }
+        if (writeBoundSec < 0) {
+            throw new ArgumentOutOfRangeException(nameof(writeBoundSec), writeBoundSec, "Write bound must be non-negative (0 disables the bound).");
+        }
 
         ReadTimeoutMs = readTimeoutMs;
         KeepAliveTimeSec = keepAliveTimeSec;
@@ -185,7 +207,16 @@ public sealed class TransportTimeoutPolicy
         PreparingSilenceBoundSec = preparingSilenceBoundSec;
         VersionExchangeBoundSec = versionExchangeBoundSec;
         PreparingHardCapSec = preparingHardCapSec;
+        WriteBoundSec = writeBoundSec;
     }
+
+    /// <summary>
+    /// #2198 (P1-1): the library-default per-chunk async write bound in SECONDS (60s). Generous for a
+    /// single ~64 KB chunk on a healthy usbmux relay (which moves in milliseconds) while still bounding
+    /// the previously-unbounded async write so a stalled backupd feeds reconnect-and-resume instead of
+    /// parking a write forever. WiFi disables the bound via <see cref="WiFiLoose"/> (writeBoundSec: 0).
+    /// </summary>
+    public const int DefaultWriteBoundSec = 60;
 
     /// <summary>
     /// #2193: the library-default Preparing-phase silence bound in SECONDS (4 minutes). Generous enough
@@ -242,6 +273,12 @@ public sealed class TransportTimeoutPolicy
     public TimeSpan PreparingHardCap => TimeSpan.FromSeconds(PreparingHardCapSec);
 
     /// <summary>
+    /// #2198 (P1-1): the per-chunk async write bound as a <see cref="TimeSpan"/>.
+    /// <see cref="TimeSpan.Zero"/> when the bound is disabled (writeBoundSec == 0, the WiFi-loose case).
+    /// </summary>
+    public TimeSpan WriteBound => TimeSpan.FromSeconds(WriteBoundSec);
+
+    /// <summary>
     /// USB (usbmux) transport policy -- the reliability-critical, fail-fast-into-recovery path and the
     /// library default. Keepalive budget preserves the #1857 intent (~7 min:
     /// <c>120 + 10*30</c>, kept under the DeviceLinkService bulk-read timeout) while every OTHER bound
@@ -266,7 +303,10 @@ public sealed class TransportTimeoutPolicy
         versionExchangeBoundSec: DefaultVersionExchangeBoundSec,
         // #2197 (P0-B): a generous hard cap on TOTAL continuous Preparing silence (the probe-and-wait
         // loop's last-resort bound), comfortably above a real on-device manifest diff.
-        preparingHardCapSec: DefaultPreparingHardCapSec);
+        preparingHardCapSec: DefaultPreparingHardCapSec,
+        // #2198 (P1-1): bound each ~64KB async write chunk so a stalled backupd can never park a send
+        // forever (the previously-unbounded async write — WriteTimeout is sync-only in .NET).
+        writeBoundSec: DefaultWriteBoundSec);
 
     /// <summary>
     /// WiFi (lockdown/TCP) transport policy -- LOOSE, preserving existing behavior. Every bound is
@@ -290,7 +330,10 @@ public sealed class TransportTimeoutPolicy
         // untouched (these new bounds are applied only on USB anyway). The hard cap equals the loose
         // Preparing bound to satisfy the cap >= bound invariant.
         versionExchangeBoundSec: 10 * 60,
-        preparingHardCapSec: 10 * 60);
+        preparingHardCapSec: 10 * 60,
+        // #2198 (P1-1): WiFi writes stay UNBOUNDED — 0 disables the per-chunk write bound entirely, so
+        // WiFi async-write behavior is byte-for-byte untouched (no gratuitous WiFi change).
+        writeBoundSec: 0);
 
     /// <summary>
     /// ScribeHold fork (#2190): build the USB-tight policy the host drives from
@@ -319,12 +362,18 @@ public sealed class TransportTimeoutPolicy
     /// <c>BackupConfiguration.UsbPreparingHardCapSec</c>. Defaults to
     /// <see cref="DefaultPreparingHardCapSec"/>. Must be >= <paramref name="preparingSilenceBoundSec"/>.
     /// </param>
+    /// <param name="writeBoundSec">
+    /// #2198 (P1-1): the per-~64KB-chunk async write bound (seconds); from
+    /// <c>BackupConfiguration.UsbWriteBoundSec</c>. Defaults to <see cref="DefaultWriteBoundSec"/>;
+    /// <c>0</c> disables the bound.
+    /// </param>
     public static TransportTimeoutPolicy ForUsb(
         int sslHandshakeWatchdogSec,
         int interMessageSilenceBoundSec,
         int preparingSilenceBoundSec = DefaultPreparingSilenceBoundSec,
         int versionExchangeBoundSec = DefaultVersionExchangeBoundSec,
-        int preparingHardCapSec = DefaultPreparingHardCapSec)
+        int preparingHardCapSec = DefaultPreparingHardCapSec,
+        int writeBoundSec = DefaultWriteBoundSec)
     {
         return new TransportTimeoutPolicy(
             readTimeoutMs: UsbTight.ReadTimeoutMs,
@@ -335,7 +384,8 @@ public sealed class TransportTimeoutPolicy
             interMessageSilenceBoundSec: interMessageSilenceBoundSec,
             preparingSilenceBoundSec: preparingSilenceBoundSec,
             versionExchangeBoundSec: versionExchangeBoundSec,
-            preparingHardCapSec: preparingHardCapSec);
+            preparingHardCapSec: preparingHardCapSec,
+            writeBoundSec: writeBoundSec);
     }
 
     /// <summary>
