@@ -102,7 +102,7 @@ public class Program {
                 mb2.Status += BackupJob_Status;
                 mb2.Started += BackupJob_Started;
 
-                await mb2.Backup(false, false, true, "backups", tokenSource.Token);
+                await mb2.Backup(false, false, true, "backups", cancellationToken: tokenSource.Token);
             }
         }
 
@@ -178,7 +178,7 @@ public class Program {
             mb2.Status += BackupJob_Status;
             mb2.Started += BackupJob_Started;
 
-            await mb2.Backup(false, false, true, "backups", tokenSource.Token);
+            await mb2.Backup(false, false, true, "backups", cancellationToken: tokenSource.Token);
         }
 
         await Task.Delay(5 * 1000);

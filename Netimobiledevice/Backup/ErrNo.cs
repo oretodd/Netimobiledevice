@@ -21,4 +21,10 @@ internal enum ErrNo : int
     /// Already exists.
     /// </summary>
     EEXIST = 17,
+    /// <summary>
+    /// Operation not supported (Darwin/iOS errno 45). #2199 (P2-3): returned in the DeviceLink status
+    /// response for an unsupported/unknown command so a future-iOS message type is answered gracefully
+    /// instead of killing the backup.
+    /// </summary>
+    ENOTSUP = 45,
 }

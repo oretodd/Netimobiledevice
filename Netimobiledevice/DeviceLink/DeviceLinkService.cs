@@ -5,6 +5,7 @@ using Netimobiledevice.EndianBitConversion;
 using Netimobiledevice.Lockdown;
 using Netimobiledevice.Plist;
 using System;
+using System.Buffers;
 using System.Collections.Generic;
 using System.ComponentModel;
 using System.Diagnostics;
@@ -94,6 +95,18 @@ public delegate Task<bool> DevicePresenceProbe(CancellationToken cancellationTok
 
 internal sealed class DeviceLinkService : IDisposable {
     private const int BULK_OPERATION_ERROR = -13;
+    // #2199 (P2-3): the DeviceLink status-response error code for an unsupported/unknown command
+    // (negated Darwin/iOS ENOTSUP errno), mirroring how CreateErrorReport negates errno codes.
+    private const int OPERATION_NOT_SUPPORTED_ERROR = -(int) ErrNo.ENOTSUP;
+    // #2199 (P2-5): the DownloadFiles per-read chunk size rented from ArrayPool<byte>.Shared. ~4 MiB
+    // keeps the buffer off the LOH (< 85KB threshold does not apply here, but a pooled 4 MiB buffer is
+    // reused rather than freshly LOH-allocated per file) and bounds a single chunk's payload well under
+    // the old fresh 128 MiB allocation while keeping throughput high.
+    private const int FILE_DATA_CHUNK_SIZE = 4 * 1024 * 1024;
+    // #2199 (P2-5): the single ResultCode.FileData code byte, sent as its own write in the three-write
+    // chunk framing (length prefix, THIS byte, then the payload) — a one-element buffer so SendFileData-
+    // ChunkAsync never rebuilds it per chunk.
+    private static readonly byte[] FileDataCodeByte = [(byte) ResultCode.FileData];
     // #2198 (P1-6): the FILE_TRANSFER_TERMINATOR (empty dword) now lives on DownloadFilesObligation,
     // which owns the composite terminator+status obligation.
     // ScribeHold fork: bumped 5 → 10 minutes. iOS's "build incremental diff" prep window on
@@ -473,10 +486,21 @@ internal sealed class DeviceLinkService : IDisposable {
             new StringNode("___EmptyParameterString___")
         ];
         try {
-            _service.SendPlist(message, PlistFormat.Binary);
+            // #2199 (P2-2): 5s-bounded disconnect send (mirrors the CancelBackup teardown bound). The
+            // prior SYNC SendPlist was capped only by Stream.WriteTimeout (~600s) — a wedged socket parked
+            // Dispose (and the resume behind it) for up to ten minutes. Route through the async send under
+            // a 5s CTS so a stalled peer never holds teardown hostage; the socket close in Dispose's
+            // finally is what actually releases the transport.
+            using CancellationTokenSource disconnectCts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+            _service.SendPlistAsync(message, PlistFormat.Binary, disconnectCts.Token).GetAwaiter().GetResult();
         }
         catch (ObjectDisposedException) {
             _logger.LogWarning("Trying to send disconnect from disposed service");
+        }
+        catch (OperationCanceledException) {
+            // #2199 (P2-2): the 5s disconnect bound elapsed on a wedged peer — stop waiting and let the
+            // socket close release the transport. The device invalidates the session on the FIN anyway.
+            _logger.LogDebug("Disconnect send timed out after 5s on a wedged peer (ignored) (#2199 P2-2)");
         }
         catch (IOException ex) {
             // #2197 (P0-C): a broken/closed peer during the disconnect send is expected (the device may
@@ -527,16 +551,21 @@ internal sealed class DeviceLinkService : IDisposable {
             string filePath = Path.Combine(_rootPath, filename.Value);
             if (File.Exists(filePath)) {
                 await using (FileStream fs = File.OpenRead(filePath)) {
-                    // We want to use a chunk size of 128 MiB
-                    byte[] chunk = new byte[128 * 1024 * 1024];
-
-                    int bytesRead;
-                    while ((bytesRead = await fs.ReadAsync(chunk, cancellationToken).ConfigureAwait(false)) > 0) {
-                        byte[] data = [
-                            (byte) ResultCode.FileData,
-                            .. chunk[0 .. bytesRead]
-                        ];
-                        await SendPrefixed(data, data.Length, cancellationToken).ConfigureAwait(false);
+                    // #2199 (P2-5): rent a ~4 MiB chunk from the shared pool instead of allocating a fresh
+                    // 128 MiB LOH buffer per file. The old code ALSO built a second full copy per read
+                    // ([FileData, ..chunk[0..bytesRead]]) — up to 256 MiB of LOH traffic per chunk while the
+                    // device waited. We now stream each chunk with THREE writes (length prefix, the single
+                    // FileData code byte, then the rented slice directly) — byte-identical on the wire to the
+                    // prefixed [FileData + payload] frame, with zero per-chunk allocation.
+                    byte[] chunk = ArrayPool<byte>.Shared.Rent(FILE_DATA_CHUNK_SIZE);
+                    try {
+                        int bytesRead;
+                        while ((bytesRead = await fs.ReadAsync(chunk.AsMemory(0, FILE_DATA_CHUNK_SIZE), cancellationToken).ConfigureAwait(false)) > 0) {
+                            await SendFileDataChunkAsync(chunk, bytesRead, cancellationToken).ConfigureAwait(false);
+                        }
+                    }
+                    finally {
+                        ArrayPool<byte>.Shared.Return(chunk);
                     }
                 }
 
@@ -840,6 +869,20 @@ internal sealed class DeviceLinkService : IDisposable {
     }
 
     /// <summary>
+    /// #2199 (P2-5): send one file-data chunk as a length-prefixed frame WITHOUT the prior per-chunk
+    /// allocation. The wire bytes are byte-identical to the old
+    /// <c>SendPrefixed([FileData, ..payload], 1 + bytesRead)</c>: a 4-byte big-endian length of
+    /// <c>1 + bytesRead</c>, then the single <see cref="ResultCode.FileData"/> code byte, then the
+    /// <paramref name="bytesRead"/> payload bytes streamed directly from the rented <paramref name="chunk"/>
+    /// (which may be larger than <paramref name="bytesRead"/>). Three writes, zero copy, no protocol change.
+    /// </summary>
+    private async Task SendFileDataChunkAsync(byte[] chunk, int bytesRead, CancellationToken cancellationToken) {
+        await _service.SendAsync(EndianBitConverter.BigEndian.GetBytes(1 + bytesRead), cancellationToken).ConfigureAwait(false);
+        await _service.SendAsync(FileDataCodeByte, cancellationToken).ConfigureAwait(false);
+        await _service.SendAsync(chunk.AsMemory(0, bytesRead), cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>
     /// Sends a status report to the backup service.
     /// </summary>
     /// <param name="errorCode">The error code to send (as errno value).</param>
@@ -1131,6 +1174,30 @@ internal sealed class DeviceLinkService : IDisposable {
                 "DlLoop exchange #{Seq}: command={Command} status={Status} elements={Count} elapsedMs={ElapsedMs:0.#}",
                 ++dlLoopSeq, command, dlLoopStatus, message.Count, dlLoopElapsedMs);
 
+            // #2199 (P2-3): future-iOS resilience. An unknown command (a new/renamed DeviceLink message a
+            // future iOS introduces) must NOT kill the whole backup. The old code fell into the default
+            // switch arm, dereferenced message[3] unguarded (a short message → IndexOutOfRange) and then
+            // indexed DeviceLinkHandlers[command] (unknown key → KeyNotFoundException) — both generic-fatal.
+            // Now: resolve the handler with TryGetValue FIRST; on a miss, WARN + send an unsupported-
+            // operation error status through the guarantee (exactly-once, so the device is never left
+            // blocking) and continue the loop, exactly as libimobiledevice replies to unhandled types.
+            //
+            // ProcessMessage is the ONE known command handled entirely by the switch below (it detects a
+            // device-side error and completes/returns the backup) and is deliberately NOT a DeviceLinkHandlers
+            // key — the old code never indexed the dictionary for it because the switch case returns first.
+            // It must therefore be treated as KNOWN here, or every backup's terminal completion message would
+            // be misclassified as unsupported and the loop would never return Success. Recognize it explicitly.
+            bool commandHasHandler = DeviceLinkHandlers.TryGetValue(command, out Func<ArrayNode, CancellationToken, Task>? handler);
+            if (IsUnsupportedDeviceLinkCommand(command, commandHasHandler)) {
+                _logger.LogWarning(
+                    "DlLoop received an unsupported command '{Command}' ({Count} elements) — replying with an unsupported-operation error status and continuing (future-iOS resilience) (#2199 P2-3)",
+                    command, message.Count);
+                await using IDeviceLinkResponseGuarantee unsupportedGuard = _responseGuarantees.Create();
+                await unsupportedGuard.SendTerminatingStatusAsync(
+                    OPERATION_NOT_SUPPORTED_ERROR, $"Unsupported operation: {command}", null, _internalCancellationTokenSource.Token).ConfigureAwait(false);
+                continue;
+            }
+
             switch (command) {
                 case DeviceLinkMessage.ProcessMessage: {
                     if (message[1].AsDictionaryNode()["ErrorCode"].AsIntegerNode().Value != (ulong) ResultCode.Success) {
@@ -1151,12 +1218,20 @@ internal sealed class DeviceLinkService : IDisposable {
                 }
 
                 default: {
-                    UpdateProgressForMessage(message[3].AsRealNode());
+                    // #2199 (P2-3): guard the progress read. A KNOWN handler whose message is shorter than
+                    // expected (a truncated/new-shape message from a future iOS) must not IndexOutOfRange
+                    // the whole backup — skip the progress update and let the handler run.
+                    if (message.Count > 3) {
+                        UpdateProgressForMessage(message[3].AsRealNode());
+                    }
                     break;
                 }
             }
 
-            await DeviceLinkHandlers[command](message, _internalCancellationTokenSource.Token).ConfigureAwait(false);
+            // #2199 (P2-3): the only command that reaches here with a null handler is ProcessMessage, whose
+            // switch case above always returns/throws first — every other command that passes the miss-guard
+            // has a non-null DeviceLinkHandlers entry. The null-forgiving is safe by that control flow.
+            await handler!(message, _internalCancellationTokenSource.Token).ConfigureAwait(false);
         }
         return ResultCode.Skipped;
     }
@@ -1458,6 +1533,20 @@ internal sealed class DeviceLinkService : IDisposable {
     /// </summary>
     internal static bool ShouldCompleteAfterFinished(bool finishedTimedOut, int messageCount) {
         return finishedTimedOut || messageCount == 0;
+    }
+
+    /// <summary>
+    /// ScribeHold fork (#2199 P2-3): the pure decision for the DlLoop dispatch guard — a command is
+    /// UNSUPPORTED (reply with an unsupported-operation status and continue, rather than dispatch) iff it
+    /// has no <c>DeviceLinkHandlers</c> entry AND is not <see cref="DeviceLinkMessage.ProcessMessage"/>.
+    /// ProcessMessage is the ONE known command deliberately absent from the handler dictionary — it is
+    /// handled entirely by the DlLoop switch (it detects a device-side error and completes the backup with
+    /// Success), so it must be treated as KNOWN here even though it has no handler. Without this exception a
+    /// backup's terminal completion message would be misclassified as unsupported and the loop would never
+    /// return Success. Pure + internal so the regression is pinned without a live socket.
+    /// </summary>
+    internal static bool IsUnsupportedDeviceLinkCommand(string command, bool hasHandler) {
+        return !hasHandler && command != DeviceLinkMessage.ProcessMessage;
     }
 
     /// <summary>

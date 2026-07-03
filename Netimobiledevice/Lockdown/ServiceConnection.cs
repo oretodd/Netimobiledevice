@@ -124,7 +124,28 @@ public class ServiceConnection : IDisposable {
     /// </summary>
     public TransportTimeoutPolicy TimeoutPolicy {
         get => _timeoutPolicy;
-        set => _timeoutPolicy = value ?? throw new ArgumentNullException(nameof(value));
+        set {
+            _timeoutPolicy = value ?? throw new ArgumentNullException(nameof(value));
+            // #2199 (P2-4): re-apply the keepalive budget from the NOW-ASSIGNED policy. The usbmux
+            // factories set keepalive at socket creation with the hard-coded UsbTight literal because the
+            // host policy is assigned only later (here) — so any host keepalive tuning silently did nothing
+            // (the same drift-trap species as the #1857/90s bug). Re-applying here makes the assigned
+            // policy's keepalive actually take effect. USB-only: a usbmux relay socket (MuxDevice != null)
+            // is the sole transport that had keepalive applied; TCP/WiFi never did, so it stays untouched.
+            if (MuxDevice != null) {
+                try {
+                    ApplyKeepAlive(_networkStream.Socket, _timeoutPolicy);
+                }
+                catch (SocketException ex) {
+                    // Best-effort: a socket that is mid-teardown may reject the option. Keepalive is a
+                    // reliability optimization, never a correctness requirement — never fatal to assign.
+                    _logger.LogDebug(ex, "Re-applying keepalive from the assigned policy failed (ignored) (#2199 P2-4)");
+                }
+                catch (ObjectDisposedException ex) {
+                    _logger.LogDebug(ex, "Re-applying keepalive on a disposed socket (ignored) (#2199 P2-4)");
+                }
+            }
+        }
     }
 
     private ServiceConnection(Socket sock, int timeout, ILogger logger, UsbmuxdDevice? muxDevice = null) {
@@ -325,7 +346,10 @@ public class ServiceConnection : IDisposable {
 
             int bytesRead;
             if (Stream.ReadTimeout != -1) {
-                CancellationTokenSource localTaskComplete = new CancellationTokenSource(Stream.ReadTimeout);
+                // #2199 (P2-4): dispose the per-read read-timeout CTS. Previously only the LINKED source was
+                // in a using — localTaskComplete leaked one Timer per read (one per ~64KB chunk on the bulk
+                // path), a slow drip of undisposed timers across a multi-GB backup.
+                using CancellationTokenSource localTaskComplete = new CancellationTokenSource(Stream.ReadTimeout);
                 CancellationTokenSource linkedCancellationTokenSource = CancellationTokenSource.CreateLinkedTokenSource(localTaskComplete.Token, cancellationToken);
                 using (linkedCancellationTokenSource) {
                     try {
