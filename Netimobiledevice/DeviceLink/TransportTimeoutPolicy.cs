@@ -86,6 +86,29 @@ public sealed class TransportTimeoutPolicy
     public int PreparingSilenceBoundSec { get; }
 
     /// <summary>
+    /// #2197 (P0-D): the bound in SECONDS applied to EACH pre-DlLoop version-exchange read — the
+    /// DLMessageVersionExchange read, the DLMessageDeviceReady read, and the mb2 <c>Hello</c> response
+    /// read. Before this bound existed the version exchange on a RESUMED session went straight to the
+    /// coarse ~10-minute stream read: a busy <c>backupd</c> that was still unwinding a cancelled diff
+    /// left the resume waiting the full 10 minutes and then dead-ending as fatal. USB uses a tight
+    /// (~35s) bound so a silent-but-busy backupd feeds reconnect-and-resume in seconds; WiFi keeps a
+    /// loose bound so its behavior is untouched. Only applied on USB (see the DlLoop transport gate).
+    /// </summary>
+    public int VersionExchangeBoundSec { get; }
+
+    /// <summary>
+    /// #2197 (P0-B): the HARD cap in SECONDS on TOTAL continuous <c>Preparing</c>-phase silence. When
+    /// the (generous) <see cref="PreparingSilenceBoundSec"/> trips during the pre-first-file window the
+    /// DlLoop no longer tears down blindly — it first runs a passive transport health check and, if the
+    /// transport is healthy (device still diffing), KEEPS WAITING and re-enters the bounded read. This
+    /// cap bounds how long that "healthy but silent" waiting may continue in aggregate before the loop
+    /// gives up and surfaces the bounded transport-drop signal, so a genuinely wedged Preparing window
+    /// can never hang forever even when the socket probe keeps reporting healthy. USB default is
+    /// generous (15+ min) to comfortably exceed a real on-device manifest diff; WiFi keeps it loose.
+    /// </summary>
+    public int PreparingHardCapSec { get; }
+
+    /// <summary>
     /// The keepalive budget in seconds implied by the keepalive settings
     /// (<c>Time + Interval * RetryCount</c>). Diagnostic/convenience; #1857 sized this to ~7 min on
     /// USB, kept under the DeviceLinkService bulk-read timeout.
@@ -103,6 +126,17 @@ public sealed class TransportTimeoutPolicy
     /// <see cref="DefaultPreparingSilenceBoundSec"/> so existing callers stay non-breaking and a
     /// standalone consumer never interrupts a normal multi-minute manifest diff.
     /// </param>
+    /// <param name="versionExchangeBoundSec">
+    /// #2197 (P0-D): the per-read bound on each pre-DlLoop version-exchange read (seconds). Defaults to
+    /// <see cref="DefaultVersionExchangeBoundSec"/> so existing callers stay non-breaking; the host
+    /// overrides it via <see cref="ForUsb(int, int, int, int, int)"/>.
+    /// </param>
+    /// <param name="preparingHardCapSec">
+    /// #2197 (P0-B): the hard cap on TOTAL continuous <c>Preparing</c> silence (seconds). Defaults to
+    /// <see cref="DefaultPreparingHardCapSec"/> so existing callers stay non-breaking. Must be >= the
+    /// generous <paramref name="preparingSilenceBoundSec"/> (the cap can never be tighter than a single
+    /// probe interval).
+    /// </param>
     public TransportTimeoutPolicy(
         int readTimeoutMs,
         int keepAliveTimeSec,
@@ -110,7 +144,9 @@ public sealed class TransportTimeoutPolicy
         int keepAliveRetryCount,
         int sslHandshakeWatchdogSec,
         int interMessageSilenceBoundSec,
-        int preparingSilenceBoundSec = DefaultPreparingSilenceBoundSec)
+        int preparingSilenceBoundSec = DefaultPreparingSilenceBoundSec,
+        int versionExchangeBoundSec = DefaultVersionExchangeBoundSec,
+        int preparingHardCapSec = DefaultPreparingHardCapSec)
     {
         if (readTimeoutMs != Timeout.Infinite && readTimeoutMs <= 0) {
             throw new ArgumentOutOfRangeException(nameof(readTimeoutMs), readTimeoutMs, "Read timeout must be positive or Timeout.Infinite.");
@@ -133,6 +169,12 @@ public sealed class TransportTimeoutPolicy
         if (preparingSilenceBoundSec <= 0) {
             throw new ArgumentOutOfRangeException(nameof(preparingSilenceBoundSec), preparingSilenceBoundSec, "Preparing silence bound must be positive.");
         }
+        if (versionExchangeBoundSec <= 0) {
+            throw new ArgumentOutOfRangeException(nameof(versionExchangeBoundSec), versionExchangeBoundSec, "Version-exchange bound must be positive.");
+        }
+        if (preparingHardCapSec < preparingSilenceBoundSec) {
+            throw new ArgumentOutOfRangeException(nameof(preparingHardCapSec), preparingHardCapSec, "Preparing hard cap must be >= the generous Preparing silence bound.");
+        }
 
         ReadTimeoutMs = readTimeoutMs;
         KeepAliveTimeSec = keepAliveTimeSec;
@@ -141,6 +183,8 @@ public sealed class TransportTimeoutPolicy
         SslHandshakeWatchdogSec = sslHandshakeWatchdogSec;
         InterMessageSilenceBoundSec = interMessageSilenceBoundSec;
         PreparingSilenceBoundSec = preparingSilenceBoundSec;
+        VersionExchangeBoundSec = versionExchangeBoundSec;
+        PreparingHardCapSec = preparingHardCapSec;
     }
 
     /// <summary>
@@ -152,6 +196,24 @@ public sealed class TransportTimeoutPolicy
     /// <see cref="ForUsb(int, int, int)"/>.
     /// </summary>
     public const int DefaultPreparingSilenceBoundSec = 4 * 60;
+
+    /// <summary>
+    /// #2197 (P0-D): the library-default per-read version-exchange bound in SECONDS (35s). Tight enough
+    /// that a resumed session hitting a busy-but-silent <c>backupd</c> feeds reconnect-and-resume in
+    /// seconds instead of waiting the coarse ~10-minute stream read and then dead-ending as fatal, yet
+    /// generous enough to absorb a healthy handshake's round-trips. The host overrides it via
+    /// <see cref="ForUsb(int, int, int, int, int)"/>.
+    /// </summary>
+    public const int DefaultVersionExchangeBoundSec = 35;
+
+    /// <summary>
+    /// #2197 (P0-B): the library-default Preparing hard cap in SECONDS (20 minutes). The hard cap floor
+    /// is 15 minutes; this default sits comfortably above a real on-device manifest diff (observed at
+    /// several minutes) so a healthy-but-silent Preparing window is never torn down for exceeding the
+    /// cap while the socket probe reports the transport healthy. The host overrides it via
+    /// <see cref="ForUsb(int, int, int, int, int)"/>.
+    /// </summary>
+    public const int DefaultPreparingHardCapSec = 20 * 60;
 
     /// <summary>
     /// The SSL-handshake watchdog bound as a <see cref="TimeSpan"/> for direct use with a
@@ -168,6 +230,16 @@ public sealed class TransportTimeoutPolicy
     /// #2193: the generous pre-first-file <c>Preparing</c>-phase silence bound as a <see cref="TimeSpan"/>.
     /// </summary>
     public TimeSpan PreparingSilenceBound => TimeSpan.FromSeconds(PreparingSilenceBoundSec);
+
+    /// <summary>
+    /// #2197 (P0-D): the per-read version-exchange bound as a <see cref="TimeSpan"/>.
+    /// </summary>
+    public TimeSpan VersionExchangeBound => TimeSpan.FromSeconds(VersionExchangeBoundSec);
+
+    /// <summary>
+    /// #2197 (P0-B): the total-continuous Preparing hard cap as a <see cref="TimeSpan"/>.
+    /// </summary>
+    public TimeSpan PreparingHardCap => TimeSpan.FromSeconds(PreparingHardCapSec);
 
     /// <summary>
     /// USB (usbmux) transport policy -- the reliability-critical, fail-fast-into-recovery path and the
@@ -188,7 +260,13 @@ public sealed class TransportTimeoutPolicy
         interMessageSilenceBoundSec: 45,
         // #2193: the tight 45s inter-message bound governs ONLY the in-transfer phase; a healthy
         // Preparing diff is silent for minutes, so it uses the generous library-default Preparing bound.
-        preparingSilenceBoundSec: DefaultPreparingSilenceBoundSec);
+        preparingSilenceBoundSec: DefaultPreparingSilenceBoundSec,
+        // #2197 (P0-D): a tight per-read version-exchange bound so a resumed session hitting a busy
+        // backupd feeds reconnect in seconds, not the coarse ~10-minute read.
+        versionExchangeBoundSec: DefaultVersionExchangeBoundSec,
+        // #2197 (P0-B): a generous hard cap on TOTAL continuous Preparing silence (the probe-and-wait
+        // loop's last-resort bound), comfortably above a real on-device manifest diff.
+        preparingHardCapSec: DefaultPreparingHardCapSec);
 
     /// <summary>
     /// WiFi (lockdown/TCP) transport policy -- LOOSE, preserving existing behavior. Every bound is
@@ -207,7 +285,12 @@ public sealed class TransportTimeoutPolicy
         // #2193: WiFi keeps a single loose bound — the Preparing bound matches its loose inter-message
         // bound so a WiFi Preparing window is never tightened. (The DlLoop applies the inter-message
         // bound only on USB anyway; this keeps the value object internally consistent.)
-        preparingSilenceBoundSec: 10 * 60);
+        preparingSilenceBoundSec: 10 * 60,
+        // #2197: WiFi keeps loose version-exchange / Preparing-hard-cap values so its behavior is
+        // untouched (these new bounds are applied only on USB anyway). The hard cap equals the loose
+        // Preparing bound to satisfy the cap >= bound invariant.
+        versionExchangeBoundSec: 10 * 60,
+        preparingHardCapSec: 10 * 60);
 
     /// <summary>
     /// ScribeHold fork (#2190): build the USB-tight policy the host drives from
@@ -225,10 +308,23 @@ public sealed class TransportTimeoutPolicy
     /// <see cref="DefaultPreparingSilenceBoundSec"/> so a caller that has not adopted the third key
     /// keeps the safe generous library default.
     /// </param>
+    /// <param name="versionExchangeBoundSec">
+    /// #2197 (P0-D): the per-read version-exchange bound (seconds); from
+    /// <c>BackupConfiguration.UsbVersionExchangeBoundSec</c>. Defaults to
+    /// <see cref="DefaultVersionExchangeBoundSec"/> so a caller that has not adopted the key keeps the
+    /// tight library default.
+    /// </param>
+    /// <param name="preparingHardCapSec">
+    /// #2197 (P0-B): the hard cap on total continuous Preparing silence (seconds); from
+    /// <c>BackupConfiguration.UsbPreparingHardCapSec</c>. Defaults to
+    /// <see cref="DefaultPreparingHardCapSec"/>. Must be >= <paramref name="preparingSilenceBoundSec"/>.
+    /// </param>
     public static TransportTimeoutPolicy ForUsb(
         int sslHandshakeWatchdogSec,
         int interMessageSilenceBoundSec,
-        int preparingSilenceBoundSec = DefaultPreparingSilenceBoundSec)
+        int preparingSilenceBoundSec = DefaultPreparingSilenceBoundSec,
+        int versionExchangeBoundSec = DefaultVersionExchangeBoundSec,
+        int preparingHardCapSec = DefaultPreparingHardCapSec)
     {
         return new TransportTimeoutPolicy(
             readTimeoutMs: UsbTight.ReadTimeoutMs,
@@ -237,7 +333,9 @@ public sealed class TransportTimeoutPolicy
             keepAliveRetryCount: UsbTight.KeepAliveRetryCount,
             sslHandshakeWatchdogSec: sslHandshakeWatchdogSec,
             interMessageSilenceBoundSec: interMessageSilenceBoundSec,
-            preparingSilenceBoundSec: preparingSilenceBoundSec);
+            preparingSilenceBoundSec: preparingSilenceBoundSec,
+            versionExchangeBoundSec: versionExchangeBoundSec,
+            preparingHardCapSec: preparingHardCapSec);
     }
 
     /// <summary>

@@ -199,6 +199,77 @@ public class TransportTimeoutPolicyTests
             sslHandshakeWatchdogSec: 60, interMessageSilenceBoundSec: 30, preparingSilenceBoundSec: 0));
     }
 
+    // ── #2197 (P0-D/P0-B): the version-exchange bound and the Preparing hard cap ────────────────────
+
+    [TestMethod]
+    [Description("#2197 (P0-D): the USB-tight version-exchange bound is a tight seconds-scale value (35s) " +
+                 "— far below the coarse ~10-minute stream read a busy backupd used to wedge on — while " +
+                 "WiFi keeps a loose bound so its behavior is untouched.")]
+    public void VersionExchangeBound_UsbTight_WiFiLoose()
+    {
+        TransportTimeoutPolicy usb = TransportTimeoutPolicy.UsbTight;
+        TransportTimeoutPolicy wifi = TransportTimeoutPolicy.WiFiLoose;
+
+        Assert.AreEqual(TransportTimeoutPolicy.DefaultVersionExchangeBoundSec, usb.VersionExchangeBoundSec);
+        Assert.AreEqual(35, usb.VersionExchangeBoundSec, "The USB version-exchange bound is ~35s.");
+        Assert.IsTrue(usb.VersionExchangeBoundSec < usb.ReadTimeoutMs / 1000,
+            "The version-exchange bound must be far tighter than the bulk-read timeout so a busy backupd feeds reconnect fast.");
+        Assert.IsTrue(usb.VersionExchangeBoundSec < wifi.VersionExchangeBoundSec,
+            "USB must be strictly tighter than WiFi's loose version-exchange bound.");
+        Assert.AreEqual(TimeSpan.FromSeconds(usb.VersionExchangeBoundSec), usb.VersionExchangeBound,
+            "The TimeSpan accessor matches the seconds value.");
+    }
+
+    [TestMethod]
+    [Description("#2197 (P0-B): the USB Preparing hard cap floors at 15 min and the library default (20 min) " +
+                 "sits comfortably above a real on-device manifest diff, and is >= the generous Preparing bound.")]
+    public void PreparingHardCap_UsbTight_IsGenerousAndAboveTheFloor()
+    {
+        TransportTimeoutPolicy usb = TransportTimeoutPolicy.UsbTight;
+
+        Assert.AreEqual(TransportTimeoutPolicy.DefaultPreparingHardCapSec, usb.PreparingHardCapSec);
+        Assert.AreEqual(20 * 60, usb.PreparingHardCapSec, "The library-default Preparing hard cap is 20 minutes.");
+        Assert.IsTrue(usb.PreparingHardCapSec >= 15 * 60, "The Preparing hard cap must floor at 15 minutes.");
+        Assert.IsTrue(usb.PreparingHardCapSec >= usb.PreparingSilenceBoundSec,
+            "The hard cap must be >= the generous Preparing silence bound (a single probe interval).");
+        Assert.AreEqual(TimeSpan.FromSeconds(usb.PreparingHardCapSec), usb.PreparingHardCap,
+            "The TimeSpan accessor matches the seconds value.");
+    }
+
+    [TestMethod]
+    [Description("#2197: ForUsb overrides the version-exchange bound and the Preparing hard cap from the " +
+                 "host config alongside the existing bounds; omitting them keeps the library defaults.")]
+    public void ForUsb_OverridesVersionExchangeAndHardCap_FromHostConfig()
+    {
+        TransportTimeoutPolicy overridden = TransportTimeoutPolicy.ForUsb(
+            sslHandshakeWatchdogSec: 60, interMessageSilenceBoundSec: 30, preparingSilenceBoundSec: 240,
+            versionExchangeBoundSec: 45, preparingHardCapSec: 1200);
+        Assert.AreEqual(45, overridden.VersionExchangeBoundSec, "The version-exchange bound must come from the host config.");
+        Assert.AreEqual(1200, overridden.PreparingHardCapSec, "The Preparing hard cap must come from the host config.");
+
+        TransportTimeoutPolicy defaults = TransportTimeoutPolicy.ForUsb(
+            sslHandshakeWatchdogSec: 60, interMessageSilenceBoundSec: 30);
+        Assert.AreEqual(TransportTimeoutPolicy.DefaultVersionExchangeBoundSec, defaults.VersionExchangeBoundSec,
+            "Omitting the version-exchange arg keeps the tight library default.");
+        Assert.AreEqual(TransportTimeoutPolicy.DefaultPreparingHardCapSec, defaults.PreparingHardCapSec,
+            "Omitting the hard-cap arg keeps the generous library default.");
+    }
+
+    [TestMethod]
+    [Description("#2197: the constructor rejects a non-positive version-exchange bound, and rejects a " +
+                 "Preparing hard cap that is tighter than the generous Preparing bound (the cap can never " +
+                 "be smaller than a single probe interval).")]
+    public void Constructor_RejectsInvalidNewBounds()
+    {
+        Assert.ThrowsExactly<ArgumentOutOfRangeException>(() => Build(versionExchangeBoundSec: 0));
+        Assert.ThrowsExactly<ArgumentOutOfRangeException>(() => Build(versionExchangeBoundSec: -5));
+        // Hard cap < Preparing bound is rejected.
+        Assert.ThrowsExactly<ArgumentOutOfRangeException>(() => Build(preparingSilenceBoundSec: 240, preparingHardCapSec: 100));
+        // Equal is allowed (a single-interval cap).
+        TransportTimeoutPolicy equal = Build(preparingSilenceBoundSec: 240, preparingHardCapSec: 240);
+        Assert.AreEqual(240, equal.PreparingHardCapSec);
+    }
+
     private static TransportTimeoutPolicy Build(
         int readTimeoutMs = 600_000,
         int keepAliveTimeSec = 120,
@@ -206,7 +277,9 @@ public class TransportTimeoutPolicyTests
         int keepAliveRetryCount = 10,
         int sslHandshakeWatchdogSec = 60,
         int interMessageSilenceBoundSec = 45,
-        int preparingSilenceBoundSec = 240)
+        int preparingSilenceBoundSec = 240,
+        int versionExchangeBoundSec = 35,
+        int preparingHardCapSec = 1200)
     {
         return new TransportTimeoutPolicy(
             readTimeoutMs,
@@ -215,6 +288,8 @@ public class TransportTimeoutPolicyTests
             keepAliveRetryCount,
             sslHandshakeWatchdogSec,
             interMessageSilenceBoundSec,
-            preparingSilenceBoundSec);
+            preparingSilenceBoundSec,
+            versionExchangeBoundSec,
+            preparingHardCapSec);
     }
 }

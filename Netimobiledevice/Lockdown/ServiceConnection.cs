@@ -69,6 +69,43 @@ public class ServiceConnection : IDisposable {
         }
     }
 
+    /// <summary>
+    /// ScribeHold fork (#2197, P0-B): a passive, non-destructive transport health check. Returns
+    /// <c>true</c> when the peer looks alive and <c>false</c> when the socket is a dead peer (a readable
+    /// socket with zero bytes available is a received FIN/EOF; a socket error condition is an RST). Used
+    /// when the generous <c>Preparing</c> silence bound trips: if the transport is healthy the device is
+    /// still building its on-device manifest diff, so the DlLoop keeps waiting instead of tearing the
+    /// session down. This reads NO application bytes — it only polls socket state — so it can never
+    /// disturb the in-flight protocol. Best-effort and exception-safe: on any probe error it reports
+    /// unhealthy (fail-safe toward teardown) rather than throwing into the loop.
+    /// </summary>
+    /// <returns><c>true</c> if the transport looks healthy; <c>false</c> if it is a dead peer.</returns>
+    public bool IsTransportHealthy() {
+        try {
+            Socket socket = _networkStream.Socket;
+            if (!socket.Connected) {
+                return false;
+            }
+            // A received RST surfaces as an error condition.
+            if (socket.Poll(0, SelectMode.SelectError)) {
+                return false;
+            }
+            // Readable with nothing available, when no read is outstanding, is a peer FIN/EOF (dead peer).
+            // Readable WITH bytes available, or not-readable, are both healthy (data pending, or simply
+            // quiet while the device diffs). We treat only the readable-with-zero-available case as dead.
+            if (socket.Poll(0, SelectMode.SelectRead) && socket.Available == 0) {
+                return false;
+            }
+            return true;
+        }
+        catch (ObjectDisposedException) {
+            return false;
+        }
+        catch (SocketException) {
+            return false;
+        }
+    }
+
     public Stream Stream => _sslStream != null ? _sslStream : _networkStream;
 
     /// <summary>
@@ -175,12 +212,51 @@ public class ServiceConnection : IDisposable {
     }
 
     public void Close() {
-        Stream.Close();
+        // ScribeHold fork (#2197, P0-C): a REAL socket close so the device gets a deterministic TCP FIN.
+        // The SslStream was constructed with leaveInnerStreamOpen:true, so disposing IT alone never closes
+        // the socket-owning _networkStream — the prior `Stream.Close()` left the socket half-open (no FIN),
+        // and the device got no release signal. Now we: (1) best-effort TLS close_notify (SslStream
+        // .ShutdownAsync) under a short ~2s bound so a wedged peer can't hang the close, (2) dispose the
+        // SslStream, then (3) dispose _networkStream — which OWNS the socket, so the FIN is deterministic.
+        // Each step is independently guarded so one failure never skips the socket close.
+        try {
+            ShutdownSslBestEffort();
+        }
+        finally {
+            try {
+                _sslStream?.Dispose();
+            }
+            catch (Exception ex) {
+                _logger.LogDebug(ex, "ServiceConnection.Close: SslStream dispose threw (ignored)");
+            }
+            _networkStream.Dispose();
+        }
+    }
+
+    /// <summary>
+    /// ScribeHold fork (#2197, P0-C): best-effort TLS <c>close_notify</c> before we tear the socket down,
+    /// so a well-behaved peer sees a graceful application-layer close rather than only a bare FIN. Bounded
+    /// to ~2s so a wedged/silent peer can never hang the teardown, and fully exception-safe — a failed or
+    /// timed-out shutdown must never prevent the socket close that follows.
+    /// </summary>
+    private void ShutdownSslBestEffort() {
+        SslStream? ssl = _sslStream;
+        if (ssl == null) {
+            return;
+        }
+        try {
+            using CancellationTokenSource shutdownCts = new CancellationTokenSource(TimeSpan.FromSeconds(2));
+            ssl.ShutdownAsync().WaitAsync(shutdownCts.Token).GetAwaiter().GetResult();
+        }
+        catch (Exception ex) {
+            // A wedged/closed peer, a timeout, or an already-disposed stream — all expected here; the
+            // socket close in Close() is what actually releases the device.
+            _logger.LogDebug(ex, "ServiceConnection.Close: SSL close_notify shutdown did not complete cleanly (ignored)");
+        }
     }
 
     public void Dispose() {
         Close();
-        Stream.Dispose();
         GC.SuppressFinalize(this);
     }
 
