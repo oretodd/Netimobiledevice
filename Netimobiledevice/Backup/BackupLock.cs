@@ -17,11 +17,33 @@ internal sealed class BackupLock(AfcService afc, NotificationProxyService np) : 
 
     public void Dispose()
     {
-        Task.Run(async () => {
-            await _afc.Lock(_syncLockFileHandle, AfcLockModes.Unlock, CancellationToken.None).ConfigureAwait(false);
-            await _afc.FileClose(_syncLockFileHandle, CancellationToken.None).ConfigureAwait(false);
-        }).GetAwaiter().GetResult();
-        _np.Post(SendableNotificaton.SyncDidFinish);
+        // #2199 (P2-2): bound the whole unlock/close/post teardown with a 5s CTS and swallow on timeout.
+        // The prior sequence ran AFC Unlock + FileClose via sync-over-async on CancellationToken.None —
+        // each op waited its OWN read timeout against a possibly-dead socket, so a wedged device stalled
+        // Dispose (and the resume behind it) for minutes. The device invalidates the sync lock itself when
+        // the connection drops, so on a timeout we can safely stop waiting; still post SyncDidFinish so a
+        // live device that IS reachable gets the release signal.
+        using CancellationTokenSource cts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+        try {
+            Task.Run(async () => {
+                await _afc.Lock(_syncLockFileHandle, AfcLockModes.Unlock, cts.Token).ConfigureAwait(false);
+                await _afc.FileClose(_syncLockFileHandle, cts.Token).ConfigureAwait(false);
+            }, cts.Token).GetAwaiter().GetResult();
+        }
+        catch (OperationCanceledException) {
+            // The 5s teardown bound elapsed against a wedged/dead socket — stop waiting. iOS invalidates
+            // the sync lock on the connection drop, so the on-device lock is released regardless.
+        }
+        catch (Exception) {
+            // Any other AFC/transport failure during best-effort teardown is non-fatal — the socket close
+            // releases the transport and iOS drops the lock on disconnect.
+        }
+        try {
+            _np.Post(SendableNotificaton.SyncDidFinish);
+        }
+        catch (Exception) {
+            // Best-effort notification on a possibly-dead notification-proxy socket; never fatal on teardown.
+        }
     }
 
     public async Task AquireBackupLock(CancellationToken cancellationToken)

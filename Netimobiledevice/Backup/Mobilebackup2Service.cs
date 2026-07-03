@@ -404,6 +404,14 @@ public sealed class Mobilebackup2Service(
     /// <param name="ignoreTransferErrors">Whether to skip over any transfer errors</param>
     /// <param name="performBackupSizeCheck">Whether to check that the size of the backup will fit onto this device</param>
     /// <param name="backupDirectory">Directory to write backup to</param>
+    /// <param name="isResume">
+    /// ScribeHold fork (#2199 P2-1): true when this call CONTINUES a snapshot the device is still holding
+    /// (the host coordinator's <c>RunBackupWithDeviceLockResumeAsync(isResume:true)</c> path). On a resume
+    /// the device does not need a freshly rebuilt Info.plist for the snapshot it is already mid-transfer on,
+    /// so when a valid Info.plist already exists on disk we REUSE it and skip the full instproxy Browse +
+    /// per-app SpringBoard icon fetch + iTunes AFC reads that <see cref="CreateInfoPlist"/> runs — several
+    /// seconds of wasted latency on every resume attempt while the device waits.
+    /// </param>
     /// <param name="cancellationToken"></param>
     /// <returns></returns>
     public async Task<ResultCode> Backup(
@@ -411,6 +419,7 @@ public sealed class Mobilebackup2Service(
         bool ignoreTransferErrors = true,
         bool performBackupSizeCheck = true,
         string backupDirectory = ".",
+        bool isResume = false,
         CancellationToken cancellationToken = default
     ) {
         _internalCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
@@ -451,12 +460,28 @@ public sealed class Mobilebackup2Service(
                         await backupLock.AquireBackupLock(_internalCts.Token).ConfigureAwait(false);
 
                         // Create Info.plist
+                        // #2199 (P2-1): on a RESUME with a valid Info.plist already on disk, reuse it and
+                        // skip CreateInfoPlist's full instproxy Browse + per-app SpringBoard icon fetch +
+                        // iTunes AFC reads — the device is mid-transfer on a snapshot it already accepted and
+                        // does not need a freshly rebuilt manifest. First-attempt (or a missing/torn file)
+                        // still rebuilds.
                         string infoPlistPath = Path.Combine(deviceDirectory, "Info.plist");
-                        DictionaryNode infoPlist = await CreateInfoPlist(afc, _internalCts.Token).ConfigureAwait(false);
-                        using (FileStream fs = File.OpenWrite(infoPlistPath)) {
-                            byte[] infoPlistData = PropertyList.SaveAsByteArray(infoPlist, PlistFormat.Xml);
-                            await fs.WriteAsync(infoPlistData, _internalCts.Token).ConfigureAwait(false);
-                            FileReceived?.Invoke(this, new BackupFileEventArgs(new BackupFile(string.Empty, infoPlistPath, deviceDirectory)));
+                        if (isResume && IsInfoPlistValid(infoPlistPath)) {
+                            Logger.LogInformation(
+                                "Resume with a valid Info.plist at {InfoPlistPath} — reusing it and skipping the full CreateInfoPlist rebuild (instproxy Browse + icon fetch + AFC reads) (#2199 P2-1)",
+                                infoPlistPath);
+                        }
+                        else {
+                            DictionaryNode infoPlist = await CreateInfoPlist(afc, _internalCts.Token).ConfigureAwait(false);
+                            // #2199 (P2-1): FileMode.Create TRUNCATES. The prior File.OpenWrite is
+                            // FileMode.OpenOrCreate WITHOUT truncation — when the new plist is shorter than the
+                            // last one (e.g. an app was uninstalled) the stale tail bytes after </plist>
+                            // survived, handing the device a malformed plist. Truncate-on-open fixes it.
+                            using (FileStream fs = new FileStream(infoPlistPath, FileMode.Create, FileAccess.Write)) {
+                                byte[] infoPlistData = PropertyList.SaveAsByteArray(infoPlist, PlistFormat.Xml);
+                                await fs.WriteAsync(infoPlistData, _internalCts.Token).ConfigureAwait(false);
+                                FileReceived?.Invoke(this, new BackupFileEventArgs(new BackupFile(string.Empty, infoPlistPath, deviceDirectory)));
+                            }
                         }
 
                         // Create Manifest.plist if doesn't exist.
@@ -642,6 +667,30 @@ public sealed class Mobilebackup2Service(
         }
         catch (Exception ex) {
             Logger.LogDebug(ex, "Status.plist at {StatusPath} failed to parse (#2198 P1-3)", statusPlistPath);
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// #2199 (P2-1): true when the Info.plist at <paramref name="infoPlistPath"/> exists, is non-empty
+    /// and parses as a well-formed plist dictionary. A resume reuses such a file rather than rebuilding
+    /// it; a missing, empty or torn/truncated file (e.g. a stale tail left by the pre-truncation
+    /// File.OpenWrite) returns false so the caller rebuilds a clean one.
+    /// </summary>
+    private bool IsInfoPlistValid(string infoPlistPath) {
+        try {
+            if (!File.Exists(infoPlistPath)) {
+                return false;
+            }
+            byte[] bytes = File.ReadAllBytes(infoPlistPath);
+            if (bytes.Length == 0) {
+                return false;
+            }
+            _ = PropertyList.LoadFromByteArray(bytes).AsDictionaryNode();
+            return true;
+        }
+        catch (Exception ex) {
+            Logger.LogDebug(ex, "Info.plist at {InfoPlistPath} failed validity check (#2199 P2-1)", infoPlistPath);
             return false;
         }
     }
