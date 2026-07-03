@@ -160,6 +160,27 @@ public sealed class TransportTimeoutPolicy
         interMessageSilenceBoundSec: 10 * 60);
 
     /// <summary>
+    /// ScribeHold fork (#2190): build the USB-tight policy the host drives from
+    /// <c>BackupConfiguration</c>. Keeps the #1857 keepalive budget and the DeviceLinkService-matched
+    /// bulk-read timeout from <see cref="UsbTight"/> (neither is a host-tunable key), and overrides ONLY
+    /// the two config-driven bounds — the SSL-handshake watchdog and the DlLoop inter-message silence
+    /// bound — so the Task-3 keys <c>SslHandshakeWatchdogSec</c> and <c>UsbInterMessageSilenceBoundSec</c>
+    /// actually take effect on every USB connection instead of the hard-coded default.
+    /// </summary>
+    /// <param name="sslHandshakeWatchdogSec">SSL-handshake watchdog bound (seconds); from <c>BackupConfiguration.SslHandshakeWatchdogSec</c>.</param>
+    /// <param name="interMessageSilenceBoundSec">DlLoop inter-message silence bound (seconds); from <c>BackupConfiguration.UsbInterMessageSilenceBoundSec</c>.</param>
+    public static TransportTimeoutPolicy ForUsb(int sslHandshakeWatchdogSec, int interMessageSilenceBoundSec)
+    {
+        return new TransportTimeoutPolicy(
+            readTimeoutMs: UsbTight.ReadTimeoutMs,
+            keepAliveTimeSec: UsbTight.KeepAliveTimeSec,
+            keepAliveIntervalSec: UsbTight.KeepAliveIntervalSec,
+            keepAliveRetryCount: UsbTight.KeepAliveRetryCount,
+            sslHandshakeWatchdogSec: sslHandshakeWatchdogSec,
+            interMessageSilenceBoundSec: interMessageSilenceBoundSec);
+    }
+
+    /// <summary>
     /// True when EVERY bound in this policy is strictly tighter than (or, for the keepalive budget that
     /// #1857 pins on both transports, equal to) <paramref name="other"/>. The transport-split invariant
     /// asserts <c>UsbTight.IsTighterThan(WiFiLoose)</c>: USB read-timeout/handshake-watchdog/

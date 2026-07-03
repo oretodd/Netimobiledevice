@@ -101,8 +101,11 @@ internal sealed class DeviceLinkService : IDisposable {
     // if (!IsCancellationRequested) { send } guards.
     private readonly DeviceLinkResponseGuarantees _responseGuarantees;
 
-    // ScribeHold fork (#2181): the active USB inter-message silence bound. USB-tight library default;
-    // overridable by the host from BackupConfiguration.UsbInterMessageSilenceBoundSec (Task 3).
+    // ScribeHold fork (#2181/#2190): the active USB inter-message silence bound the DlLoop applies.
+    // Seeded in the ctor from the connection's TransportTimeoutPolicy so the value the host derived
+    // from BackupConfiguration.UsbInterMessageSilenceBoundSec (assigned onto the ServiceConnection by
+    // LockdownClient, #2190) flows down through the SAME single policy that carries the SSL-handshake
+    // watchdog — no separate host call. SetUsbInterMessageSilenceBound remains an explicit override.
     private TimeSpan _usbInterMessageSilenceBound = DefaultUsbInterMessageSilenceBound;
 
     /// <summary>
@@ -169,6 +172,12 @@ internal sealed class DeviceLinkService : IDisposable {
         _ignoreTransferErrors = ignoreTransferErrors;
         _performBackupSizeCheck = performBackupSizeCheck;
         _logger = logger ?? NullLogger.Instance;
+
+        // #2190: seed the DlLoop inter-message silence bound from the connection's transport policy so
+        // the host-configured UsbInterMessageSilenceBoundSec (carried on the ServiceConnection via
+        // LockdownClient.TimeoutPolicy) takes effect. Falls back to the USB-tight policy default when
+        // the host has not overridden the policy. Only applied when the transport is USB (IsUsbTransport).
+        _usbInterMessageSilenceBound = service.TimeoutPolicy.InterMessageSilenceBound;
 
         _internalCancellationTokenSource = new CancellationTokenSource();
 

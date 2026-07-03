@@ -471,50 +471,6 @@ public sealed class Mobilebackup2Service(
         }
     }
 
-    /// <summary>
-    /// ScribeHold fork (#2182): the mb2 half of the SESSION-PRESERVING RECONNECT SEAM. On a transient
-    /// transport drop (a USB socket error 10053/10054/10060, or the tripped SSL-handshake watchdog /
-    /// DlLoop inter-message bound), swap the underlying socket BENEATH the preserved
-    /// <see cref="LockdownService.Service"/> ServiceConnection WITHOUT recreating THIS
-    /// Mobilebackup2Service or its mb2 session state.
-    ///
-    /// Because this same instance survives, the once-per-session passcode binding
-    /// (<see cref="NotificationProxy_ReceivedNotification"/> latching <c>_passcodeRequired</c> on
-    /// <c>LocalAuthenticationUiPresented</c>) is NOT re-triggered — the passcode grant survives the
-    /// hiccup and Task 4's USB resume can continue with NO second passcode prompt. The seam obtains a
-    /// fresh, fully-established ServiceConnection from the lockdown provider (which owns StartService +
-    /// SSL), then delegates the transport transplant to
-    /// <see cref="ServiceConnection.AdoptTransportFrom"/>. It does NOT tear down or recreate the mb2
-    /// session object; when the socket cannot be swapped, Task 4's grace window is the fallback for an
-    /// unavoidable fresh session.
-    /// </summary>
-    /// <param name="cancellationToken">Cancels the establishment of the fresh transport.</param>
-    public async Task ReconnectUnderlyingTransportAsync(CancellationToken cancellationToken = default) {
-        cancellationToken.ThrowIfCancellationRequested();
-
-        // The lockdown provider owns the StartService + SSL handshake for a fresh connection to the
-        // SAME service; useEscrowBag mirrors how this mb2 service was started.
-        ServiceConnection fresh = await Lockdown
-            .StartLockdownServiceAsync(ServiceName, useEscrowBag: true)
-            .ConfigureAwait(false);
-        try {
-            // Transplant the fresh socket/SSL stream beneath the preserved Service instance. After
-            // this returns, Service is the SAME object it was before — only its transport changed.
-            Service.AdoptTransportFrom(fresh);
-        }
-        catch {
-            // The swap did not take: dispose the fresh connection we established so we don't leak the
-            // socket, then let the caller (coordinator) fall back to a fresh-session path.
-            try {
-                fresh.Dispose();
-            }
-            catch {
-                // Ignore teardown faults on the discarded fresh connection.
-            }
-            throw;
-        }
-    }
-
     private void NotificationProxy_ReceivedNotification(object? sender, ReceivedNotificationEventArgs e) {
         if (e.Event == ReceivableNotification.LocalAuthenticationUiPresented) {
             // iOS versions 15.7.1 and anything 16.1 or newer will require you to input a passcode before
