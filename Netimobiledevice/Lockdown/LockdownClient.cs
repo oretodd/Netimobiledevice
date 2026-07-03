@@ -1,5 +1,6 @@
 ﻿using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
+using Netimobiledevice.DeviceLink;
 using Netimobiledevice.Lockdown.Pairing;
 using Netimobiledevice.NotificationProxy;
 using Netimobiledevice.Plist;
@@ -51,6 +52,19 @@ public abstract class LockdownClient : LockdownServiceProvider, IDisposable {
     /// pair record was already proven valid.
     /// </summary>
     public bool PairRecordValidated { get; private set; }
+
+    /// <summary>
+    /// ScribeHold fork (#2182/#2190): the transport-timeout policy applied to every
+    /// <see cref="ServiceConnection"/> this client starts (via
+    /// <see cref="StartLockdownService(string, bool, bool)"/> /
+    /// <see cref="StartLockdownServiceAsync(string, bool, bool)"/>), BEFORE its SSL handshake — so the
+    /// policy's SSL-handshake watchdog and keepalive budget take effect on that connection. Defaults to
+    /// <see cref="TransportTimeoutPolicy.UsbTight"/> so a standalone submodule consumer is safe; the
+    /// hosting ScribeHold.Service assigns a policy derived from <c>BackupConfiguration</c> (Task 3) —
+    /// USB-tight or WiFi-loose per the resolved transport — so the config keys actually flow down
+    /// instead of every connection running the hard-coded default (#2190).
+    /// </summary>
+    public TransportTimeoutPolicy TimeoutPolicy { get; set; } = TransportTimeoutPolicy.UsbTight;
 
     protected readonly DirectoryInfo? _pairingRecordsCacheDirectory;
     /// <summary>
@@ -677,6 +691,10 @@ public abstract class LockdownClient : LockdownServiceProvider, IDisposable {
         DictionaryNode attr = GetServiceConnectionAttributes(name, useEscrowBag, useTrustedConnection).AsDictionaryNode();
         LogStartServiceResponse(name, useEscrowBag, attr);
         ServiceConnection serviceConnection = CreateServiceConnection((ushort) attr["Port"].AsIntegerNode().Value);
+        // #2190: apply the host-assigned transport-timeout policy BEFORE the SSL handshake so the
+        // policy's SSL-handshake watchdog and keepalive budget bound this connection (the watchdog is
+        // read during StartSsl). Defaults to UsbTight when the host has not overridden it.
+        serviceConnection.TimeoutPolicy = TimeoutPolicy;
 
         if (attr.TryGetValue("EnableServiceSSL", out PropertyNode? enableServiceSsl) && enableServiceSsl?.AsBooleanNode().Value == true) {
             if (_pairRecord == null) {
@@ -698,6 +716,10 @@ public abstract class LockdownClient : LockdownServiceProvider, IDisposable {
         DictionaryNode attr = GetServiceConnectionAttributes(name, useEscrowBag, useTrustedConnection).AsDictionaryNode();
         LogStartServiceResponse(name, useEscrowBag, attr);
         ServiceConnection serviceConnection = await CreateServiceConnectionAsync((ushort) attr["Port"].AsIntegerNode().Value).ConfigureAwait(false);
+        // #2190: apply the host-assigned transport-timeout policy BEFORE the SSL handshake so the
+        // policy's SSL-handshake watchdog and keepalive budget bound this connection (the watchdog is
+        // read during StartSslAsync). Defaults to UsbTight when the host has not overridden it.
+        serviceConnection.TimeoutPolicy = TimeoutPolicy;
 
         if (attr.TryGetValue("EnableServiceSSL", out PropertyNode? enableServiceSsl) && enableServiceSsl?.AsBooleanNode().Value == true) {
             if (_pairRecord == null) {

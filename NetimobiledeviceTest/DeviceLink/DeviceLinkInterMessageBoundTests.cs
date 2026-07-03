@@ -1,6 +1,10 @@
 using System.Diagnostics;
+using System.Net;
+using System.Net.Sockets;
+using System.Reflection;
 using Microsoft.Extensions.Logging.Abstractions;
 using Netimobiledevice.DeviceLink;
+using Netimobiledevice.Lockdown;
 using Netimobiledevice.Plist;
 
 namespace NetimobiledeviceTest.DeviceLink;
@@ -180,5 +184,94 @@ public class DeviceLinkInterMessageBoundTests
             isUsbTransport: true, bound, read, NullLogger.Instance, CancellationToken.None);
 
         Assert.AreSame(expected, actual, "A message that arrives within the bound must be returned unchanged.");
+    }
+
+    // ── #2190: the DlLoop bound is SEEDED from the connection's transport policy ───────────────────
+
+    [TestMethod]
+    [Description("#2190: DeviceLinkService seeds its inter-message silence bound from the connection's " +
+                 "TransportTimeoutPolicy, so the host-configured UsbInterMessageSilenceBoundSec (carried " +
+                 "on the ServiceConnection via LockdownClient.TimeoutPolicy) flows down without a separate " +
+                 "SetUsbInterMessageSilenceBound call.")]
+    public void Ctor_SeedsInterMessageBoundFromConnectionPolicy()
+    {
+        using SocketPair pair = SocketPair.CreateConnected();
+        ServiceConnection connection = CreateServiceConnection(pair.Client, timeout: 5000);
+        // Host-configured policy: an inter-message bound distinct from the UsbTight default (45s).
+        connection.TimeoutPolicy = TransportTimeoutPolicy.ForUsb(sslHandshakeWatchdogSec: 60, interMessageSilenceBoundSec: 17);
+
+        using var dl = new DeviceLinkService(connection, backupDirectory: string.Empty, iosVersion: new Version(17, 0),
+            logger: NullLogger.Instance);
+
+        TimeSpan seeded = ReadBoundField(dl);
+        Assert.AreEqual(TimeSpan.FromSeconds(17), seeded,
+            "The DlLoop inter-message bound must be seeded from the connection's policy so the host config value takes effect.");
+    }
+
+    [TestMethod]
+    [Description("#2190: with the default (UsbTight) policy, the seeded bound is the USB-tight default — " +
+                 "a standalone consumer that never overrides the policy still gets a safe bound.")]
+    public void Ctor_DefaultPolicy_SeedsUsbTightBound()
+    {
+        using SocketPair pair = SocketPair.CreateConnected();
+        ServiceConnection connection = CreateServiceConnection(pair.Client, timeout: 5000);
+        // No policy override → the ServiceConnection default is TransportTimeoutPolicy.UsbTight.
+
+        using var dl = new DeviceLinkService(connection, backupDirectory: string.Empty, iosVersion: new Version(17, 0),
+            logger: NullLogger.Instance);
+
+        TimeSpan seeded = ReadBoundField(dl);
+        Assert.AreEqual(TransportTimeoutPolicy.UsbTight.InterMessageSilenceBound, seeded,
+            "With the default policy the seeded bound must equal the UsbTight inter-message bound.");
+    }
+
+    private static TimeSpan ReadBoundField(DeviceLinkService dl)
+    {
+        FieldInfo field = typeof(DeviceLinkService).GetField("_usbInterMessageSilenceBound",
+            BindingFlags.NonPublic | BindingFlags.Instance)
+            ?? throw new AssertFailedException("_usbInterMessageSilenceBound field must exist on DeviceLinkService.");
+        return (TimeSpan)field.GetValue(dl)!;
+    }
+
+    private static ServiceConnection CreateServiceConnection(Socket connectedSocket, int timeout)
+    {
+        ConstructorInfo ctor = typeof(ServiceConnection).GetConstructor(
+            BindingFlags.NonPublic | BindingFlags.Instance,
+            binder: null,
+            types: [typeof(Socket), typeof(int), typeof(Microsoft.Extensions.Logging.ILogger), typeof(Netimobiledevice.Usbmuxd.UsbmuxdDevice)],
+            modifiers: null)
+            ?? throw new AssertFailedException(
+                "ServiceConnection(Socket, int, ILogger, UsbmuxdDevice?) constructor must exist for this test.");
+
+        return (ServiceConnection)ctor.Invoke(
+            [connectedSocket, timeout, NullLogger.Instance, null]);
+    }
+
+    /// <summary>A connected loopback TCP socket pair (client + accepted server), disposed together.</summary>
+    private sealed class SocketPair : IDisposable
+    {
+        public required Socket Client { get; init; }
+        public required Socket Server { get; init; }
+
+        public static SocketPair CreateConnected()
+        {
+            using var listener = new TcpListener(IPAddress.Loopback, 0);
+            listener.Start();
+            int port = ((IPEndPoint)listener.LocalEndpoint).Port;
+
+            Task<Socket> acceptTask = listener.AcceptSocketAsync();
+
+            var client = new Socket(SocketType.Stream, ProtocolType.Tcp);
+            client.Connect(IPAddress.Loopback, port);
+            Socket server = acceptTask.GetAwaiter().GetResult();
+
+            return new SocketPair { Client = client, Server = server };
+        }
+
+        public void Dispose()
+        {
+            try { Client.Dispose(); } catch (SocketException) { }
+            try { Server.Dispose(); } catch (SocketException) { }
+        }
     }
 }

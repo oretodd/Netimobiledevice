@@ -30,12 +30,8 @@ public class ServiceConnection : IDisposable {
     /// <summary>
     /// The initial stream used for the ServiceConnection until the SSL stream starts, unless you specifically need to use this stream
     /// you should use the Stream property instead.
-    /// ScribeHold fork (#2182): no longer <c>readonly</c> so the session-preserving reconnect seam
-    /// (<see cref="AdoptTransportFrom"/>) can swap the underlying socket BENEATH this same
-    /// ServiceConnection instance on a transport drop -- the mb2 session is not recreated, so the
-    /// passcode grant survives a USB hiccup.
     /// </summary>
-    private NetworkStream _networkStream;
+    private readonly NetworkStream _networkStream;
     /// <summary>
     /// The main stream once SSL is established, unless you specifically need to use this stream you should use the Stream
     /// property instead
@@ -179,20 +175,12 @@ public class ServiceConnection : IDisposable {
     }
 
     public void Close() {
-        // ScribeHold fork (#2182): after AdoptTransportFrom neutralizes a fresh wrapper, both streams
-        // are null and there is nothing to close — guard so disposing the discarded shell is a no-op
-        // rather than an NRE (the transplanted transport is owned by the adopting instance now).
-        if (_sslStream == null && _networkStream == null) {
-            return;
-        }
         Stream.Close();
     }
 
     public void Dispose() {
         Close();
-        if (_sslStream != null || _networkStream != null) {
-            Stream.Dispose();
-        }
+        Stream.Dispose();
         GC.SuppressFinalize(this);
     }
 
@@ -565,66 +553,6 @@ public class ServiceConnection : IDisposable {
         }
         _sslStream.ReadTimeout = _timeout;
         _sslStream.WriteTimeout = _timeout;
-    }
-
-    /// <summary>
-    /// ScribeHold fork (#2182): the SESSION-PRESERVING RECONNECT SEAM. Swaps the underlying socket /
-    /// streams of THIS ServiceConnection for those of a freshly-established <paramref name="fresh"/>
-    /// connection to the same service, WITHOUT recreating this ServiceConnection instance. The mb2
-    /// session and its <c>Mobilebackup2Service</c> owner keep pointing at the same
-    /// <see cref="ServiceConnection"/>, so the passcode grant bound once per mb2 session
-    /// (<c>LocalAuthenticationUiPresented</c>) is NOT re-triggered — the grant survives a USB hiccup.
-    ///
-    /// The caller obtains <paramref name="fresh"/> from the lockdown service provider (which owns the
-    /// StartService + SSL logic), then hands it here. This method transplants the fresh transport in
-    /// and neutralizes the fresh wrapper so disposing it will NOT close the transplanted socket.
-    /// It is a narrow seam: it owns only the old-transport teardown and the new-transport attach; it
-    /// does not know about mb2 sessions, DeviceLink, or reconnection policy.
-    /// </summary>
-    /// <param name="fresh">A newly-established connection whose socket/streams are transplanted into this instance.</param>
-    public void AdoptTransportFrom(ServiceConnection fresh) {
-        ArgumentNullException.ThrowIfNull(fresh);
-        if (ReferenceEquals(fresh, this)) {
-            throw new InvalidOperationException("A ServiceConnection cannot adopt its own transport.");
-        }
-
-        // Tear down THIS connection's old transport. Best-effort: the old socket is very likely
-        // already broken (that is why we are reconnecting), so swallow teardown faults.
-        SslStream? oldSslStream = _sslStream;
-        NetworkStream oldNetworkStream = _networkStream;
-
-        // Transplant the fresh transport beneath the preserved instance.
-        _networkStream = fresh._networkStream;
-        _sslStream = fresh._sslStream;
-        MuxDevice = fresh.MuxDevice;
-
-        // Re-apply this connection's configured data-read timeout to the adopted stream so the
-        // #1857 bulk-read budget carries across the swap (SetTimeout writes the active stream).
-        SetTimeout(_timeout);
-
-        // Neutralize the fresh wrapper so its Dispose() cannot close the transplanted transport that
-        // this instance now owns. It is now an empty shell the caller can safely discard/dispose.
-        fresh._sslStream = null;
-        fresh._networkStream = null!;
-
-        // Now dispose the old transport (after the swap, so a fault here cannot leave the instance in
-        // a half-swapped state). Order: SSL stream first (it wraps the network stream), then network.
-        try {
-            oldSslStream?.Dispose();
-        }
-        catch {
-            // Old transport is expected to be broken during a reconnect — ignore teardown faults.
-        }
-        try {
-            oldNetworkStream?.Dispose();
-        }
-        catch {
-            // Ignore — see above.
-        }
-
-        if (_logger.IsEnabled(LogLevel.Debug)) {
-            _logger.LogDebug("ServiceConnection adopted a fresh transport (#2182 reconnect seam); mb2 session preserved");
-        }
     }
 
     /// <summary>

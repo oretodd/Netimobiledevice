@@ -118,6 +118,30 @@ public class TransportTimeoutPolicyTests
         Assert.ThrowsExactly<ArgumentNullException>(() => TransportTimeoutPolicy.UsbTight.IsTighterThan(null!));
     }
 
+    [TestMethod]
+    [Description("#2190: ForUsb overrides ONLY the two config-driven bounds (SSL-handshake watchdog + " +
+                 "inter-message silence) and keeps the #1857 keepalive budget and bulk-read timeout from " +
+                 "UsbTight, so the host's BackupConfiguration values flow down without disturbing the " +
+                 "non-tunable bounds.")]
+    public void ForUsb_OverridesConfigDrivenBounds_KeepsUsbTightRest()
+    {
+        TransportTimeoutPolicy policy = TransportTimeoutPolicy.ForUsb(sslHandshakeWatchdogSec: 42, interMessageSilenceBoundSec: 17);
+
+        Assert.AreEqual(42, policy.SslHandshakeWatchdogSec, "The SSL-handshake watchdog must come from the host config.");
+        Assert.AreEqual(17, policy.InterMessageSilenceBoundSec, "The inter-message silence bound must come from the host config.");
+        Assert.AreEqual(TransportTimeoutPolicy.UsbTight.ReadTimeoutMs, policy.ReadTimeoutMs, "The bulk-read timeout is not host-tunable; it stays at the UsbTight value.");
+        Assert.AreEqual(TransportTimeoutPolicy.UsbTight.KeepAliveBudgetSec, policy.KeepAliveBudgetSec, "The #1857 keepalive budget is not host-tunable; it stays at the UsbTight value.");
+    }
+
+    [TestMethod]
+    [Description("#2190: ForUsb still validates its bounds — a non-positive config value is rejected " +
+                 "rather than silently disabling a bound.")]
+    public void ForUsb_RejectsNonPositiveConfigValues()
+    {
+        Assert.ThrowsExactly<ArgumentOutOfRangeException>(() => TransportTimeoutPolicy.ForUsb(sslHandshakeWatchdogSec: 0, interMessageSilenceBoundSec: 17));
+        Assert.ThrowsExactly<ArgumentOutOfRangeException>(() => TransportTimeoutPolicy.ForUsb(sslHandshakeWatchdogSec: 42, interMessageSilenceBoundSec: 0));
+    }
+
     private static TransportTimeoutPolicy Build(
         int readTimeoutMs = 600_000,
         int keepAliveTimeSec = 120,
