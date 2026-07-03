@@ -233,6 +233,129 @@ public class DeviceLinkInterMessageBoundTests
         return (TimeSpan)field.GetValue(dl)!;
     }
 
+    // ── #2193: the Preparing phase uses a GENEROUS bound; the tight bound governs ONLY in-transfer ──
+
+    private static readonly TimeSpan GenerousPreparingBound = TimeSpan.FromMinutes(4);
+
+    [TestMethod]
+    [Description("#2193: BEFORE the first real file transfer (Preparing window), the DlLoop selects the " +
+                 "GENEROUS Preparing bound — a healthy multi-minute manifest diff must not be interrupted.")]
+    public void SelectInterMessageBound_PreTransfer_UsesGenerousPreparingBound()
+    {
+        TimeSpan selected = DeviceLinkService.SelectInterMessageBound(
+            realTransferStarted: false, preparingBound: GenerousPreparingBound, inTransferBound: TightUsbBound);
+
+        Assert.AreEqual(GenerousPreparingBound, selected,
+            "Pre-first-file the device is building its on-device diff and is legitimately silent for minutes; " +
+            "the generous Preparing bound must apply so the diff runs uninterrupted (the toddfone regression).");
+    }
+
+    [TestMethod]
+    [Description("#2193: ONCE real transfer has started, the DlLoop selects the TIGHT in-transfer bound — " +
+                 "a between-message gap is now genuinely anomalous and must be caught in seconds.")]
+    public void SelectInterMessageBound_PostTransfer_UsesTightInTransferBound()
+    {
+        TimeSpan selected = DeviceLinkService.SelectInterMessageBound(
+            realTransferStarted: true, preparingBound: GenerousPreparingBound, inTransferBound: TightUsbBound);
+
+        Assert.AreEqual(TightUsbBound, selected,
+            "Post-first-file a real mid-transfer stall must still be caught on the tight bound and fed into " +
+            "reconnect-and-resume (the genuinely-good epic behavior is preserved).");
+    }
+
+    [TestMethod]
+    [Timeout(5000)]
+    [Description("#2193 (AC5): a Preparing-phase silence WITHIN the generous bound does NOT trip a reconnect — " +
+                 "the diff is allowed to run. A tight in-transfer bound of the same length WOULD have tripped.")]
+    public async Task PreparingSilence_WithinGenerousBound_DoesNotTrip()
+    {
+        // Model the Preparing window: real transfer has NOT started, so the generous bound applies. A
+        // silence of ~90s–2min (here scaled down) sits well inside a generous bound but far past a tight one.
+        TimeSpan generousBound = TimeSpan.FromMilliseconds(600);
+        TimeSpan tightBound = TimeSpan.FromMilliseconds(150);
+        TimeSpan preparingSelected = DeviceLinkService.SelectInterMessageBound(
+            realTransferStarted: false, preparingBound: generousBound, inTransferBound: tightBound);
+
+        using CancellationTokenSource callerCts = new();
+        Task<ArrayNode> pending = DeviceLinkService.ReceiveWithInterMessageBoundAsync(
+            isUsbTransport: true, preparingSelected, NeverReturnsRead(), NullLogger.Instance, callerCts.Token);
+
+        // Wait past the TIGHT bound but within the generous one: nothing should have tripped.
+        await Task.Delay(300).ConfigureAwait(false);
+        Assert.IsFalse(pending.IsCompleted,
+            "A Preparing silence within the generous bound must NOT trip an inter-message timeout — a tight " +
+            "bound of the same length would have fired by now, manufacturing the toddfone failure.");
+
+        callerCts.Cancel();
+        Exception ex = await Assert.ThrowsAsync<OperationCanceledException>(() => pending);
+        Assert.IsNotInstanceOfType<DeviceLinkInterMessageTimeoutException>(ex,
+            "Within the generous Preparing bound the read ends only on caller cancellation, never a synthetic timeout.");
+    }
+
+    [TestMethod]
+    [Timeout(5000)]
+    [Description("#2193 (AC5): a Preparing silence BEYOND the generous bound DOES trip a bounded reconnect signal " +
+                 "(the generous bound is a last-resort safety net, not disabled).")]
+    public async Task PreparingSilence_BeyondGenerousBound_Trips()
+    {
+        TimeSpan generousBound = TimeSpan.FromMilliseconds(200);
+        TimeSpan preparingSelected = DeviceLinkService.SelectInterMessageBound(
+            realTransferStarted: false, preparingBound: generousBound, inTransferBound: TightUsbBound);
+
+        DeviceLinkInterMessageTimeoutException ex = await Assert.ThrowsExactlyAsync<DeviceLinkInterMessageTimeoutException>(
+            () => DeviceLinkService.ReceiveWithInterMessageBoundAsync(
+                isUsbTransport: true, preparingSelected, NeverReturnsRead(), NullLogger.Instance, CancellationToken.None),
+            "A Preparing silence that exceeds the GENEROUS bound must still surface the bounded transport-drop signal " +
+            "so a genuinely wedged Preparing window is recovered — the safety net is raised, not removed.");
+
+        Assert.AreEqual(generousBound, ex.Bound, "The raised signal carries the generous Preparing bound that tripped.");
+    }
+
+    [TestMethod]
+    [Description("#2193: DeviceLinkService seeds its Preparing-phase bound from the connection's " +
+                 "TransportTimeoutPolicy so the host-configured UsbPreparingStallThresholdSec takes effect.")]
+    public void Ctor_SeedsPreparingBoundFromConnectionPolicy()
+    {
+        using SocketPair pair = SocketPair.CreateConnected();
+        ServiceConnection connection = CreateServiceConnection(pair.Client, timeout: 5000);
+        // Host-configured policy: a Preparing bound distinct from both defaults.
+        connection.TimeoutPolicy = TransportTimeoutPolicy.ForUsb(
+            sslHandshakeWatchdogSec: 60, interMessageSilenceBoundSec: 30, preparingSilenceBoundSec: 200);
+
+        using var dl = new DeviceLinkService(connection, backupDirectory: string.Empty, iosVersion: new Version(17, 0),
+            logger: NullLogger.Instance);
+
+        TimeSpan seeded = ReadPreparingBoundField(dl);
+        Assert.AreEqual(TimeSpan.FromSeconds(200), seeded,
+            "The Preparing-phase bound must be seeded from the connection's policy so the host config value takes effect.");
+    }
+
+    [TestMethod]
+    [Description("#2193: with the default (UsbTight) policy, the seeded Preparing bound is the generous library " +
+                 "default (4 min) — a standalone consumer never interrupts a normal manifest diff.")]
+    public void Ctor_DefaultPolicy_SeedsGenerousPreparingBound()
+    {
+        using SocketPair pair = SocketPair.CreateConnected();
+        ServiceConnection connection = CreateServiceConnection(pair.Client, timeout: 5000);
+
+        using var dl = new DeviceLinkService(connection, backupDirectory: string.Empty, iosVersion: new Version(17, 0),
+            logger: NullLogger.Instance);
+
+        TimeSpan seeded = ReadPreparingBoundField(dl);
+        Assert.AreEqual(TransportTimeoutPolicy.UsbTight.PreparingSilenceBound, seeded,
+            "With the default policy the seeded Preparing bound must equal the generous UsbTight Preparing bound.");
+        Assert.IsTrue(seeded > TransportTimeoutPolicy.UsbTight.InterMessageSilenceBound,
+            "The Preparing bound must be strictly GENEROUS relative to the tight in-transfer bound.");
+    }
+
+    private static TimeSpan ReadPreparingBoundField(DeviceLinkService dl)
+    {
+        FieldInfo field = typeof(DeviceLinkService).GetField("_usbPreparingSilenceBound",
+            BindingFlags.NonPublic | BindingFlags.Instance)
+            ?? throw new AssertFailedException("_usbPreparingSilenceBound field must exist on DeviceLinkService.");
+        return (TimeSpan)field.GetValue(dl)!;
+    }
+
     private static ServiceConnection CreateServiceConnection(Socket connectedSocket, int timeout)
     {
         ConstructorInfo ctor = typeof(ServiceConnection).GetConstructor(

@@ -67,6 +67,15 @@ internal sealed class DeviceLinkService : IDisposable {
     // WiFi keeps its loose behavior (the bound is applied only when the transport is USB).
     private static readonly TimeSpan DefaultUsbInterMessageSilenceBound = TimeSpan.FromSeconds(30);
 
+    // ScribeHold fork (#2193): the generous PRE-first-file Preparing-phase silence bound. During
+    // Backup_Preparing the device legitimately goes silent for MINUTES while it builds its on-device
+    // manifest diff — the tight inter-message bound above must NOT interrupt that healthy diff. Until
+    // the first real FileReceiving event fires (real backup-file content flowing), DlLoop applies THIS
+    // generous bound; after it, the tight in-transfer bound governs. Library default matches the host
+    // BackupConfiguration.UsbPreparingStallThresholdSec default (4 min); the host overrides it via the
+    // connection's TransportTimeoutPolicy.PreparingSilenceBound.
+    private static readonly TimeSpan DefaultUsbPreparingSilenceBound = TimeSpan.FromMinutes(4);
+
     private readonly ServiceConnection _service;
     private readonly string _rootPath;
     private readonly ILogger _logger;
@@ -107,6 +116,19 @@ internal sealed class DeviceLinkService : IDisposable {
     // LockdownClient, #2190) flows down through the SAME single policy that carries the SSL-handshake
     // watchdog — no separate host call. SetUsbInterMessageSilenceBound remains an explicit override.
     private TimeSpan _usbInterMessageSilenceBound = DefaultUsbInterMessageSilenceBound;
+
+    // ScribeHold fork (#2193): the active generous Preparing-phase silence bound, seeded in the ctor
+    // from the connection's TransportTimeoutPolicy (host key UsbPreparingStallThresholdSec) so a normal
+    // multi-minute manifest diff is never interrupted. Falls back to DefaultUsbPreparingSilenceBound.
+    private TimeSpan _usbPreparingSilenceBound = DefaultUsbPreparingSilenceBound;
+
+    // ScribeHold fork (#2193): latched true on the FIRST real FileReceiving event — the moment the
+    // device begins pushing real backup-file content (mb2 UploadFiles). Preparing-phase messages are
+    // DownloadFiles/ContentsOfDirectory and never raise FileReceiving, so this flips false→true exactly
+    // at the Preparing→in-transfer boundary. DlLoop reads it to select the generous Preparing bound (pre)
+    // vs the tight inter-message bound (post). Mirrors the host's RealTransferStarted signal (first
+    // FileReceiving), so both ends agree on where Preparing ends. Latch-once: a backup never un-starts.
+    private bool _realTransferStarted;
 
     /// <summary>
     /// ScribeHold fork: optional delegate to classify whether a file should be discarded (bytes
@@ -178,6 +200,11 @@ internal sealed class DeviceLinkService : IDisposable {
         // LockdownClient.TimeoutPolicy) takes effect. Falls back to the USB-tight policy default when
         // the host has not overridden the policy. Only applied when the transport is USB (IsUsbTransport).
         _usbInterMessageSilenceBound = service.TimeoutPolicy.InterMessageSilenceBound;
+
+        // #2193: seed the generous Preparing-phase bound from the SAME transport policy so the host key
+        // UsbPreparingStallThresholdSec (carried on the ServiceConnection via LockdownClient.TimeoutPolicy)
+        // takes effect. Applied only on USB, only until the first real FileReceiving.
+        _usbPreparingSilenceBound = service.TimeoutPolicy.PreparingSilenceBound;
 
         _internalCancellationTokenSource = new CancellationTokenSource();
 
@@ -521,6 +548,13 @@ internal sealed class DeviceLinkService : IDisposable {
     /// <param name="file">The file received.</param>
     /// <param name="fileData">The file contents received</param>
     private void OnFileReceiving(BackupFile file, byte[] fileData) {
+        // ScribeHold fork (#2193): latch the Preparing→in-transfer boundary. The FIRST FileReceiving is
+        // the device beginning to push real backup-file content (mb2 UploadFiles); the Preparing-phase
+        // manifest diff sends only DownloadFiles/ContentsOfDirectory, which never reach here. Once
+        // latched, DlLoop switches from the generous Preparing bound to the tight inter-message bound.
+        // Latch-once (never un-set) so a healthy in-transfer read never reverts to the generous bound.
+        _realTransferStarted = true;
+
         if (string.Equals("Status.plist", Path.GetFileName(file.LocalPath), StringComparison.OrdinalIgnoreCase)) {
             try {
                 DictionaryNode statusPlist = PropertyList.LoadFromByteArray(fileData).AsDictionaryNode();
@@ -860,6 +894,9 @@ internal sealed class DeviceLinkService : IDisposable {
         // ScribeHold fork (#2081): reset the Finished latch per loop so a reused service instance never
         // carries a prior session's terminal state into a new backup.
         _finishedObserved = false;
+        // ScribeHold fork (#2193): reset the real-transfer latch per loop for the same reason — a resumed
+        // session starts back in the Preparing window (generous bound) until it re-observes real transfer.
+        _realTransferStarted = false;
 
         _internalCancellationTokenSource = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         while (!cancellationToken.IsCancellationRequested) {
@@ -948,8 +985,26 @@ internal sealed class DeviceLinkService : IDisposable {
     /// inter-message timeout.
     /// </summary>
     private Task<ArrayNode> ReceiveMessageWithInterMessageBound(CancellationToken cancellationToken) {
+        // #2193: pre-first-file (Preparing) uses the generous bound so a healthy multi-minute manifest
+        // diff finishes uninterrupted; once real transfer has started, the tight in-transfer bound governs.
+        TimeSpan bound = SelectInterMessageBound(
+            _realTransferStarted, _usbPreparingSilenceBound, _usbInterMessageSilenceBound);
         return ReceiveWithInterMessageBoundAsync(
-            IsUsbTransport, _usbInterMessageSilenceBound, ReceiveMessage, _logger, cancellationToken);
+            IsUsbTransport, bound, ReceiveMessage, _logger, cancellationToken);
+    }
+
+    /// <summary>
+    /// ScribeHold fork (#2193): the pure phase-selection for which silence bound the DlLoop applies to
+    /// the next inter-message read. Before the first real backup-file transfer
+    /// (<paramref name="realTransferStarted"/> == false) the device is in the <c>Preparing</c> window —
+    /// building its on-device manifest diff — and is legitimately silent for MINUTES, so the generous
+    /// <paramref name="preparingBound"/> applies. Once real transfer has begun a between-message gap is
+    /// genuinely anomalous, so the tight <paramref name="inTransferBound"/> applies and a wedge is caught
+    /// in seconds. Pure + internal so the fork regression test exercises the boundary without a live
+    /// socket or clock.
+    /// </summary>
+    internal static TimeSpan SelectInterMessageBound(bool realTransferStarted, TimeSpan preparingBound, TimeSpan inTransferBound) {
+        return realTransferStarted ? inTransferBound : preparingBound;
     }
 
     /// <summary>

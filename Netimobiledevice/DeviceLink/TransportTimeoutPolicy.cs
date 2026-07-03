@@ -64,8 +64,26 @@ public sealed class TransportTimeoutPolicy
     /// (consumed by Task 1's DeviceLinkService). USB-tight so a between-message wedge fails in seconds
     /// and feeds reconnect, rather than waiting out the 10-minute bulk-read timeout. Exposed here so
     /// the single policy owns every transport bound; Task 1 reads it from the same policy.
+    ///
+    /// <para>#2193: this TIGHT bound governs ONLY the in-transfer phase (after the device begins
+    /// pushing real backup-file content). During the pre-first-file <c>Preparing</c> window the device
+    /// legitimately goes silent for MINUTES while it builds its on-device manifest diff, so the DlLoop
+    /// applies the generous <see cref="PreparingSilenceBoundSec"/> instead — the tight bound here must
+    /// not interrupt a healthy Preparing diff.</para>
     /// </summary>
     public int InterMessageSilenceBoundSec { get; }
+
+    /// <summary>
+    /// #2193: the PRE-first-file <c>Preparing</c>-phase silence bound in SECONDS — generous (minutes),
+    /// because a healthy device goes silent for several minutes while it builds its on-device manifest
+    /// diff before any real backup-file transfer begins. The DlLoop applies THIS bound (not the tight
+    /// <see cref="InterMessageSilenceBoundSec"/>) until the first real <c>FileReceiving</c> event, then
+    /// switches to the tight in-transfer bound. This is the safeguard the plan designed as a "distinct,
+    /// generous Preparing bound" (host key <c>BackupConfiguration.UsbPreparingStallThresholdSec</c>);
+    /// the library default keeps it comfortably above the tight bound so a standalone consumer never
+    /// interrupts a normal diff. Only applied on USB (WiFi keeps its single loose bound).
+    /// </summary>
+    public int PreparingSilenceBoundSec { get; }
 
     /// <summary>
     /// The keepalive budget in seconds implied by the keepalive settings
@@ -79,14 +97,20 @@ public sealed class TransportTimeoutPolicy
     /// <param name="keepAliveIntervalSec">TCP keepalive interval between probes (seconds).</param>
     /// <param name="keepAliveRetryCount">TCP keepalive probe count before the socket is declared dead.</param>
     /// <param name="sslHandshakeWatchdogSec">SSL-handshake watchdog bound (seconds); bounds ONLY the SSL wait.</param>
-    /// <param name="interMessageSilenceBoundSec">DlLoop inter-message silence bound (seconds).</param>
+    /// <param name="interMessageSilenceBoundSec">DlLoop inter-message silence bound (seconds) — the TIGHT in-transfer bound.</param>
+    /// <param name="preparingSilenceBoundSec">
+    /// #2193: the generous pre-first-file <c>Preparing</c>-phase silence bound (seconds). Defaults to
+    /// <see cref="DefaultPreparingSilenceBoundSec"/> so existing callers stay non-breaking and a
+    /// standalone consumer never interrupts a normal multi-minute manifest diff.
+    /// </param>
     public TransportTimeoutPolicy(
         int readTimeoutMs,
         int keepAliveTimeSec,
         int keepAliveIntervalSec,
         int keepAliveRetryCount,
         int sslHandshakeWatchdogSec,
-        int interMessageSilenceBoundSec)
+        int interMessageSilenceBoundSec,
+        int preparingSilenceBoundSec = DefaultPreparingSilenceBoundSec)
     {
         if (readTimeoutMs != Timeout.Infinite && readTimeoutMs <= 0) {
             throw new ArgumentOutOfRangeException(nameof(readTimeoutMs), readTimeoutMs, "Read timeout must be positive or Timeout.Infinite.");
@@ -106,6 +130,9 @@ public sealed class TransportTimeoutPolicy
         if (interMessageSilenceBoundSec <= 0) {
             throw new ArgumentOutOfRangeException(nameof(interMessageSilenceBoundSec), interMessageSilenceBoundSec, "Inter-message silence bound must be positive.");
         }
+        if (preparingSilenceBoundSec <= 0) {
+            throw new ArgumentOutOfRangeException(nameof(preparingSilenceBoundSec), preparingSilenceBoundSec, "Preparing silence bound must be positive.");
+        }
 
         ReadTimeoutMs = readTimeoutMs;
         KeepAliveTimeSec = keepAliveTimeSec;
@@ -113,7 +140,18 @@ public sealed class TransportTimeoutPolicy
         KeepAliveRetryCount = keepAliveRetryCount;
         SslHandshakeWatchdogSec = sslHandshakeWatchdogSec;
         InterMessageSilenceBoundSec = interMessageSilenceBoundSec;
+        PreparingSilenceBoundSec = preparingSilenceBoundSec;
     }
+
+    /// <summary>
+    /// #2193: the library-default Preparing-phase silence bound in SECONDS (4 minutes). Generous enough
+    /// that a legitimate large-device on-device manifest diff (observed at several minutes on heavy
+    /// iPhone 16 Pro Max users, iOS 26.x) finishes uninterrupted, while still bounding a genuinely
+    /// wedged Preparing window. Mirrors the host default
+    /// <c>BackupConfiguration.UsbPreparingStallThresholdSec</c>; the host overrides it via
+    /// <see cref="ForUsb(int, int, int)"/>.
+    /// </summary>
+    public const int DefaultPreparingSilenceBoundSec = 4 * 60;
 
     /// <summary>
     /// The SSL-handshake watchdog bound as a <see cref="TimeSpan"/> for direct use with a
@@ -122,9 +160,14 @@ public sealed class TransportTimeoutPolicy
     public TimeSpan SslHandshakeWatchdog => TimeSpan.FromSeconds(SslHandshakeWatchdogSec);
 
     /// <summary>
-    /// The DlLoop inter-message silence bound as a <see cref="TimeSpan"/>.
+    /// The DlLoop inter-message silence bound (TIGHT, in-transfer) as a <see cref="TimeSpan"/>.
     /// </summary>
     public TimeSpan InterMessageSilenceBound => TimeSpan.FromSeconds(InterMessageSilenceBoundSec);
+
+    /// <summary>
+    /// #2193: the generous pre-first-file <c>Preparing</c>-phase silence bound as a <see cref="TimeSpan"/>.
+    /// </summary>
+    public TimeSpan PreparingSilenceBound => TimeSpan.FromSeconds(PreparingSilenceBoundSec);
 
     /// <summary>
     /// USB (usbmux) transport policy -- the reliability-critical, fail-fast-into-recovery path and the
@@ -142,7 +185,10 @@ public sealed class TransportTimeoutPolicy
         keepAliveIntervalSec: 30,
         keepAliveRetryCount: 10,
         sslHandshakeWatchdogSec: 60,
-        interMessageSilenceBoundSec: 45);
+        interMessageSilenceBoundSec: 45,
+        // #2193: the tight 45s inter-message bound governs ONLY the in-transfer phase; a healthy
+        // Preparing diff is silent for minutes, so it uses the generous library-default Preparing bound.
+        preparingSilenceBoundSec: DefaultPreparingSilenceBoundSec);
 
     /// <summary>
     /// WiFi (lockdown/TCP) transport policy -- LOOSE, preserving existing behavior. Every bound is
@@ -157,7 +203,11 @@ public sealed class TransportTimeoutPolicy
         keepAliveIntervalSec: 30,
         keepAliveRetryCount: 10,
         sslHandshakeWatchdogSec: 300,
-        interMessageSilenceBoundSec: 10 * 60);
+        interMessageSilenceBoundSec: 10 * 60,
+        // #2193: WiFi keeps a single loose bound — the Preparing bound matches its loose inter-message
+        // bound so a WiFi Preparing window is never tightened. (The DlLoop applies the inter-message
+        // bound only on USB anyway; this keeps the value object internally consistent.)
+        preparingSilenceBoundSec: 10 * 60);
 
     /// <summary>
     /// ScribeHold fork (#2190): build the USB-tight policy the host drives from
@@ -168,8 +218,17 @@ public sealed class TransportTimeoutPolicy
     /// actually take effect on every USB connection instead of the hard-coded default.
     /// </summary>
     /// <param name="sslHandshakeWatchdogSec">SSL-handshake watchdog bound (seconds); from <c>BackupConfiguration.SslHandshakeWatchdogSec</c>.</param>
-    /// <param name="interMessageSilenceBoundSec">DlLoop inter-message silence bound (seconds); from <c>BackupConfiguration.UsbInterMessageSilenceBoundSec</c>.</param>
-    public static TransportTimeoutPolicy ForUsb(int sslHandshakeWatchdogSec, int interMessageSilenceBoundSec)
+    /// <param name="interMessageSilenceBoundSec">DlLoop TIGHT in-transfer inter-message silence bound (seconds); from <c>BackupConfiguration.UsbInterMessageSilenceBoundSec</c>.</param>
+    /// <param name="preparingSilenceBoundSec">
+    /// #2193: the generous pre-first-file <c>Preparing</c>-phase silence bound (seconds); from
+    /// <c>BackupConfiguration.UsbPreparingStallThresholdSec</c>. Defaults to
+    /// <see cref="DefaultPreparingSilenceBoundSec"/> so a caller that has not adopted the third key
+    /// keeps the safe generous library default.
+    /// </param>
+    public static TransportTimeoutPolicy ForUsb(
+        int sslHandshakeWatchdogSec,
+        int interMessageSilenceBoundSec,
+        int preparingSilenceBoundSec = DefaultPreparingSilenceBoundSec)
     {
         return new TransportTimeoutPolicy(
             readTimeoutMs: UsbTight.ReadTimeoutMs,
@@ -177,7 +236,8 @@ public sealed class TransportTimeoutPolicy
             keepAliveIntervalSec: UsbTight.KeepAliveIntervalSec,
             keepAliveRetryCount: UsbTight.KeepAliveRetryCount,
             sslHandshakeWatchdogSec: sslHandshakeWatchdogSec,
-            interMessageSilenceBoundSec: interMessageSilenceBoundSec);
+            interMessageSilenceBoundSec: interMessageSilenceBoundSec,
+            preparingSilenceBoundSec: preparingSilenceBoundSec);
     }
 
     /// <summary>

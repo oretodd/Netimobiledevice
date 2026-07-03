@@ -142,13 +142,71 @@ public class TransportTimeoutPolicyTests
         Assert.ThrowsExactly<ArgumentOutOfRangeException>(() => TransportTimeoutPolicy.ForUsb(sslHandshakeWatchdogSec: 42, interMessageSilenceBoundSec: 0));
     }
 
+    // ── #2193: the generous pre-first-file Preparing-phase silence bound ────────────────────────────
+
+    [TestMethod]
+    [Description("#2193: the library-default Preparing bound (4 min) is GENEROUS relative to the tight " +
+                 "in-transfer bound on both the UsbTight and WiFiLoose policies, so a normal multi-minute " +
+                 "on-device manifest diff finishes uninterrupted.")]
+    public void PreparingBound_IsGenerousRelativeToInterMessageBound()
+    {
+        // Read the const through the instance property (UsbTight defaults to it) so the assertion is a
+        // real runtime check, not a compile-time-constant compare the analyzer would fold to always-true.
+        Assert.AreEqual(4 * 60, TransportTimeoutPolicy.UsbTight.PreparingSilenceBoundSec,
+            "The library-default Preparing bound (carried by UsbTight) is 4 minutes.");
+        Assert.AreEqual(TransportTimeoutPolicy.DefaultPreparingSilenceBoundSec,
+            TransportTimeoutPolicy.UsbTight.PreparingSilenceBoundSec,
+            "UsbTight keeps the generous library-default Preparing bound (the tight 45s governs only in-transfer).");
+        Assert.IsTrue(
+            TransportTimeoutPolicy.UsbTight.PreparingSilenceBoundSec > TransportTimeoutPolicy.UsbTight.InterMessageSilenceBoundSec,
+            "The Preparing bound must be strictly greater than the tight in-transfer bound on USB.");
+        Assert.AreEqual(TimeSpan.FromSeconds(TransportTimeoutPolicy.UsbTight.PreparingSilenceBoundSec),
+            TransportTimeoutPolicy.UsbTight.PreparingSilenceBound,
+            "The TimeSpan accessor matches the seconds value.");
+    }
+
+    [TestMethod]
+    [Description("#2193: ForUsb overrides the Preparing bound from the host config " +
+                 "(BackupConfiguration.UsbPreparingStallThresholdSec) alongside the other two config-driven bounds.")]
+    public void ForUsb_OverridesPreparingBound_FromHostConfig()
+    {
+        TransportTimeoutPolicy policy = TransportTimeoutPolicy.ForUsb(
+            sslHandshakeWatchdogSec: 42, interMessageSilenceBoundSec: 17, preparingSilenceBoundSec: 240);
+
+        Assert.AreEqual(240, policy.PreparingSilenceBoundSec, "The Preparing bound must come from the host config value.");
+        Assert.AreEqual(17, policy.InterMessageSilenceBoundSec, "The tight in-transfer bound is unchanged.");
+    }
+
+    [TestMethod]
+    [Description("#2193: ForUsb without the third arg keeps the generous library-default Preparing bound — " +
+                 "a caller that has not adopted the new key is never regressed into interrupting a normal diff.")]
+    public void ForUsb_WithoutPreparingArg_KeepsGenerousDefault()
+    {
+        TransportTimeoutPolicy policy = TransportTimeoutPolicy.ForUsb(sslHandshakeWatchdogSec: 60, interMessageSilenceBoundSec: 30);
+
+        Assert.AreEqual(TransportTimeoutPolicy.DefaultPreparingSilenceBoundSec, policy.PreparingSilenceBoundSec,
+            "Omitting the Preparing arg must fall back to the generous library default, not a tight value.");
+    }
+
+    [TestMethod]
+    [Description("#2193: the constructor rejects a non-positive Preparing bound so a mis-configured policy " +
+                 "cannot disable the Preparing safety net.")]
+    public void Constructor_RejectsNonPositivePreparingBound()
+    {
+        Assert.ThrowsExactly<ArgumentOutOfRangeException>(() => Build(preparingSilenceBoundSec: 0));
+        Assert.ThrowsExactly<ArgumentOutOfRangeException>(() => Build(preparingSilenceBoundSec: -5));
+        Assert.ThrowsExactly<ArgumentOutOfRangeException>(() => TransportTimeoutPolicy.ForUsb(
+            sslHandshakeWatchdogSec: 60, interMessageSilenceBoundSec: 30, preparingSilenceBoundSec: 0));
+    }
+
     private static TransportTimeoutPolicy Build(
         int readTimeoutMs = 600_000,
         int keepAliveTimeSec = 120,
         int keepAliveIntervalSec = 30,
         int keepAliveRetryCount = 10,
         int sslHandshakeWatchdogSec = 60,
-        int interMessageSilenceBoundSec = 45)
+        int interMessageSilenceBoundSec = 45,
+        int preparingSilenceBoundSec = 240)
     {
         return new TransportTimeoutPolicy(
             readTimeoutMs,
@@ -156,6 +214,7 @@ public class TransportTimeoutPolicyTests
             keepAliveIntervalSec,
             keepAliveRetryCount,
             sslHandshakeWatchdogSec,
-            interMessageSilenceBoundSec);
+            interMessageSilenceBoundSec,
+            preparingSilenceBoundSec);
     }
 }
