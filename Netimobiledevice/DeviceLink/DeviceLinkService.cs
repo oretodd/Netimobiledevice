@@ -40,6 +40,44 @@ public sealed class DeviceLinkInterMessageTimeoutException : TimeoutException
     public TimeSpan Bound { get; }
 }
 
+/// <summary>
+/// ScribeHold fork (#2197, P0-D): raised when one of the pre-DlLoop version-exchange reads — the
+/// DLMessageVersionExchange read, the DLMessageDeviceReady read, or the mb2 <c>Hello</c> response read —
+/// stays silent longer than the (transport-aware, USB-tight) version-exchange bound. Before this bound
+/// existed, a RESUMED session's version exchange went straight to the coarse ~10-minute stream read: a
+/// busy <c>backupd</c> still unwinding a cancelled diff left the resume waiting the full 10 minutes and
+/// then dead-ending as a bare <see cref="TimeoutException"/> → generic catch → fatal on attempt 1/3.
+///
+/// It derives from <see cref="TimeoutException"/> — exactly like
+/// <see cref="DeviceLinkInterMessageTimeoutException"/> — so the host's inner <c>catch (TimeoutException)</c>
+/// ladder still captures it, while the dedicated type lets the coordinator classify it as a recoverable
+/// transport drop (reconnect-and-resume with escalating backoff sized for backupd's release) rather than
+/// a terminal failure. Raised only for USB; WiFi keeps its loose behavior and never applies the bound.
+/// </summary>
+public sealed class DeviceLinkVersionExchangeTimeoutException : TimeoutException
+{
+    public DeviceLinkVersionExchangeTimeoutException(TimeSpan bound)
+        : base($"Device went silent during the DeviceLink version exchange for longer than the version-exchange bound ({bound.TotalSeconds:0.###}s)")
+    {
+        Bound = bound;
+    }
+
+    /// <summary>The version-exchange bound that was exceeded.</summary>
+    public TimeSpan Bound { get; }
+}
+
+/// <summary>
+/// ScribeHold fork (#2197, P0-B): an optional host-supplied presence probe. Given the loop's
+/// cancellation token, returns <c>true</c> when the device is still present (e.g. via usbmux presence),
+/// <c>false</c> when it is known gone. The DlLoop consults it — in addition to the passive socket probe —
+/// when the generous <c>Preparing</c> silence bound trips, so a healthy multi-minute on-device diff keeps
+/// waiting rather than being torn down. Optional and default-null: when null the DlLoop uses the
+/// socket-level probe alone (the host wires usbmux presence in a follow-up wave).
+/// </summary>
+/// <param name="cancellationToken">The loop's cancellation token.</param>
+/// <returns>A task yielding <c>true</c> if the device is still present, <c>false</c> if known gone.</returns>
+public delegate Task<bool> DevicePresenceProbe(CancellationToken cancellationToken);
+
 internal sealed class DeviceLinkService : IDisposable {
     private const int BULK_OPERATION_ERROR = -13;
     private const uint FILE_TRANSFER_TERMINATOR = 0x00;
@@ -75,6 +113,20 @@ internal sealed class DeviceLinkService : IDisposable {
     // BackupConfiguration.UsbPreparingStallThresholdSec default (4 min); the host overrides it via the
     // connection's TransportTimeoutPolicy.PreparingSilenceBound.
     private static readonly TimeSpan DefaultUsbPreparingSilenceBound = TimeSpan.FromMinutes(4);
+
+    // ScribeHold fork (#2197, P0-D): the per-read version-exchange bound the pre-DlLoop reads apply on
+    // USB. A resumed session's version exchange that goes silent longer than this — a busy backupd still
+    // unwinding a cancelled diff — trips a bounded DeviceLinkVersionExchangeTimeoutException in seconds
+    // and feeds reconnect-and-resume, instead of waiting the coarse ~10-minute stream read and then
+    // dead-ending as fatal. Library default matches the host BackupConfiguration.UsbVersionExchangeBoundSec
+    // (35s); the host overrides it via the connection's TransportTimeoutPolicy.VersionExchangeBound.
+    private static readonly TimeSpan DefaultUsbVersionExchangeBound = TimeSpan.FromSeconds(35);
+
+    // ScribeHold fork (#2197, P0-B): the hard cap on TOTAL continuous Preparing-phase silence. When the
+    // generous Preparing bound trips the DlLoop probes the transport and, if healthy, keeps waiting; this
+    // caps that probe-and-wait so a genuinely wedged Preparing window can never hang forever even when
+    // the socket probe keeps reporting healthy. Library default matches the host default (20 min).
+    private static readonly TimeSpan DefaultUsbPreparingHardCap = TimeSpan.FromMinutes(20);
 
     private readonly ServiceConnection _service;
     private readonly string _rootPath;
@@ -129,6 +181,23 @@ internal sealed class DeviceLinkService : IDisposable {
     // vs the tight inter-message bound (post). Mirrors the host's RealTransferStarted signal (first
     // FileReceiving), so both ends agree on where Preparing ends. Latch-once: a backup never un-starts.
     private bool _realTransferStarted;
+
+    // ScribeHold fork (#2197, P0-D): the active per-read version-exchange bound, seeded in the ctor from
+    // the connection's TransportTimeoutPolicy (host key UsbVersionExchangeBoundSec). Falls back to the
+    // library default so a standalone consumer is safe.
+    private TimeSpan _usbVersionExchangeBound = DefaultUsbVersionExchangeBound;
+
+    // ScribeHold fork (#2197, P0-B): the active Preparing hard cap, seeded in the ctor from the same
+    // policy (host key UsbPreparingHardCapSec). Falls back to the library default.
+    private TimeSpan _usbPreparingHardCap = DefaultUsbPreparingHardCap;
+
+    /// <summary>
+    /// ScribeHold fork (#2197, P0-B): optional host-supplied presence probe consulted — alongside the
+    /// passive socket-level probe — when the generous Preparing silence bound trips, so a healthy
+    /// multi-minute on-device manifest diff keeps waiting instead of being torn down. Null (default) →
+    /// the DlLoop uses the socket probe alone. The host wires usbmux presence here in a follow-up wave.
+    /// </summary>
+    public DevicePresenceProbe? PresenceProbe { get; set; }
 
     /// <summary>
     /// ScribeHold fork: optional delegate to classify whether a file should be discarded (bytes
@@ -205,6 +274,20 @@ internal sealed class DeviceLinkService : IDisposable {
         // UsbPreparingStallThresholdSec (carried on the ServiceConnection via LockdownClient.TimeoutPolicy)
         // takes effect. Applied only on USB, only until the first real FileReceiving.
         _usbPreparingSilenceBound = service.TimeoutPolicy.PreparingSilenceBound;
+
+        // #2197 (P0-D/P0-B): seed the version-exchange bound and the Preparing hard cap from the same
+        // policy so the host keys UsbVersionExchangeBoundSec / UsbPreparingHardCapSec take effect.
+        _usbVersionExchangeBound = service.TimeoutPolicy.VersionExchangeBound;
+        _usbPreparingHardCap = service.TimeoutPolicy.PreparingHardCap;
+
+        // #2197 (P0-E): one Info line of the EFFECTIVE transport policy at construction so any recurrence
+        // is diagnosable in a single run without enabling Debug. Volume is one line per connection open.
+        TransportTimeoutPolicy policy = service.TimeoutPolicy;
+        _logger.LogInformation(
+            "DeviceLink transport policy (usb={IsUsb}): sslWatchdog={SslSec}s interMsg={InterMsgSec}s preparing={PreparingSec}s preparingHardCap={HardCapSec}s versionExchange={VerSec}s read={ReadMs}ms",
+            IsUsbTransport, policy.SslHandshakeWatchdogSec, policy.InterMessageSilenceBoundSec,
+            policy.PreparingSilenceBoundSec, policy.PreparingHardCapSec, policy.VersionExchangeBoundSec,
+            policy.ReadTimeoutMs);
 
         _internalCancellationTokenSource = new CancellationTokenSource();
 
@@ -380,6 +463,12 @@ internal sealed class DeviceLinkService : IDisposable {
         catch (ObjectDisposedException) {
             _logger.LogWarning("Trying to send disconnect from disposed service");
         }
+        catch (IOException ex) {
+            // #2197 (P0-C): a broken/closed peer during the disconnect send is expected (the device may
+            // have already FIN'd). Swallow it so Dispose stays unreachable-proof — the socket close in the
+            // Dispose finally is what actually releases the transport.
+            _logger.LogDebug(ex, "Disconnect send failed on a broken peer (ignored)");
+        }
     }
 
     private async Task DisconnectAsync(ArrayNode msg, CancellationToken cancellationToken) {
@@ -553,6 +642,14 @@ internal sealed class DeviceLinkService : IDisposable {
         // manifest diff sends only DownloadFiles/ContentsOfDirectory, which never reach here. Once
         // latched, DlLoop switches from the generous Preparing bound to the tight inter-message bound.
         // Latch-once (never un-set) so a healthy in-transfer read never reverts to the generous bound.
+        // #2197 (P0-E): log the transition exactly once — the moment real transfer begins is a key
+        // diagnostic boundary (Preparing bound / hard-cap probe path ends here; the tight bound takes over).
+        if (!_realTransferStarted) {
+            _logger.LogInformation(
+                "Preparing→Transfer: first real file transfer observed ({File}) — switching from the generous " +
+                "Preparing bound to the tight in-transfer inter-message bound (#2197 P0-E)",
+                Path.GetFileName(file.LocalPath));
+        }
         _realTransferStarted = true;
 
         if (string.Equals("Status.plist", Path.GetFileName(file.LocalPath), StringComparison.OrdinalIgnoreCase)) {
@@ -882,10 +979,42 @@ internal sealed class DeviceLinkService : IDisposable {
     }
 
     public void Dispose() {
-        Disconnect();
-        _service.Close();
-        _internalCancellationTokenSource.Dispose();
-        GC.SuppressFinalize(this);
+        // #2197 (P0-C): wrap Disconnect in try/finally so _service.Close() ALWAYS runs even if the
+        // DLMessageDisconnect send throws (previously a throwing Disconnect skipped Close and leaked the
+        // socket). The socket close is the deterministic FIN and must be unreachable-proof.
+        try {
+            Disconnect();
+        }
+        finally {
+            CloseAndDisposeCore();
+        }
+    }
+
+    /// <summary>
+    /// ScribeHold fork (#2197, P0-C): dispose WITHOUT sending DLMessageDisconnect — the quiet-abandon
+    /// path. When we are unwinding on a drop-class the host will RESUME, sending Disconnect tells the busy
+    /// device to tear down the very session we are about to resume; we must only close the socket
+    /// (deterministic FIN) so backupd keeps holding the in-progress snapshot. The socket close and CTS
+    /// dispose always run.
+    /// </summary>
+    public void DisposeQuietly() {
+        CloseAndDisposeCore();
+    }
+
+    /// <summary>
+    /// ScribeHold fork (#2197, P0-C): the shared close path — close the underlying service connection
+    /// (the real TCP FIN via ServiceConnection.Close, which now disposes the socket-owning network
+    /// stream) and dispose the internal CTS. Each step is independently guarded so one failure never
+    /// skips the next, and the finalizer is always suppressed.
+    /// </summary>
+    private void CloseAndDisposeCore() {
+        try {
+            _service.Close();
+        }
+        finally {
+            _internalCancellationTokenSource.Dispose();
+            GC.SuppressFinalize(this);
+        }
     }
 
     public async Task<ResultCode> DlLoop(CancellationToken cancellationToken = default) {
@@ -899,8 +1028,12 @@ internal sealed class DeviceLinkService : IDisposable {
         _realTransferStarted = false;
 
         _internalCancellationTokenSource = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        // ScribeHold fork (#2197, P0-E): per-exchange sequence counter for the DlLoop trace so a live run
+        // is diagnosable in a single pass — each read is logged with seq#, command, elapsed and bytes.
+        long dlLoopSeq = 0;
         while (!cancellationToken.IsCancellationRequested) {
             ArrayNode message;
+            long readStartTicks = Stopwatch.GetTimestamp();
             if (_finishedObserved) {
                 // ScribeHold fork (#2081): once SnapshotState=Finished has been observed, bound the next
                 // read to a short timeout instead of the long SERVICE_READ_TIMEOUT_MS block. If the device
@@ -919,13 +1052,19 @@ internal sealed class DeviceLinkService : IDisposable {
                 }
             }
             else {
-                // ScribeHold fork (#2181): on USB, bound the wait for the next inter-message read to a
-                // tight silence bound (seconds) instead of only the coarse ~10-minute
+                // ScribeHold fork (#2181/#2197): on USB, bound the wait for the next inter-message read to
+                // a tight silence bound (seconds) instead of only the coarse ~10-minute
                 // SERVICE_READ_TIMEOUT_MS. A device going silent BETWEEN messages then trips a bounded,
                 // classifiable transport-drop signal (DeviceLinkInterMessageTimeoutException) that FEEDS
                 // reconnect-and-resume, rather than wedging until the long read finally times out. WiFi
                 // keeps its loose behavior (the bound is applied only on USB).
-                message = await ReceiveMessageWithInterMessageBound(_internalCancellationTokenSource.Token).ConfigureAwait(false);
+                //
+                // #2197 (P0-B): during the pre-first-file Preparing window a trip is PROBED, not obeyed
+                // blindly — a healthy multi-minute on-device manifest diff must not be torn down. When the
+                // generous Preparing bound trips and the transport probes HEALTHY, we keep waiting under a
+                // total-continuous hard cap; we tear down only on transport evidence (probe says dead) or
+                // hard-cap exhaustion.
+                message = await ReceiveMessageWithPreparingProbeAsync(_internalCancellationTokenSource.Token).ConfigureAwait(false);
                 if (message.Count == 0) {
                     _logger.LogWarning("Received array node with no elements");
                     await Task.Delay(100, cancellationToken).ConfigureAwait(false);
@@ -935,6 +1074,16 @@ internal sealed class DeviceLinkService : IDisposable {
 
             string command = message[0].AsStringNode().Value;
             _logger.LogDebug("Command recieved: {command}", command);
+
+            // ScribeHold fork (#2197, P0-E): one Info line per DlLoop exchange — seq#, command, response
+            // status code (when the message carries one), element count and elapsed ms. Observed max
+            // ~8 msg/s, so the volume is fine and a live wedge is diagnosable in a single run.
+            double dlLoopElapsedMs = Stopwatch.GetElapsedTime(readStartTicks).TotalMilliseconds;
+            long dlLoopStatus = ExtractStatusCode(command, message);
+            _logger.LogInformation(
+                "DlLoop exchange #{Seq}: command={Command} status={Status} elements={Count} elapsedMs={ElapsedMs:0.#}",
+                ++dlLoopSeq, command, dlLoopStatus, message.Count, dlLoopElapsedMs);
+
             switch (command) {
                 case DeviceLinkMessage.ProcessMessage: {
                     if (message[1].AsDictionaryNode()["ErrorCode"].AsIntegerNode().Value != (ulong) ResultCode.Success) {
@@ -974,6 +1123,59 @@ internal sealed class DeviceLinkService : IDisposable {
     }
 
     /// <summary>
+    /// ScribeHold fork (#2197, P0-D): read a pre-DlLoop version-exchange message with the USB version-
+    /// exchange bound applied. Used for the DLMessageVersionExchange read, the DLMessageDeviceReady read
+    /// and the mb2 <c>Hello</c> response read — the three reads that, before this bound existed, went
+    /// straight to the coarse ~10-minute stream read on a RESUMED session and let a busy-but-silent
+    /// <c>backupd</c> dead-end the resume as fatal. On USB, if the device stays silent longer than
+    /// <see cref="_usbVersionExchangeBound"/> this raises a
+    /// <see cref="DeviceLinkVersionExchangeTimeoutException"/> (a bounded, classifiable transport-drop
+    /// signal that FEEDS reconnect-and-resume) in seconds. On WiFi (or a non-positive bound) it defers to
+    /// the plain <see cref="ReceiveMessage"/> with no added bound. A caller cancellation is always
+    /// propagated, never reclassified.
+    /// </summary>
+    public Task<ArrayNode> ReceiveVersionExchangeMessage(CancellationToken cancellationToken) {
+        return ReceiveWithVersionExchangeBoundAsync(
+            IsUsbTransport, _usbVersionExchangeBound, ReceiveMessage, _logger, cancellationToken);
+    }
+
+    /// <summary>
+    /// ScribeHold fork (#2197, P0-D): the transport-aware version-exchange bounded read, static with the
+    /// read function injected so the TIMING behavior is unit-testable without a live socket. Mirrors
+    /// <see cref="ReceiveWithInterMessageBoundAsync"/>: when the bound does not apply (WiFi, or a
+    /// non-positive bound) it defers to <paramref name="read"/> with no added bound; when it applies (USB,
+    /// positive bound) it raises a bounded <see cref="DeviceLinkVersionExchangeTimeoutException"/> if the
+    /// bound elapses before a message arrives and the caller did NOT request cancellation. A genuine
+    /// caller cancellation is always propagated as-is.
+    /// </summary>
+    internal static async Task<ArrayNode> ReceiveWithVersionExchangeBoundAsync(
+        bool isUsbTransport,
+        TimeSpan bound,
+        Func<CancellationToken, Task<ArrayNode>> read,
+        ILogger logger,
+        CancellationToken cancellationToken) {
+        if (!ShouldApplyInterMessageBound(isUsbTransport, bound)) {
+            return await read(cancellationToken).ConfigureAwait(false);
+        }
+
+        using CancellationTokenSource versionExchangeCts = new CancellationTokenSource(bound);
+        using CancellationTokenSource linkedCts =
+            CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, versionExchangeCts.Token);
+        try {
+            return await read(linkedCts.Token).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (versionExchangeCts.IsCancellationRequested && !cancellationToken.IsCancellationRequested) {
+            // The USB version-exchange bound elapsed (not a caller cancellation): a busy-but-silent
+            // backupd (typically a resumed session) never answered. Surface the bounded transport-drop
+            // signal so the coordinator can reconnect-and-resume rather than wait out the long read.
+            logger.LogWarning(
+                "USB version-exchange bound ({BoundSec}s) tripped waiting on a device reply; surfacing a bounded transport-drop signal for reconnect-and-resume (#2197 P0-D)",
+                bound.TotalSeconds);
+            throw new DeviceLinkVersionExchangeTimeoutException(bound);
+        }
+    }
+
+    /// <summary>
     /// ScribeHold fork (#2181): read the next inter-message DeviceLink message, applying the USB-tight
     /// inter-message silence bound. On USB, if the device stays silent between messages longer than
     /// <see cref="_usbInterMessageSilenceBound"/>, this raises a
@@ -991,6 +1193,113 @@ internal sealed class DeviceLinkService : IDisposable {
             _realTransferStarted, _usbPreparingSilenceBound, _usbInterMessageSilenceBound);
         return ReceiveWithInterMessageBoundAsync(
             IsUsbTransport, bound, ReceiveMessage, _logger, cancellationToken);
+    }
+
+    /// <summary>
+    /// ScribeHold fork (#2197, P0-B): read the next DlLoop message with the inter-message bound, but
+    /// during the pre-first-file <c>Preparing</c> window a bound trip is PROBED rather than obeyed
+    /// blindly. When the generous Preparing bound trips (device silent while it builds its on-device
+    /// manifest diff), we run a passive transport health check — the socket-level poll plus the optional
+    /// host-supplied <see cref="PresenceProbe"/>. If the transport is HEALTHY the device is still diffing,
+    /// so we log Info and KEEP WAITING, re-entering the bounded read, until the TOTAL continuous Preparing
+    /// silence exceeds the hard cap (<see cref="_usbPreparingHardCap"/>). We tear down (rethrow the bounded
+    /// transport-drop signal) ONLY on transport evidence (probe says dead) or hard-cap exhaustion. TCP
+    /// keepalive remains the true dead-peer detector; this adds a device-still-diffing tolerance on top.
+    ///
+    /// <para>Once real transfer has started the tight in-transfer bound governs and a trip is NOT probed —
+    /// a mid-transfer stall is genuinely anomalous and feeds reconnect immediately (the #2181/#2193
+    /// behavior is preserved). WiFi never applies the bound, so this whole path is USB-only.</para>
+    /// </summary>
+    private async Task<ArrayNode> ReceiveMessageWithPreparingProbeAsync(CancellationToken cancellationToken) {
+        // The total continuous Preparing silence measured across probe iterations (the hard cap bounds
+        // this, not a single probe interval). Started at the first trip and never reset while we keep
+        // waiting in the Preparing window.
+        long preparingSilenceStartTicks = 0;
+        while (true) {
+            try {
+                return await ReceiveMessageWithInterMessageBound(cancellationToken).ConfigureAwait(false);
+            }
+            catch (DeviceLinkInterMessageTimeoutException interMessageTimeout) {
+                // Only PROBE while still in the Preparing window on USB — a post-transfer stall or a WiFi
+                // path must surface the signal immediately (unchanged behavior). _realTransferStarted may
+                // have latched between reads; re-check it here so the boundary is honored precisely.
+                if (_realTransferStarted || !IsUsbTransport) {
+                    throw;
+                }
+
+                if (preparingSilenceStartTicks == 0) {
+                    preparingSilenceStartTicks = Stopwatch.GetTimestamp();
+                }
+                TimeSpan totalSilence = Stopwatch.GetElapsedTime(preparingSilenceStartTicks) + interMessageTimeout.Bound;
+
+                bool transportHealthy = await IsPreparingTransportHealthyAsync(cancellationToken).ConfigureAwait(false);
+                if (ShouldContinuePreparingWait(transportHealthy, totalSilence, _usbPreparingHardCap)) {
+                    _logger.LogInformation(
+                        "Still preparing (device diffing), transport healthy — continuing to wait (#2197 P0-B). " +
+                        "totalPreparingSilence={SilenceSec:0.#}s hardCap={HardCapSec:0.#}s",
+                        totalSilence.TotalSeconds, _usbPreparingHardCap.TotalSeconds);
+                    continue;
+                }
+
+                // Tear down: either the transport probe reported a dead peer, or the hard cap is exhausted.
+                if (!transportHealthy) {
+                    _logger.LogWarning(
+                        "Preparing silence bound tripped and the transport probed DEAD — surfacing the bounded " +
+                        "transport-drop signal for reconnect-and-resume (#2197 P0-B). totalPreparingSilence={SilenceSec:0.#}s",
+                        totalSilence.TotalSeconds);
+                }
+                else {
+                    _logger.LogWarning(
+                        "Preparing hard cap exhausted ({HardCapSec:0.#}s) while the transport still probed healthy — " +
+                        "surfacing the bounded transport-drop signal for reconnect-and-resume (#2197 P0-B). " +
+                        "totalPreparingSilence={SilenceSec:0.#}s",
+                        _usbPreparingHardCap.TotalSeconds, totalSilence.TotalSeconds);
+                }
+                throw;
+            }
+        }
+    }
+
+    /// <summary>
+    /// ScribeHold fork (#2197, P0-B): the pure decision for whether the DlLoop keeps waiting on a
+    /// Preparing-phase silence trip. Keep waiting only when the transport is healthy AND the total
+    /// continuous Preparing silence is still within the hard cap. A dead transport, or an exhausted hard
+    /// cap, both stop the wait so the bounded transport-drop signal surfaces. Pure + internal so the fork
+    /// regression test exercises the boundary without a live socket or clock.
+    /// </summary>
+    internal static bool ShouldContinuePreparingWait(bool transportHealthy, TimeSpan totalPreparingSilence, TimeSpan hardCap) {
+        return transportHealthy && totalPreparingSilence < hardCap;
+    }
+
+    /// <summary>
+    /// ScribeHold fork (#2197, P0-B): the composite Preparing-phase transport health check — the passive
+    /// socket-level probe AND (when the host has wired one) the optional <see cref="PresenceProbe"/>. The
+    /// device is considered present only when BOTH agree it is alive; a socket-dead or presence-gone
+    /// verdict means tear down. When no presence probe is supplied the socket probe alone decides. The
+    /// presence probe is best-effort: if it throws, we treat presence as UNKNOWN and defer to the socket
+    /// probe rather than letting a probe error fail the backup.
+    /// </summary>
+    private async Task<bool> IsPreparingTransportHealthyAsync(CancellationToken cancellationToken) {
+        bool socketHealthy = _service.IsTransportHealthy();
+        if (!socketHealthy) {
+            return false;
+        }
+
+        DevicePresenceProbe? probe = PresenceProbe;
+        if (probe == null) {
+            return true;
+        }
+        try {
+            return await probe(cancellationToken).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) {
+            throw;
+        }
+        catch (Exception ex) {
+            // A presence-probe error must not fail the backup — defer to the socket probe (healthy here).
+            _logger.LogWarning(ex, "Preparing presence probe threw; deferring to the socket probe (healthy) (#2197 P0-B)");
+            return true;
+        }
     }
 
     /// <summary>
@@ -1052,6 +1361,30 @@ internal sealed class DeviceLinkService : IDisposable {
     /// </summary>
     internal static bool ShouldApplyInterMessageBound(bool isUsbTransport, TimeSpan bound) {
         return isUsbTransport && bound > TimeSpan.Zero;
+    }
+
+    /// <summary>
+    /// ScribeHold fork (#2197, P0-E): extract the response status code carried by a DlLoop message for
+    /// the per-exchange trace. Only DLMessageProcessMessage carries an <c>ErrorCode</c> dictionary entry;
+    /// every other command has no status field, so <see cref="long.MinValue"/> is returned as a sentinel
+    /// ("n/a"). Best-effort and exception-safe — a diagnostic trace must never throw into the loop. Pure +
+    /// internal so the fork regression test can exercise it without a live socket.
+    /// </summary>
+    internal static long ExtractStatusCode(string command, ArrayNode message) {
+        const long noStatus = long.MinValue;
+        if (command != DeviceLinkMessage.ProcessMessage || message.Count < 2) {
+            return noStatus;
+        }
+        try {
+            DictionaryNode body = message[1].AsDictionaryNode();
+            if (body.TryGetValue("ErrorCode", out PropertyNode? errorCode)) {
+                return (long) errorCode.AsIntegerNode().Value;
+            }
+        }
+        catch (Exception) {
+            // A malformed body must not break the trace — fall through to the sentinel.
+        }
+        return noStatus;
     }
 
     /// <summary>
@@ -1160,7 +1493,9 @@ internal sealed class DeviceLinkService : IDisposable {
         }
 
         // Get DLMessageVersionExchange from device
-        ArrayNode versionExchangeMessage = await ReceiveMessage(cancellationToken);
+        // #2197 (P0-D): bounded read — a busy-but-silent backupd on a resumed session must feed reconnect
+        // in seconds, not wait the coarse ~10-minute stream read and then dead-end as fatal.
+        ArrayNode versionExchangeMessage = await ReceiveVersionExchangeMessage(cancellationToken);
         if (diag) {
             _logger.LogDebug(
                 "DeviceLink VersionExchange: received {Count}-element message after {ElapsedMs}ms: {Message}",
@@ -1200,7 +1535,8 @@ internal sealed class DeviceLinkService : IDisposable {
         if (diag) {
             _logger.LogDebug("DeviceLink VersionExchange: awaiting DLMessageDeviceReady at {ElapsedMs}ms", stopwatch.ElapsedMilliseconds);
         }
-        ArrayNode messageDeviceReady = await ReceiveMessage(cancellationToken);
+        // #2197 (P0-D): bounded read for the same reason as the DLMessageVersionExchange read above.
+        ArrayNode messageDeviceReady = await ReceiveVersionExchangeMessage(cancellationToken);
         if (diag) {
             _logger.LogDebug(
                 "DeviceLink VersionExchange: received {Count}-element reply after {ElapsedMs}ms: {Message}",

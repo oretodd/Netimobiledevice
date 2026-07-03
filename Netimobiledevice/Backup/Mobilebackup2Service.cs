@@ -54,6 +54,15 @@ public sealed class Mobilebackup2Service(
     public Func<string, bool>? ShouldDiscardFile { get; set; }
 
     /// <summary>
+    /// ScribeHold fork (#2197, P0-B): optional host-supplied transport-presence probe, forwarded to the
+    /// <see cref="DeviceLinkService"/> so it is consulted — alongside the passive socket probe — when the
+    /// generous <c>Preparing</c> silence bound trips. Lets a healthy multi-minute on-device manifest diff
+    /// keep waiting instead of being torn down. Set before calling <see cref="Backup"/>; null (default) →
+    /// the DeviceLinkService uses the socket-level probe alone.
+    /// </summary>
+    public DevicePresenceProbe? PresenceProbe { get; set; }
+
+    /// <summary>
     /// iTunes files to be inserted into the Info.plist file.
     /// </summary>
     private static readonly string[] iTunesFiles = [
@@ -324,6 +333,9 @@ public sealed class Mobilebackup2Service(
     private async Task<DeviceLinkService> GetDeviceLink(string backupDirectory, bool ignoreTransferErrors, bool performBackupSizeCheck, CancellationToken cancellationToken) {
         DeviceLinkService dl = new DeviceLinkService(this.Service, backupDirectory, this.Lockdown.OsVersion, ignoreTransferErrors, performBackupSizeCheck, Logger);
         dl.ShouldDiscardFile = this.ShouldDiscardFile;
+        // #2197 (P0-B): forward the presence probe BEFORE the version exchange so it is armed for both the
+        // version-exchange reads and the subsequent Preparing-phase wait.
+        dl.PresenceProbe = this.PresenceProbe;
         await dl.VersionExchange(MOBILEBACKUP2_VERSION_MAJOR, MOBILEBACKUP2_VERSION_MINOR, cancellationToken).ConfigureAwait(false);
         await VersionExchange(dl, cancellationToken).ConfigureAwait(false);
         return dl;
@@ -346,7 +358,10 @@ public sealed class Mobilebackup2Service(
             cancellationToken
         ).ConfigureAwait(false);
 
-        ArrayNode reply = await dl.ReceiveMessage(cancellationToken).ConfigureAwait(false);
+        // #2197 (P0-D): the mb2 Hello response is the third pre-DlLoop version-exchange read — bound it
+        // like the other two so a busy-but-silent backupd on a resumed session feeds reconnect in seconds
+        // instead of waiting the coarse ~10-minute stream read and then dead-ending as fatal.
+        ArrayNode reply = await dl.ReceiveVersionExchangeMessage(cancellationToken).ConfigureAwait(false);
         if (reply[0].AsStringNode().Value != "DLMessageProcessMessage" || reply[1].AsDictionaryNode()["ErrorCode"].AsIntegerNode().Value != 0) {
             throw new Mobilebackup2Exception("Found error in response during version exchange");
         }
@@ -376,8 +391,18 @@ public sealed class Mobilebackup2Service(
         string deviceDirectory = Path.Combine(backupDirectory, Lockdown.Udid);
         Directory.CreateDirectory(deviceDirectory);
 
-        DeviceLinkService dl = await GetDeviceLink(backupDirectory, ignoreTransferErrors, performBackupSizeCheck, _internalCts.Token).ConfigureAwait(false);
+        // #2197 (P0-C): true once we observe a drop-class exception the host coordinator will RESUME
+        // (an inter-message timeout, the new version-exchange timeout, or a transient IOException). On a
+        // quiet abandon we must NOT send CancelBackup (a non-standard, fork-invented mb2 message that
+        // tells the device to cancel the very session we are about to resume) and must NOT send
+        // DLMessageDisconnect — we just tear the socket down (DeviceLinkService.Dispose closes it), so the
+        // resumed session finds backupd still holding the in-progress snapshot.
+        bool quietAbandon = false;
+        // #2197 (P0-D): GetDeviceLink is now INSIDE the try so a version-exchange failure still runs the
+        // finally (app-layer teardown + throughput capture + dispose), rather than escaping it.
+        DeviceLinkService? dl = null;
         try {
+            dl = await GetDeviceLink(backupDirectory, ignoreTransferErrors, performBackupSizeCheck, _internalCts.Token).ConfigureAwait(false);
             dl.BeforeReceivingFile += DeviceLink_BeforeReceivingFile;
             dl.Completed += DeviceLink_Completed;
             dl.FileReceived += DeviceLink_FileReceived;
@@ -413,6 +438,14 @@ public sealed class Mobilebackup2Service(
                             File.Delete(manifestPlistPath);
                         }
                         else if (!fullBackup && !File.Exists(manifestPlistPath)) {
+                            // #2197 (P0-E): make the silent incremental→full degradation LOUD. When
+                            // Manifest.plist is missing an incremental backup silently becomes a FULL
+                            // backup — a full re-transfer of the whole device. The behavior is UNCHANGED
+                            // here (never alter it); this WARN just makes the degradation diagnosable in a
+                            // single run instead of being invisible.
+                            Logger.LogWarning(
+                                "Requested incremental backup but Manifest.plist is missing at {ManifestPath} — degrading to a FULL backup (whole-device re-transfer) (#2197 P0-E)",
+                                manifestPlistPath);
                             fullBackup = true;
                         }
 
@@ -439,36 +472,81 @@ public sealed class Mobilebackup2Service(
                 }
             }
         }
+        catch (Exception ex) when (IsResumeDropClass(ex)) {
+            // #2197 (P0-C): a drop-class the host will RESUME. Flag it so the finally SKIPS the
+            // CancelBackup + Disconnect that would tell the busy device to cancel the very session we are
+            // about to resume, and just tears the socket down. Rethrow so the coordinator classifies it.
+            quietAbandon = true;
+            throw;
+        }
         finally {
-            // ScribeHold fork: send CancelBackup to cleanly terminate the backup session on the
-            // device side. On successful completion the device has already closed its end of the
-            // connection, so the write may throw SocketError 10053 (WSAECONNABORTED) or hang
-            // indefinitely on a half-closed SSL socket. Use a 5-second timeout to prevent hanging
-            // forever, and scope the catches so we don't swallow unexpected exceptions.
-            try {
-                using var cancelBackupCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-                cancelBackupCts.CancelAfter(TimeSpan.FromSeconds(5));
-                DictionaryNode message = new DictionaryNode() {
-                    { "MessageName", new StringNode("CancelBackup") },
-                    { "TargetIdentifier", new StringNode(Lockdown.Udid) }
-                };
-                await dl.SendProcessMessage(message, cancelBackupCts.Token).ConfigureAwait(false);
-            }
-            catch (IOException) { }
-            catch (OperationCanceledException) { }
+            // #2197 (P0-C): the app-layer teardown. On a normal/terminal unwind we send CancelBackup then
+            // let Dispose close the socket. On a QUIET ABANDON (a drop-class the host will resume) we skip
+            // BOTH CancelBackup (a non-standard fork-invented mb2 message that cancels the very session we
+            // are about to resume) and DLMessageDisconnect — we just tear the socket down. Either way the
+            // outcome is LOGGED (previously swallowed), so a live run explains what teardown happened.
+            if (dl != null) {
+                if (quietAbandon) {
+                    Logger.LogInformation(
+                        "Backup teardown: quiet abandon (drop-class the host will resume) — CancelBackup + Disconnect SKIPPED, tearing the socket down only (#2197 P0-C)");
+                }
+                else {
+                    // ScribeHold fork: send CancelBackup to cleanly terminate the backup session on the
+                    // device side. On successful completion the device has already closed its end of the
+                    // connection, so the write may throw SocketError 10053 (WSAECONNABORTED) or hang
+                    // indefinitely on a half-closed SSL socket. Use a 5-second timeout to prevent hanging
+                    // forever, and scope the catches so we don't swallow unexpected exceptions.
+                    try {
+                        using var cancelBackupCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+                        cancelBackupCts.CancelAfter(TimeSpan.FromSeconds(5));
+                        DictionaryNode message = new DictionaryNode() {
+                            { "MessageName", new StringNode("CancelBackup") },
+                            { "TargetIdentifier", new StringNode(Lockdown.Udid) }
+                        };
+                        await dl.SendProcessMessage(message, cancelBackupCts.Token).ConfigureAwait(false);
+                        Logger.LogInformation("Backup teardown: CancelBackup sent (#2197 P0-E)");
+                    }
+                    catch (IOException ex) {
+                        Logger.LogInformation("Backup teardown: CancelBackup send failed (expected on a closed peer): {Message} (#2197 P0-E)", ex.Message);
+                    }
+                    catch (OperationCanceledException) {
+                        Logger.LogInformation("Backup teardown: CancelBackup send timed out after 5s (#2197 P0-E)");
+                    }
+                }
 
-            // ScribeHold fork: capture throughput stats before dl is disposed. Exposed to the
-            // caller via LastBackupThroughputStats so they can log under their own category.
-            // Runs regardless of CancelBackup outcome so stats are never lost.
-            LastBackupThroughputStats = dl.GetAndResetThroughputStats();
+                // ScribeHold fork: capture throughput stats before dl is disposed. Exposed to the
+                // caller via LastBackupThroughputStats so they can log under their own category.
+                // Runs regardless of CancelBackup outcome so stats are never lost.
+                LastBackupThroughputStats = dl.GetAndResetThroughputStats();
 
-            try {
-                dl.Dispose();
-            }
-            catch {
-                // Do nothing for these exceptions
+                try {
+                    // #2197 (P0-C): Dispose closes the socket. On a quiet abandon it must NOT send the
+                    // DLMessageDisconnect — DeviceLinkService.Dispose honors DisposeQuietly for that.
+                    if (quietAbandon) {
+                        dl.DisposeQuietly();
+                    }
+                    else {
+                        dl.Dispose();
+                    }
+                }
+                catch {
+                    // Do nothing for these exceptions
+                }
             }
         }
+    }
+
+    /// <summary>
+    /// ScribeHold fork (#2197, P0-C): true when <paramref name="ex"/> is a drop-class the host coordinator
+    /// will RESUME rather than treat as terminal — a between-message inter-message timeout, the new
+    /// version-exchange timeout, or a transient transport <see cref="IOException"/>. On these we quiet-abandon
+    /// (skip CancelBackup + Disconnect) so the resumed session finds backupd still holding the in-progress
+    /// snapshot. A user/terminal cancellation is NOT a drop-class (the normal CancelBackup path runs).
+    /// </summary>
+    private static bool IsResumeDropClass(Exception ex) {
+        return ex is DeviceLinkInterMessageTimeoutException
+            or DeviceLinkVersionExchangeTimeoutException
+            or IOException;
     }
 
     private void NotificationProxy_ReceivedNotification(object? sender, ReceivedNotificationEventArgs e) {
