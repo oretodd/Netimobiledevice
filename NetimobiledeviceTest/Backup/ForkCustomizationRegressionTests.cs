@@ -50,6 +50,47 @@ public class ForkCustomizationRegressionTests
     }
 
     [TestMethod]
+    [Description("Asserts PresenceProbe exists on DeviceLinkService (fork-only additive property, #2197 P0-B)")]
+    public void DeviceLinkService_PresenceProbe_PropertyExists()
+    {
+        PropertyInfo? property = typeof(DeviceLinkService).GetProperty(
+            "PresenceProbe",
+            BindingFlags.Public | BindingFlags.Instance);
+
+        Assert.IsNotNull(property,
+            "DeviceLinkService.PresenceProbe must exist. " +
+            "This is a fork-only additive property (#2197 P0-B). " +
+            "If this test fails after an upstream merge, restore the property.");
+
+        Assert.AreEqual(typeof(DevicePresenceProbe), property.PropertyType,
+            "PresenceProbe must be DevicePresenceProbe");
+
+        Assert.IsTrue(property.CanRead && property.CanWrite,
+            "PresenceProbe must be publicly readable and writable");
+    }
+
+    [TestMethod]
+    [Description("Asserts PresenceProbe exists on Mobilebackup2Service as the host passthrough (#2197 P0-B), " +
+                 "mirroring the ShouldDiscardFile passthrough so the host can arm the probe.")]
+    public void Mobilebackup2Service_PresenceProbe_PropertyExists()
+    {
+        PropertyInfo? property = typeof(Mobilebackup2Service).GetProperty(
+            "PresenceProbe",
+            BindingFlags.Public | BindingFlags.Instance);
+
+        Assert.IsNotNull(property,
+            "Mobilebackup2Service.PresenceProbe must exist as the host-facing passthrough. " +
+            "This is a fork-only additive property (#2197 P0-B). " +
+            "If this test fails after an upstream merge, restore the property.");
+
+        Assert.AreEqual(typeof(DevicePresenceProbe), property.PropertyType,
+            "PresenceProbe must be DevicePresenceProbe");
+
+        Assert.IsTrue(property.CanRead && property.CanWrite,
+            "PresenceProbe must be publicly readable and writable so the host can set it before Backup().");
+    }
+
+    [TestMethod]
     [Description("Asserts LastBackupThroughputStats exists on Mobilebackup2Service (fork-only additive property)")]
     public void Mobilebackup2Service_LastBackupThroughputStats_PropertyExists()
     {

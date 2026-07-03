@@ -54,6 +54,15 @@ public sealed class Mobilebackup2Service(
     public Func<string, bool>? ShouldDiscardFile { get; set; }
 
     /// <summary>
+    /// ScribeHold fork (#2197, P0-B): optional host-supplied transport-presence probe, forwarded to the
+    /// <see cref="DeviceLinkService"/> so it is consulted — alongside the passive socket probe — when the
+    /// generous <c>Preparing</c> silence bound trips. Lets a healthy multi-minute on-device manifest diff
+    /// keep waiting instead of being torn down. Set before calling <see cref="Backup"/>; null (default) →
+    /// the DeviceLinkService uses the socket-level probe alone.
+    /// </summary>
+    public DevicePresenceProbe? PresenceProbe { get; set; }
+
+    /// <summary>
     /// iTunes files to be inserted into the Info.plist file.
     /// </summary>
     private static readonly string[] iTunesFiles = [
@@ -324,6 +333,9 @@ public sealed class Mobilebackup2Service(
     private async Task<DeviceLinkService> GetDeviceLink(string backupDirectory, bool ignoreTransferErrors, bool performBackupSizeCheck, CancellationToken cancellationToken) {
         DeviceLinkService dl = new DeviceLinkService(this.Service, backupDirectory, this.Lockdown.OsVersion, ignoreTransferErrors, performBackupSizeCheck, Logger);
         dl.ShouldDiscardFile = this.ShouldDiscardFile;
+        // #2197 (P0-B): forward the presence probe BEFORE the version exchange so it is armed for both the
+        // version-exchange reads and the subsequent Preparing-phase wait.
+        dl.PresenceProbe = this.PresenceProbe;
         await dl.VersionExchange(MOBILEBACKUP2_VERSION_MAJOR, MOBILEBACKUP2_VERSION_MINOR, cancellationToken).ConfigureAwait(false);
         await VersionExchange(dl, cancellationToken).ConfigureAwait(false);
         return dl;
