@@ -11,7 +11,7 @@ namespace NetimobiledeviceTest.DeviceLink;
 
 /// <summary>
 /// End-to-end fork tests for the #2197 (P0-B) probe-and-wait loop and the (P0-C) quiet-abandon
-/// classification. These drive the private <c>ReceiveMessageWithPreparingProbeAsync</c> over a live
+/// classification. These drive the private <c>ReceiveMessageWithSilenceProbeAsync</c> over a live
 /// loopback socket (with the Preparing bound + hard cap shrunk to milliseconds via reflection) so the
 /// three required outcomes are exercised: probe-healthy → keeps waiting under the hard cap; probe-dead →
 /// tears down; hard-cap exhaustion → tears down.
@@ -46,6 +46,73 @@ public class DeviceLinkPreparingProbeLoopTests
                 "On a healthy-but-silent Preparing window the loop must eventually surface the bounded signal " +
                 "when the hard cap is exhausted (it does NOT hang forever, and it does NOT tear down on the first trip).");
 
+        Assert.IsNotNull(ex);
+    }
+
+    [TestMethod]
+    [Timeout(10000)]
+    [Description("#2200 (P0): with a HEALTHY (live, quiet) socket AFTER real transfer has started (the " +
+                 "finalizing/commit tail near 99%), the tight in-transfer bound trip does NOT tear down " +
+                 "immediately — the loop probes healthy and keeps waiting under the IN-TRANSFER hard cap, " +
+                 "then surfaces the bounded transport-drop signal only on hard-cap exhaustion. This is the " +
+                 "core #2200 fix: the old code rethrew on the first in-transfer trip, killing a healthy " +
+                 "session seconds from completion.")]
+    public async Task InTransferProbe_HealthySocket_WaitsUnderInTransferHardCap_ThenTripsOnExhaustion()
+    {
+        using SocketPair pair = SocketPair.CreateConnected();
+        ServiceConnection connection = CreateServiceConnection(pair.Client, timeout: 500);
+
+        using var dl = new DeviceLinkService(connection, backupDirectory: string.Empty, iosVersion: new Version(17, 0),
+            logger: NullLogger.Instance);
+
+        ForceUsbTransport(connection);
+        // Latch real transfer started → the loop selects the tight in-transfer bound + the in-transfer hard cap.
+        SetBoolField(dl, "_realTransferStarted", true);
+        SetTimeSpanField(dl, "_usbInterMessageSilenceBound", TimeSpan.FromMilliseconds(120));
+        // A LARGE Preparing hard cap that MUST NOT be used (this is the in-transfer phase); a small
+        // in-transfer hard cap that governs. If the loop wrongly used the Preparing cap the [Timeout] fails.
+        SetTimeSpanField(dl, "_usbPreparingHardCap", TimeSpan.FromMinutes(20));
+        SetTimeSpanField(dl, "_usbInTransferHardCap", TimeSpan.FromMilliseconds(500));
+
+        DeviceLinkInterMessageTimeoutException ex =
+            await Assert.ThrowsExactlyAsync<DeviceLinkInterMessageTimeoutException>(
+                () => InvokeProbeLoop(dl, CancellationToken.None),
+                "On a healthy-but-silent in-transfer/finalizing window the loop must KEEP WAITING (not tear " +
+                "down on the first trip) and only surface the bounded signal when the IN-TRANSFER hard cap is exhausted.");
+
+        Assert.IsNotNull(ex);
+    }
+
+    [TestMethod]
+    [Timeout(10000)]
+    [Description("#2200 (P0): an in-transfer silence whose composite health check reports DEAD (here via a " +
+                 "presence probe that says the device is GONE, a healthy-but-quiet socket notwithstanding) " +
+                 "tears down on the next trip and surfaces the bounded transport-drop signal — reconnect-and-" +
+                 "resume — rather than waiting out the (generous) in-transfer hard cap. If the in-transfer " +
+                 "trip were not probed (the pre-#2200 immediate rethrow) OR the dead verdict were ignored, this " +
+                 "would still throw, so the DISTINGUISHING assertion is that it does NOT wait out the 20-min cap " +
+                 "(the [Timeout] would fail).")]
+    public async Task InTransferProbe_HealthCheckDead_TearsDownForReconnect()
+    {
+        using SocketPair pair = SocketPair.CreateConnected();
+        ServiceConnection connection = CreateServiceConnection(pair.Client, timeout: 500);
+
+        using var dl = new DeviceLinkService(connection, backupDirectory: string.Empty, iosVersion: new Version(17, 0),
+            logger: NullLogger.Instance);
+
+        ForceUsbTransport(connection);
+        SetBoolField(dl, "_realTransferStarted", true);
+        SetTimeSpanField(dl, "_usbInterMessageSilenceBound", TimeSpan.FromMilliseconds(120));
+        // A GENEROUS in-transfer hard cap: only the DEAD composite-health verdict can tear this down before
+        // the [Timeout], proving the in-transfer trip IS probed and DOES honor a dead verdict.
+        SetTimeSpanField(dl, "_usbInTransferHardCap", TimeSpan.FromMinutes(20));
+        // Live, quiet (socket-healthy) transport, but the host presence probe reports the device GONE.
+        dl.PresenceProbe = _ => Task.FromResult(false);
+
+        var ex = await Assert.ThrowsExactlyAsync<DeviceLinkInterMessageTimeoutException>(
+            () => InvokeProbeLoop(dl, CancellationToken.None),
+            "A dead composite-health verdict in the in-transfer phase must tear down on the next trip " +
+            "(transport evidence), not wait out the generous hard cap.");
         Assert.IsNotNull(ex);
     }
 
@@ -129,8 +196,8 @@ public class DeviceLinkPreparingProbeLoopTests
     private static Task<Netimobiledevice.Plist.ArrayNode> InvokeProbeLoop(DeviceLinkService dl, CancellationToken ct)
     {
         MethodInfo method = typeof(DeviceLinkService).GetMethod(
-            "ReceiveMessageWithPreparingProbeAsync", BindingFlags.NonPublic | BindingFlags.Instance)
-            ?? throw new AssertFailedException("DeviceLinkService.ReceiveMessageWithPreparingProbeAsync must exist for #2197 P0-B.");
+            "ReceiveMessageWithSilenceProbeAsync", BindingFlags.NonPublic | BindingFlags.Instance)
+            ?? throw new AssertFailedException("DeviceLinkService.ReceiveMessageWithSilenceProbeAsync must exist for #2197 P0-B / #2200 P0.");
         return (Task<Netimobiledevice.Plist.ArrayNode>)method.Invoke(dl, [ct])!;
     }
 
@@ -152,6 +219,13 @@ public class DeviceLinkPreparingProbeLoopTests
     }
 
     private static void SetTimeSpanField(DeviceLinkService dl, string name, TimeSpan value)
+    {
+        FieldInfo field = typeof(DeviceLinkService).GetField(name, BindingFlags.NonPublic | BindingFlags.Instance)
+            ?? throw new AssertFailedException($"{name} field must exist on DeviceLinkService.");
+        field.SetValue(dl, value);
+    }
+
+    private static void SetBoolField(DeviceLinkService dl, string name, bool value)
     {
         FieldInfo field = typeof(DeviceLinkService).GetField(name, BindingFlags.NonPublic | BindingFlags.Instance)
             ?? throw new AssertFailedException($"{name} field must exist on DeviceLinkService.");
