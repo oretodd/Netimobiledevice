@@ -270,6 +270,56 @@ public class TransportTimeoutPolicyTests
         Assert.AreEqual(240, equal.PreparingHardCapSec);
     }
 
+    // ── #2200 (P0): the in-transfer hard cap ─────────────────────────────────────────────────────────
+
+    [TestMethod]
+    [Description("#2200 (P0): the USB in-transfer hard cap (5 min) is generous relative to the tight " +
+                 "in-transfer bound (covers a large-device snapshot commit tail) and shorter than the " +
+                 "Preparing hard cap; WiFi keeps it loose.")]
+    public void InTransferHardCap_UsbTight_IsGenerousAndBelowPreparingCap()
+    {
+        TransportTimeoutPolicy usb = TransportTimeoutPolicy.UsbTight;
+        TransportTimeoutPolicy wifi = TransportTimeoutPolicy.WiFiLoose;
+
+        Assert.AreEqual(TransportTimeoutPolicy.DefaultInTransferHardCapSec, usb.InTransferHardCapSec);
+        Assert.AreEqual(5 * 60, usb.InTransferHardCapSec, "The library-default in-transfer hard cap is 5 minutes.");
+        Assert.IsTrue(usb.InTransferHardCapSec >= usb.InterMessageSilenceBoundSec,
+            "The in-transfer hard cap must be >= the tight in-transfer bound (a single probe interval).");
+        Assert.IsTrue(usb.InTransferHardCapSec <= usb.PreparingHardCapSec,
+            "The in-transfer hard cap (commit tail) is not longer than the Preparing hard cap (manifest diff).");
+        Assert.IsTrue(usb.InTransferHardCapSec < wifi.InTransferHardCapSec || usb.InTransferHardCapSec == wifi.InTransferHardCapSec,
+            "WiFi keeps a loose in-transfer hard cap (the probe path is USB-only).");
+        Assert.AreEqual(TimeSpan.FromSeconds(usb.InTransferHardCapSec), usb.InTransferHardCap,
+            "The TimeSpan accessor matches the seconds value.");
+    }
+
+    [TestMethod]
+    [Description("#2200: ForUsb overrides the in-transfer hard cap from the host config; omitting it keeps " +
+                 "the library default.")]
+    public void ForUsb_OverridesInTransferHardCap_FromHostConfig()
+    {
+        TransportTimeoutPolicy overridden = TransportTimeoutPolicy.ForUsb(
+            sslHandshakeWatchdogSec: 60, interMessageSilenceBoundSec: 30, preparingSilenceBoundSec: 240,
+            versionExchangeBoundSec: 45, preparingHardCapSec: 1200, writeBoundSec: 60, inTransferHardCapSec: 200);
+        Assert.AreEqual(200, overridden.InTransferHardCapSec, "The in-transfer hard cap must come from the host config.");
+
+        TransportTimeoutPolicy defaults = TransportTimeoutPolicy.ForUsb(
+            sslHandshakeWatchdogSec: 60, interMessageSilenceBoundSec: 30);
+        Assert.AreEqual(TransportTimeoutPolicy.DefaultInTransferHardCapSec, defaults.InTransferHardCapSec,
+            "Omitting the in-transfer hard-cap arg keeps the library default.");
+    }
+
+    [TestMethod]
+    [Description("#2200: the constructor rejects an in-transfer hard cap tighter than the tight in-transfer " +
+                 "bound (the cap can never be smaller than a single probe interval); equal is allowed.")]
+    public void Constructor_RejectsInTransferHardCapBelowInterMessageBound()
+    {
+        Assert.ThrowsExactly<ArgumentOutOfRangeException>(
+            () => Build(interMessageSilenceBoundSec: 45, inTransferHardCapSec: 30));
+        TransportTimeoutPolicy equal = Build(interMessageSilenceBoundSec: 45, inTransferHardCapSec: 45);
+        Assert.AreEqual(45, equal.InTransferHardCapSec);
+    }
+
     private static TransportTimeoutPolicy Build(
         int readTimeoutMs = 600_000,
         int keepAliveTimeSec = 120,
@@ -279,7 +329,9 @@ public class TransportTimeoutPolicyTests
         int interMessageSilenceBoundSec = 45,
         int preparingSilenceBoundSec = 240,
         int versionExchangeBoundSec = 35,
-        int preparingHardCapSec = 1200)
+        int preparingHardCapSec = 1200,
+        int writeBoundSec = 60,
+        int inTransferHardCapSec = 300)
     {
         return new TransportTimeoutPolicy(
             readTimeoutMs,
@@ -290,6 +342,8 @@ public class TransportTimeoutPolicyTests
             interMessageSilenceBoundSec,
             preparingSilenceBoundSec,
             versionExchangeBoundSec,
-            preparingHardCapSec);
+            preparingHardCapSec,
+            writeBoundSec,
+            inTransferHardCapSec);
     }
 }

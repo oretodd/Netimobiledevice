@@ -156,6 +156,15 @@ internal sealed class DeviceLinkService : IDisposable {
     // the socket probe keeps reporting healthy. Library default matches the host default (20 min).
     private static readonly TimeSpan DefaultUsbPreparingHardCap = TimeSpan.FromMinutes(20);
 
+    // ScribeHold fork (#2200, P0): the hard cap on TOTAL continuous IN-TRANSFER (post-first-file)
+    // silence. The in-transfer twin of DefaultUsbPreparingHardCap. Once real transfer starts the tight
+    // inter-message bound governs — but the FINALIZING/commit tail (device quietly committing a large
+    // snapshot near 99%) legitimately exceeds it. Rather than tear a healthy session down on the first
+    // 30s gap (a self-inflicted 10053 seconds from completion), the DlLoop now PROBES the same way it
+    // does in Preparing and keeps waiting under this cap while the transport probes healthy. Library
+    // default matches the host default (5 min).
+    private static readonly TimeSpan DefaultUsbInTransferHardCap = TimeSpan.FromMinutes(5);
+
     private readonly ServiceConnection _service;
     private readonly string _rootPath;
     private readonly ILogger _logger;
@@ -218,6 +227,12 @@ internal sealed class DeviceLinkService : IDisposable {
     // ScribeHold fork (#2197, P0-B): the active Preparing hard cap, seeded in the ctor from the same
     // policy (host key UsbPreparingHardCapSec). Falls back to the library default.
     private TimeSpan _usbPreparingHardCap = DefaultUsbPreparingHardCap;
+
+    // ScribeHold fork (#2200, P0): the active in-transfer hard cap, seeded in the ctor from the same
+    // policy (host key UsbInTransferHardCapSec). Falls back to the library default. Bounds the
+    // probe-and-wait loop when a post-first-file (in-transfer/finalizing) inter-message silence trips
+    // and the transport probes healthy.
+    private TimeSpan _usbInTransferHardCap = DefaultUsbInTransferHardCap;
 
     /// <summary>
     /// ScribeHold fork (#2197, P0-B): optional host-supplied presence probe consulted — alongside the
@@ -307,6 +322,10 @@ internal sealed class DeviceLinkService : IDisposable {
         // policy so the host keys UsbVersionExchangeBoundSec / UsbPreparingHardCapSec take effect.
         _usbVersionExchangeBound = service.TimeoutPolicy.VersionExchangeBound;
         _usbPreparingHardCap = service.TimeoutPolicy.PreparingHardCap;
+
+        // #2200 (P0): seed the in-transfer hard cap from the same policy (host key UsbInTransferHardCapSec)
+        // so a healthy finalizing/commit tail is never torn down on the first tight-bound trip.
+        _usbInTransferHardCap = service.TimeoutPolicy.InTransferHardCap;
 
         // #2197 (P0-E): one Info line of the EFFECTIVE transport policy at construction so any recurrence
         // is diagnosable in a single run without enabling Debug. Volume is one line per connection open.
@@ -1133,12 +1152,15 @@ internal sealed class DeviceLinkService : IDisposable {
                 // reconnect-and-resume, rather than wedging until the long read finally times out. WiFi
                 // keeps its loose behavior (the bound is applied only on USB).
                 //
-                // #2197 (P0-B): during the pre-first-file Preparing window a trip is PROBED, not obeyed
-                // blindly — a healthy multi-minute on-device manifest diff must not be torn down. When the
-                // generous Preparing bound trips and the transport probes HEALTHY, we keep waiting under a
-                // total-continuous hard cap; we tear down only on transport evidence (probe says dead) or
-                // hard-cap exhaustion.
-                message = await ReceiveMessageWithPreparingProbeAsync(_internalCancellationTokenSource.Token).ConfigureAwait(false);
+                // #2197 (P0-B) / #2200 (P0): a silence-bound trip is PROBED, not obeyed blindly, in BOTH
+                // phases. Pre-first-file (Preparing) a healthy multi-minute on-device manifest diff must
+                // not be torn down; post-first-file (in-transfer/finalizing) a healthy device quietly
+                // committing a large snapshot near 99% must not be torn down either (the #2200 bug — a 30s
+                // gap killed a session seconds from completion). When the phase-appropriate bound trips
+                // and the transport probes HEALTHY we keep waiting under the phase-appropriate hard cap
+                // (Preparing hard cap pre-first-file, in-transfer hard cap after); we tear down only on
+                // transport evidence (probe says dead) or hard-cap exhaustion.
+                message = await ReceiveMessageWithSilenceProbeAsync(_internalCancellationTokenSource.Token).ConfigureAwait(false);
                 if (message.Count == 0) {
                     // ScribeHold fork (#2198, P1-2): an empty message is a 0-byte length-prefix read — the
                     // signature of a peer FIN. Because the read RETURNED, no timeout can ever fire, so the
@@ -1318,64 +1340,71 @@ internal sealed class DeviceLinkService : IDisposable {
     }
 
     /// <summary>
-    /// ScribeHold fork (#2197, P0-B): read the next DlLoop message with the inter-message bound, but
-    /// during the pre-first-file <c>Preparing</c> window a bound trip is PROBED rather than obeyed
-    /// blindly. When the generous Preparing bound trips (device silent while it builds its on-device
-    /// manifest diff), we run a passive transport health check — the socket-level poll plus the optional
-    /// host-supplied <see cref="PresenceProbe"/>. If the transport is HEALTHY the device is still diffing,
-    /// so we log Info and KEEP WAITING, re-entering the bounded read, until the TOTAL continuous Preparing
-    /// silence exceeds the hard cap (<see cref="_usbPreparingHardCap"/>). We tear down (rethrow the bounded
-    /// transport-drop signal) ONLY on transport evidence (probe says dead) or hard-cap exhaustion. TCP
-    /// keepalive remains the true dead-peer detector; this adds a device-still-diffing tolerance on top.
+    /// ScribeHold fork (#2197, P0-B / #2200, P0): read the next DlLoop message with the phase-appropriate
+    /// inter-message silence bound, PROBING rather than tearing down blindly on a trip — in BOTH phases.
+    /// When the bound trips we run a passive transport health check — the socket-level poll plus the
+    /// optional host-supplied <see cref="PresenceProbe"/>. If the transport is HEALTHY the device is still
+    /// working (building its on-device manifest diff in <c>Preparing</c>, or committing a large snapshot
+    /// in the in-transfer/finalizing tail), so we log Info and KEEP WAITING, re-entering the bounded read,
+    /// until the TOTAL continuous silence exceeds the phase-appropriate hard cap — the generous Preparing
+    /// hard cap (<see cref="_usbPreparingHardCap"/>) pre-first-file, or the in-transfer hard cap
+    /// (<see cref="_usbInTransferHardCap"/>) after real transfer has started. We tear down (rethrow the
+    /// bounded transport-drop signal) ONLY on transport evidence (probe says dead) or hard-cap exhaustion.
+    /// TCP keepalive remains the true dead-peer detector; this adds a device-still-working tolerance on top.
     ///
-    /// <para>Once real transfer has started the tight in-transfer bound governs and a trip is NOT probed —
-    /// a mid-transfer stall is genuinely anomalous and feeds reconnect immediately (the #2181/#2193
-    /// behavior is preserved). WiFi never applies the bound, so this whole path is USB-only.</para>
+    /// <para>#2200: before this, the in-transfer trip rethrew immediately — a 30s gap during the healthy
+    /// finalizing/commit tail (device quietly committing a 1.9 GB snapshot near 99%) cancelled the backup
+    /// token, aborted an in-flight write into a self-inflicted 10053, and killed a session seconds from
+    /// completion. Probing in-transfer too closes that second manufactured-drop window (the Preparing
+    /// window was closed by #2197). WiFi never applies the bound, so this whole path is USB-only.</para>
     /// </summary>
-    private async Task<ArrayNode> ReceiveMessageWithPreparingProbeAsync(CancellationToken cancellationToken) {
-        // The total continuous Preparing silence measured across probe iterations (the hard cap bounds
-        // this, not a single probe interval). Started at the first trip and never reset while we keep
-        // waiting in the Preparing window.
-        long preparingSilenceStartTicks = 0;
+    private async Task<ArrayNode> ReceiveMessageWithSilenceProbeAsync(CancellationToken cancellationToken) {
+        // The total continuous silence measured across probe iterations (the hard cap bounds this, not a
+        // single probe interval). Started at the first trip and never reset while we keep waiting.
+        long silenceStartTicks = 0;
         while (true) {
             try {
                 return await ReceiveMessageWithInterMessageBound(cancellationToken).ConfigureAwait(false);
             }
             catch (DeviceLinkInterMessageTimeoutException interMessageTimeout) {
-                // Only PROBE while still in the Preparing window on USB — a post-transfer stall or a WiFi
-                // path must surface the signal immediately (unchanged behavior). _realTransferStarted may
-                // have latched between reads; re-check it here so the boundary is honored precisely.
-                if (_realTransferStarted || !IsUsbTransport) {
+                // Only PROBE on USB — a WiFi path never applies the bound and must surface the signal
+                // immediately (unchanged behavior). _realTransferStarted may latch between reads, so
+                // re-read it here and select the phase-appropriate hard cap precisely at this trip.
+                if (!IsUsbTransport) {
                     throw;
                 }
 
-                if (preparingSilenceStartTicks == 0) {
-                    preparingSilenceStartTicks = Stopwatch.GetTimestamp();
+                bool inTransfer = _realTransferStarted;
+                TimeSpan hardCap = SelectSilenceHardCap(inTransfer, _usbPreparingHardCap, _usbInTransferHardCap);
+                string phase = inTransfer ? "in-transfer (device committing snapshot)" : "preparing (device diffing)";
+
+                if (silenceStartTicks == 0) {
+                    silenceStartTicks = Stopwatch.GetTimestamp();
                 }
-                TimeSpan totalSilence = Stopwatch.GetElapsedTime(preparingSilenceStartTicks) + interMessageTimeout.Bound;
+                TimeSpan totalSilence = Stopwatch.GetElapsedTime(silenceStartTicks) + interMessageTimeout.Bound;
 
                 bool transportHealthy = await IsPreparingTransportHealthyAsync(cancellationToken).ConfigureAwait(false);
-                if (ShouldContinuePreparingWait(transportHealthy, totalSilence, _usbPreparingHardCap)) {
+                if (ShouldContinueSilenceWait(transportHealthy, totalSilence, hardCap)) {
                     _logger.LogInformation(
-                        "Still preparing (device diffing), transport healthy — continuing to wait (#2197 P0-B). " +
-                        "totalPreparingSilence={SilenceSec:0.#}s hardCap={HardCapSec:0.#}s",
-                        totalSilence.TotalSeconds, _usbPreparingHardCap.TotalSeconds);
+                        "Still {Phase}, transport healthy — continuing to wait (#2197 P0-B / #2200 P0). " +
+                        "totalSilence={SilenceSec:0.#}s hardCap={HardCapSec:0.#}s",
+                        phase, totalSilence.TotalSeconds, hardCap.TotalSeconds);
                     continue;
                 }
 
                 // Tear down: either the transport probe reported a dead peer, or the hard cap is exhausted.
                 if (!transportHealthy) {
                     _logger.LogWarning(
-                        "Preparing silence bound tripped and the transport probed DEAD — surfacing the bounded " +
-                        "transport-drop signal for reconnect-and-resume (#2197 P0-B). totalPreparingSilence={SilenceSec:0.#}s",
-                        totalSilence.TotalSeconds);
+                        "Silence bound tripped while {Phase} and the transport probed DEAD — surfacing the bounded " +
+                        "transport-drop signal for reconnect-and-resume (#2197 P0-B / #2200 P0). totalSilence={SilenceSec:0.#}s",
+                        phase, totalSilence.TotalSeconds);
                 }
                 else {
                     _logger.LogWarning(
-                        "Preparing hard cap exhausted ({HardCapSec:0.#}s) while the transport still probed healthy — " +
-                        "surfacing the bounded transport-drop signal for reconnect-and-resume (#2197 P0-B). " +
-                        "totalPreparingSilence={SilenceSec:0.#}s",
-                        _usbPreparingHardCap.TotalSeconds, totalSilence.TotalSeconds);
+                        "Silence hard cap exhausted ({HardCapSec:0.#}s) while {Phase} and the transport still probed healthy — " +
+                        "surfacing the bounded transport-drop signal for reconnect-and-resume (#2197 P0-B / #2200 P0). " +
+                        "totalSilence={SilenceSec:0.#}s",
+                        hardCap.TotalSeconds, phase, totalSilence.TotalSeconds);
                 }
                 throw;
             }
@@ -1383,14 +1412,28 @@ internal sealed class DeviceLinkService : IDisposable {
     }
 
     /// <summary>
-    /// ScribeHold fork (#2197, P0-B): the pure decision for whether the DlLoop keeps waiting on a
-    /// Preparing-phase silence trip. Keep waiting only when the transport is healthy AND the total
-    /// continuous Preparing silence is still within the hard cap. A dead transport, or an exhausted hard
+    /// ScribeHold fork (#2197, P0-B / #2200, P0): the pure decision for whether the DlLoop keeps waiting
+    /// on a silence-bound trip. Keep waiting only when the transport is healthy AND the total continuous
+    /// silence is still within the (phase-appropriate) hard cap. A dead transport, or an exhausted hard
     /// cap, both stop the wait so the bounded transport-drop signal surfaces. Pure + internal so the fork
     /// regression test exercises the boundary without a live socket or clock.
     /// </summary>
-    internal static bool ShouldContinuePreparingWait(bool transportHealthy, TimeSpan totalPreparingSilence, TimeSpan hardCap) {
-        return transportHealthy && totalPreparingSilence < hardCap;
+    internal static bool ShouldContinueSilenceWait(bool transportHealthy, TimeSpan totalSilence, TimeSpan hardCap) {
+        return transportHealthy && totalSilence < hardCap;
+    }
+
+    /// <summary>
+    /// ScribeHold fork (#2200, P0): the pure phase-selection for which HARD CAP bounds the probe-and-wait
+    /// loop. Before real transfer (<paramref name="realTransferStarted"/> == false) a healthy device is
+    /// in the <c>Preparing</c> window (multi-minute on-device manifest diff), so the generous
+    /// <paramref name="preparingHardCap"/> applies. After real transfer has started a healthy device may
+    /// still be quietly committing a large snapshot (the finalizing/commit tail near 99%), so the
+    /// <paramref name="inTransferHardCap"/> applies. Mirrors <see cref="SelectInterMessageBound"/> (which
+    /// selects the per-trip bound); this selects the total-continuous-silence cap for the same phase.
+    /// Pure + internal so the fork regression test exercises the boundary without a live socket or clock.
+    /// </summary>
+    internal static TimeSpan SelectSilenceHardCap(bool realTransferStarted, TimeSpan preparingHardCap, TimeSpan inTransferHardCap) {
+        return realTransferStarted ? inTransferHardCap : preparingHardCap;
     }
 
     /// <summary>

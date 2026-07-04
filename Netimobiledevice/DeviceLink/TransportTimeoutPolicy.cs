@@ -109,6 +109,22 @@ public sealed class TransportTimeoutPolicy
     public int PreparingHardCapSec { get; }
 
     /// <summary>
+    /// #2200 (P0): the HARD cap in SECONDS on TOTAL continuous IN-TRANSFER (post-first-file) silence.
+    /// The in-transfer twin of <see cref="PreparingHardCapSec"/>. Once real backup-file transfer has
+    /// started, the tight <see cref="InterMessageSilenceBoundSec"/> governs — but the FINALIZING/commit
+    /// tail (the device quietly committing a large snapshot near 99%) legitimately exceeds it, and the
+    /// original design tore the healthy session down on the very first 30s gap (a self-inflicted 10053
+    /// seconds from completion). Now the DlLoop PROBES the same way it does in Preparing: when the tight
+    /// in-transfer bound trips it runs a passive transport health check and, if healthy (device
+    /// committing), KEEPS WAITING and re-enters the bounded read. This cap bounds how long that
+    /// "healthy but silent" in-transfer waiting may continue in aggregate before the loop surfaces the
+    /// bounded transport-drop signal, so a genuinely wedged in-transfer window can never hang forever
+    /// even when the socket probe keeps reporting healthy. USB default is a few minutes (comfortably
+    /// covering a large-device snapshot commit); WiFi keeps it loose.
+    /// </summary>
+    public int InTransferHardCapSec { get; }
+
+    /// <summary>
     /// #2198 (P1-1): the PER-CHUNK bound in SECONDS applied to each async socket write in
     /// <see cref="Netimobiledevice.Lockdown.ServiceConnection.SendAsync"/>. Async writes were previously
     /// UNBOUNDED — <c>Stream.WriteTimeout</c> is sync-only in .NET, so a stalled <c>backupd</c> could park
@@ -142,7 +158,7 @@ public sealed class TransportTimeoutPolicy
     /// <param name="versionExchangeBoundSec">
     /// #2197 (P0-D): the per-read bound on each pre-DlLoop version-exchange read (seconds). Defaults to
     /// <see cref="DefaultVersionExchangeBoundSec"/> so existing callers stay non-breaking; the host
-    /// overrides it via <see cref="ForUsb(int, int, int, int, int)"/>.
+    /// overrides it via <see cref="ForUsb(int, int, int, int, int, int, int)"/>.
     /// </param>
     /// <param name="preparingHardCapSec">
     /// #2197 (P0-B): the hard cap on TOTAL continuous <c>Preparing</c> silence (seconds). Defaults to
@@ -155,6 +171,12 @@ public sealed class TransportTimeoutPolicy
     /// <see cref="DefaultWriteBoundSec"/> so existing callers stay non-breaking; <c>0</c> disables the
     /// bound (unbounded writes — the WiFi-loose behavior). Negative values are rejected.
     /// </param>
+    /// <param name="inTransferHardCapSec">
+    /// #2200 (P0): the hard cap on TOTAL continuous in-transfer (post-first-file) silence (seconds).
+    /// Defaults to <see cref="DefaultInTransferHardCapSec"/> so existing callers stay non-breaking. Must
+    /// be >= the tight <paramref name="interMessageSilenceBoundSec"/> (the cap can never be tighter than
+    /// a single in-transfer probe interval).
+    /// </param>
     public TransportTimeoutPolicy(
         int readTimeoutMs,
         int keepAliveTimeSec,
@@ -165,7 +187,8 @@ public sealed class TransportTimeoutPolicy
         int preparingSilenceBoundSec = DefaultPreparingSilenceBoundSec,
         int versionExchangeBoundSec = DefaultVersionExchangeBoundSec,
         int preparingHardCapSec = DefaultPreparingHardCapSec,
-        int writeBoundSec = DefaultWriteBoundSec)
+        int writeBoundSec = DefaultWriteBoundSec,
+        int inTransferHardCapSec = DefaultInTransferHardCapSec)
     {
         if (readTimeoutMs != Timeout.Infinite && readTimeoutMs <= 0) {
             throw new ArgumentOutOfRangeException(nameof(readTimeoutMs), readTimeoutMs, "Read timeout must be positive or Timeout.Infinite.");
@@ -197,6 +220,9 @@ public sealed class TransportTimeoutPolicy
         if (writeBoundSec < 0) {
             throw new ArgumentOutOfRangeException(nameof(writeBoundSec), writeBoundSec, "Write bound must be non-negative (0 disables the bound).");
         }
+        if (inTransferHardCapSec < interMessageSilenceBoundSec) {
+            throw new ArgumentOutOfRangeException(nameof(inTransferHardCapSec), inTransferHardCapSec, "In-transfer hard cap must be >= the tight in-transfer inter-message silence bound.");
+        }
 
         ReadTimeoutMs = readTimeoutMs;
         KeepAliveTimeSec = keepAliveTimeSec;
@@ -208,6 +234,7 @@ public sealed class TransportTimeoutPolicy
         VersionExchangeBoundSec = versionExchangeBoundSec;
         PreparingHardCapSec = preparingHardCapSec;
         WriteBoundSec = writeBoundSec;
+        InTransferHardCapSec = inTransferHardCapSec;
     }
 
     /// <summary>
@@ -233,7 +260,7 @@ public sealed class TransportTimeoutPolicy
     /// that a resumed session hitting a busy-but-silent <c>backupd</c> feeds reconnect-and-resume in
     /// seconds instead of waiting the coarse ~10-minute stream read and then dead-ending as fatal, yet
     /// generous enough to absorb a healthy handshake's round-trips. The host overrides it via
-    /// <see cref="ForUsb(int, int, int, int, int)"/>.
+    /// <see cref="ForUsb(int, int, int, int, int, int, int)"/>.
     /// </summary>
     public const int DefaultVersionExchangeBoundSec = 35;
 
@@ -242,9 +269,19 @@ public sealed class TransportTimeoutPolicy
     /// is 15 minutes; this default sits comfortably above a real on-device manifest diff (observed at
     /// several minutes) so a healthy-but-silent Preparing window is never torn down for exceeding the
     /// cap while the socket probe reports the transport healthy. The host overrides it via
-    /// <see cref="ForUsb(int, int, int, int, int)"/>.
+    /// <see cref="ForUsb(int, int, int, int, int, int, int)"/>.
     /// </summary>
     public const int DefaultPreparingHardCapSec = 20 * 60;
+
+    /// <summary>
+    /// #2200 (P0): the library-default IN-TRANSFER hard cap in SECONDS (5 minutes). Comfortably covers a
+    /// large-device snapshot commit/finalize tail (the device quietly committing near 99%) so a healthy
+    /// finalizing session is never torn down for exceeding the cap while the socket probe reports the
+    /// transport healthy, yet still bounds a genuinely wedged in-transfer window. Shorter than the
+    /// Preparing hard cap (a manifest diff can legitimately run longer than a commit tail). The host
+    /// overrides it via <see cref="ForUsb(int, int, int, int, int, int, int)"/>.
+    /// </summary>
+    public const int DefaultInTransferHardCapSec = 5 * 60;
 
     /// <summary>
     /// The SSL-handshake watchdog bound as a <see cref="TimeSpan"/> for direct use with a
@@ -271,6 +308,11 @@ public sealed class TransportTimeoutPolicy
     /// #2197 (P0-B): the total-continuous Preparing hard cap as a <see cref="TimeSpan"/>.
     /// </summary>
     public TimeSpan PreparingHardCap => TimeSpan.FromSeconds(PreparingHardCapSec);
+
+    /// <summary>
+    /// #2200 (P0): the total-continuous in-transfer hard cap as a <see cref="TimeSpan"/>.
+    /// </summary>
+    public TimeSpan InTransferHardCap => TimeSpan.FromSeconds(InTransferHardCapSec);
 
     /// <summary>
     /// #2198 (P1-1): the per-chunk async write bound as a <see cref="TimeSpan"/>.
@@ -306,7 +348,10 @@ public sealed class TransportTimeoutPolicy
         preparingHardCapSec: DefaultPreparingHardCapSec,
         // #2198 (P1-1): bound each ~64KB async write chunk so a stalled backupd can never park a send
         // forever (the previously-unbounded async write — WriteTimeout is sync-only in .NET).
-        writeBoundSec: DefaultWriteBoundSec);
+        writeBoundSec: DefaultWriteBoundSec,
+        // #2200 (P0): the hard cap on TOTAL continuous in-transfer silence (the finalizing/commit-tail
+        // probe-and-wait loop's last-resort bound), comfortably above a large-device snapshot commit.
+        inTransferHardCapSec: DefaultInTransferHardCapSec);
 
     /// <summary>
     /// WiFi (lockdown/TCP) transport policy -- LOOSE, preserving existing behavior. Every bound is
@@ -333,7 +378,10 @@ public sealed class TransportTimeoutPolicy
         preparingHardCapSec: 10 * 60,
         // #2198 (P1-1): WiFi writes stay UNBOUNDED — 0 disables the per-chunk write bound entirely, so
         // WiFi async-write behavior is byte-for-byte untouched (no gratuitous WiFi change).
-        writeBoundSec: 0);
+        writeBoundSec: 0,
+        // #2200 (P0): WiFi keeps a loose in-transfer hard cap (the probe-and-wait path is USB-only
+        // anyway; this keeps the value object internally consistent and >= the loose inter-message bound).
+        inTransferHardCapSec: 10 * 60);
 
     /// <summary>
     /// ScribeHold fork (#2190): build the USB-tight policy the host drives from
@@ -367,13 +415,19 @@ public sealed class TransportTimeoutPolicy
     /// <c>BackupConfiguration.UsbWriteBoundSec</c>. Defaults to <see cref="DefaultWriteBoundSec"/>;
     /// <c>0</c> disables the bound.
     /// </param>
+    /// <param name="inTransferHardCapSec">
+    /// #2200 (P0): the hard cap on total continuous in-transfer silence (seconds); from
+    /// <c>BackupConfiguration.UsbInTransferHardCapSec</c>. Defaults to
+    /// <see cref="DefaultInTransferHardCapSec"/>. Must be >= <paramref name="interMessageSilenceBoundSec"/>.
+    /// </param>
     public static TransportTimeoutPolicy ForUsb(
         int sslHandshakeWatchdogSec,
         int interMessageSilenceBoundSec,
         int preparingSilenceBoundSec = DefaultPreparingSilenceBoundSec,
         int versionExchangeBoundSec = DefaultVersionExchangeBoundSec,
         int preparingHardCapSec = DefaultPreparingHardCapSec,
-        int writeBoundSec = DefaultWriteBoundSec)
+        int writeBoundSec = DefaultWriteBoundSec,
+        int inTransferHardCapSec = DefaultInTransferHardCapSec)
     {
         return new TransportTimeoutPolicy(
             readTimeoutMs: UsbTight.ReadTimeoutMs,
@@ -385,7 +439,8 @@ public sealed class TransportTimeoutPolicy
             preparingSilenceBoundSec: preparingSilenceBoundSec,
             versionExchangeBoundSec: versionExchangeBoundSec,
             preparingHardCapSec: preparingHardCapSec,
-            writeBoundSec: writeBoundSec);
+            writeBoundSec: writeBoundSec,
+            inTransferHardCapSec: inTransferHardCapSec);
     }
 
     /// <summary>

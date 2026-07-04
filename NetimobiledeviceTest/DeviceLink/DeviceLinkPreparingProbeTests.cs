@@ -15,7 +15,7 @@ namespace NetimobiledeviceTest.DeviceLink;
 /// waiting under a total-continuous hard cap. It tears down (surfaces the bounded transport-drop signal)
 /// ONLY on transport evidence (probe says dead) or hard-cap exhaustion.
 ///
-/// These pin the pure decision (<see cref="DeviceLinkService.ShouldContinuePreparingWait"/>) and the
+/// These pin the pure decision (<see cref="DeviceLinkService.ShouldContinueSilenceWait"/>) and the
 /// passive socket probe (<see cref="ServiceConnection.IsTransportHealthy"/>) with a live loopback socket
 /// pair — the decisive pieces — without needing a full mb2 device.
 /// </summary>
@@ -25,36 +25,54 @@ public class DeviceLinkPreparingProbeTests
     // ── The pure keep-waiting decision ──────────────────────────────────────────────────────────────
 
     [TestMethod]
-    [Description("#2197 (P0-B): keep waiting ONLY when the transport is healthy AND total continuous " +
-                 "Preparing silence is still within the hard cap.")]
-    public void ShouldContinuePreparingWait_HealthyAndWithinCap_KeepsWaiting()
+    [Description("#2197 (P0-B) / #2200 (P0): keep waiting ONLY when the transport is healthy AND total " +
+                 "continuous silence is still within the (phase-appropriate) hard cap.")]
+    public void ShouldContinueSilenceWait_HealthyAndWithinCap_KeepsWaiting()
     {
-        Assert.IsTrue(DeviceLinkService.ShouldContinuePreparingWait(
-            transportHealthy: true, totalPreparingSilence: TimeSpan.FromMinutes(3), hardCap: TimeSpan.FromMinutes(20)),
-            "A healthy transport still within the hard cap means the device is still diffing — keep waiting.");
+        Assert.IsTrue(DeviceLinkService.ShouldContinueSilenceWait(
+            transportHealthy: true, totalSilence: TimeSpan.FromMinutes(3), hardCap: TimeSpan.FromMinutes(20)),
+            "A healthy transport still within the hard cap means the device is still working — keep waiting.");
     }
 
     [TestMethod]
-    [Description("#2197 (P0-B): a DEAD transport stops the wait immediately (tear down on transport evidence), " +
-                 "even well within the hard cap.")]
-    public void ShouldContinuePreparingWait_DeadTransport_StopsWaiting()
+    [Description("#2197 (P0-B) / #2200 (P0): a DEAD transport stops the wait immediately (tear down on " +
+                 "transport evidence), even well within the hard cap.")]
+    public void ShouldContinueSilenceWait_DeadTransport_StopsWaiting()
     {
-        Assert.IsFalse(DeviceLinkService.ShouldContinuePreparingWait(
-            transportHealthy: false, totalPreparingSilence: TimeSpan.FromSeconds(1), hardCap: TimeSpan.FromMinutes(20)),
+        Assert.IsFalse(DeviceLinkService.ShouldContinueSilenceWait(
+            transportHealthy: false, totalSilence: TimeSpan.FromSeconds(1), hardCap: TimeSpan.FromMinutes(20)),
             "A dead-peer probe verdict must tear down immediately, regardless of the hard cap.");
     }
 
     [TestMethod]
-    [Description("#2197 (P0-B): an exhausted hard cap stops the wait even when the transport still probes " +
-                 "healthy — a genuinely wedged Preparing window can never hang forever.")]
-    public void ShouldContinuePreparingWait_HardCapExhausted_StopsWaiting()
+    [Description("#2197 (P0-B) / #2200 (P0): an exhausted hard cap stops the wait even when the transport " +
+                 "still probes healthy — a genuinely wedged silence window can never hang forever.")]
+    public void ShouldContinueSilenceWait_HardCapExhausted_StopsWaiting()
     {
-        Assert.IsFalse(DeviceLinkService.ShouldContinuePreparingWait(
-            transportHealthy: true, totalPreparingSilence: TimeSpan.FromMinutes(20), hardCap: TimeSpan.FromMinutes(20)),
+        Assert.IsFalse(DeviceLinkService.ShouldContinueSilenceWait(
+            transportHealthy: true, totalSilence: TimeSpan.FromMinutes(20), hardCap: TimeSpan.FromMinutes(20)),
             "At the hard cap the wait must stop even if the transport still probes healthy (>= is exhausted).");
-        Assert.IsFalse(DeviceLinkService.ShouldContinuePreparingWait(
-            transportHealthy: true, totalPreparingSilence: TimeSpan.FromMinutes(21), hardCap: TimeSpan.FromMinutes(20)),
+        Assert.IsFalse(DeviceLinkService.ShouldContinueSilenceWait(
+            transportHealthy: true, totalSilence: TimeSpan.FromMinutes(21), hardCap: TimeSpan.FromMinutes(20)),
             "Beyond the hard cap the wait must stop.");
+    }
+
+    // ── #2200 (P0): the phase-selection of which hard cap bounds the probe-and-wait ──────────────────
+
+    [TestMethod]
+    [Description("#2200 (P0): SelectSilenceHardCap picks the generous Preparing hard cap pre-first-file and " +
+                 "the in-transfer hard cap once real transfer has started — mirroring SelectInterMessageBound.")]
+    public void SelectSilenceHardCap_PicksByPhase()
+    {
+        TimeSpan preparing = TimeSpan.FromMinutes(20);
+        TimeSpan inTransfer = TimeSpan.FromMinutes(5);
+
+        Assert.AreEqual(preparing, DeviceLinkService.SelectSilenceHardCap(
+            realTransferStarted: false, preparingHardCap: preparing, inTransferHardCap: inTransfer),
+            "Pre-first-file (Preparing) must use the generous Preparing hard cap.");
+        Assert.AreEqual(inTransfer, DeviceLinkService.SelectSilenceHardCap(
+            realTransferStarted: true, preparingHardCap: preparing, inTransferHardCap: inTransfer),
+            "Post-first-file (in-transfer/finalizing) must use the in-transfer hard cap.");
     }
 
     // ── The passive socket probe ────────────────────────────────────────────────────────────────────
@@ -114,15 +132,16 @@ public class DeviceLinkPreparingProbeTests
     }
 
     [TestMethod]
-    [Description("#2197 (P0-B): the ctor seeds the version-exchange bound and the Preparing hard cap from the " +
-                 "connection's TransportTimeoutPolicy so the host config values take effect.")]
-    public void Ctor_SeedsVersionExchangeAndHardCapFromConnectionPolicy()
+    [Description("#2197 (P0-B) / #2200 (P0): the ctor seeds the version-exchange bound, the Preparing hard cap, " +
+                 "and the in-transfer hard cap from the connection's TransportTimeoutPolicy so the host config " +
+                 "values take effect.")]
+    public void Ctor_SeedsVersionExchangeAndHardCapsFromConnectionPolicy()
     {
         using SocketPair pair = SocketPair.CreateConnected();
         ServiceConnection connection = CreateServiceConnection(pair.Client, timeout: 5000);
         connection.TimeoutPolicy = TransportTimeoutPolicy.ForUsb(
             sslHandshakeWatchdogSec: 60, interMessageSilenceBoundSec: 30, preparingSilenceBoundSec: 240,
-            versionExchangeBoundSec: 42, preparingHardCapSec: 1000);
+            versionExchangeBoundSec: 42, preparingHardCapSec: 1000, writeBoundSec: 60, inTransferHardCapSec: 222);
 
         using var dl = new DeviceLinkService(connection, backupDirectory: string.Empty, iosVersion: new Version(17, 0),
             logger: NullLogger.Instance);
@@ -131,6 +150,8 @@ public class DeviceLinkPreparingProbeTests
             "The version-exchange bound must be seeded from the connection's policy.");
         Assert.AreEqual(TimeSpan.FromSeconds(1000), ReadField(dl, "_usbPreparingHardCap"),
             "The Preparing hard cap must be seeded from the connection's policy.");
+        Assert.AreEqual(TimeSpan.FromSeconds(222), ReadField(dl, "_usbInTransferHardCap"),
+            "The in-transfer hard cap must be seeded from the connection's policy (#2200 P0).");
     }
 
     // ── #2197 (P0-E): the per-exchange status extractor ─────────────────────────────────────────────
