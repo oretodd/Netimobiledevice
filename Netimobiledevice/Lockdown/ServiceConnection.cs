@@ -318,10 +318,14 @@ public class ServiceConnection : IDisposable {
             totalBytesRead += bytesRead;
         }
 
-        // ScribeHold fork (#2068): wire-level read trace, gated to Debug (Netimobiledevice category
-        // is pinned to Warning unless EnableDiagnosticLogging raises it), so it is free when off.
-        if (_logger.IsEnabled(LogLevel.Debug)) {
-            _logger.LogDebug("ServiceConnection.Receive read {Read}/{Expected} bytes", totalBytesRead, length);
+        // ScribeHold fork (#2068, demoted #2298 P0-b): per-read wire-level trace. Demoted from Debug to
+        // Trace so it no longer floods the log during a healthy transfer — a bulk read splits into one
+        // trace per <=32KB MAX_READ_SIZE chunk, so at Debug it drowned the diagnostic channel while a
+        // multi-GB backup was moving. At Trace it stays available for the deepest wire diagnosis but is
+        // off the Debug channel EnableDiagnosticLogging raises (Netimobiledevice is pinned to Warning
+        // otherwise), so it is free when off.
+        if (_logger.IsEnabled(LogLevel.Trace)) {
+            _logger.LogTrace("ServiceConnection.Receive read {Read}/{Expected} bytes", totalBytesRead, length);
         }
 
         if (totalBytesRead < buffer.Length) {
@@ -384,9 +388,13 @@ public class ServiceConnection : IDisposable {
             totalBytesRead += bytesRead;
         }
 
-        // ScribeHold fork (#2068): wire-level read trace (Debug-gated, free when off).
-        if (_logger.IsEnabled(LogLevel.Debug)) {
-            _logger.LogDebug("ServiceConnection.ReceiveAsync read {Read}/{Expected} bytes", totalBytesRead, length);
+        // ScribeHold fork (#2068, demoted #2298 P0-b): per-chunk wire-level read trace. Demoted from
+        // Debug to Trace so it no longer FLOODS the log during a healthy 256KB-chunk transfer — this
+        // line fired once per <=32KB MAX_READ_SIZE read, i.e. many times per 256KB DownloadFiles chunk,
+        // drowning the Debug channel across a multi-GB backup. Trace keeps it for the deepest wire
+        // diagnosis while leaving it off the Debug channel EnableDiagnosticLogging raises; free when off.
+        if (_logger.IsEnabled(LogLevel.Trace)) {
+            _logger.LogTrace("ServiceConnection.ReceiveAsync read {Read}/{Expected} bytes", totalBytesRead, length);
         }
 
         if (totalBytesRead < buffer.Length) {
