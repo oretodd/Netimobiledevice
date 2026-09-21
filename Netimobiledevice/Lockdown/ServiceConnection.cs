@@ -1,10 +1,10 @@
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using Netimobiledevice.DeviceLink;
-using Netimobiledevice.EndianBitConversion;
 using Netimobiledevice.Plist;
 using Netimobiledevice.Usbmuxd;
 using System;
+using System.Buffers.Binary;
 using System.IO;
 using System.Linq;
 using System.Net;
@@ -20,7 +20,7 @@ namespace Netimobiledevice.Lockdown;
 /// <summary>
 /// A wrapper for usbmux tcp-relay connections
 /// </summary>
-public class ServiceConnection : IDisposable {
+public sealed class ServiceConnection : IDisposable, IAsyncDisposable {
     private const int MAX_READ_SIZE = 32768;
 
     // ScribeHold fork (#2198, P1-1): the async-send chunk size. SendAsync splits every payload into
@@ -43,7 +43,7 @@ public class ServiceConnection : IDisposable {
     /// property instead
     /// </summary>
     private SslStream? _sslStream;
-    private int _timeout = Timeout.Infinite;
+    private int _timeout;
 
     /// <summary>
     /// ScribeHold fork (#2182): the transport-timeout policy this connection delegates to for the
@@ -162,18 +162,18 @@ public class ServiceConnection : IDisposable {
 
     internal static ServiceConnection CreateUsingTcp(string hostname, ushort port, int timeout = 10_000, ILogger? logger = null) {
         IPAddress ip = IPAddress.Parse(hostname);
-        Socket sock = new Socket(SocketType.Stream, ProtocolType.IP);
+        Socket sock = new Socket(SocketType.Stream, ProtocolType.Tcp);
         sock.Connect(ip, port);
         return new ServiceConnection(sock, timeout, logger ?? NullLogger.Instance);
     }
 
     internal static async Task<ServiceConnection> CreateUsingTcpAsync(string hostname, ushort port, int timeout = 10_000, ILogger? logger = null) {
         IPAddress ip = IPAddress.Parse(hostname);
-        Socket sock = new Socket(SocketType.Stream, ProtocolType.IP);
+        Socket sock = new Socket(SocketType.Stream, ProtocolType.Tcp);
 
         using (CancellationTokenSource cts = new CancellationTokenSource(TimeSpan.FromMilliseconds(timeout))) {
             try {
-                await sock.ConnectAsync(ip, port).ConfigureAwait(false);
+                await sock.ConnectAsync(ip, port, cts.Token).ConfigureAwait(false);
             }
             catch (OperationCanceledException) {
                 sock.Dispose();
@@ -234,6 +234,9 @@ public class ServiceConnection : IDisposable {
         sock.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.TcpKeepAliveRetryCount, policy.KeepAliveRetryCount);
     }
 
+    /// <summary>
+    /// iOS pairing uses self-signed/host-issued certs that can't be chain-validated so we have this function which always returns true to ignore that
+    /// </summary>
     private bool UserCertificateValidationCallback(object sender, X509Certificate? certificate, X509Chain? chain, SslPolicyErrors sslPolicyErrors) {
         return true;
     }
@@ -287,10 +290,22 @@ public class ServiceConnection : IDisposable {
         GC.SuppressFinalize(this);
     }
 
+    public async ValueTask DisposeAsync() {
+        Close();
+
+        if (_sslStream != null) {
+            await _sslStream.DisposeAsync().ConfigureAwait(false);
+        }
+        await _networkStream.DisposeAsync().ConfigureAwait(false);
+
+        GC.SuppressFinalize(this);
+    }
+
     public byte[] Receive(int length = 4096) {
         if (length <= 0) {
             return [];
         }
+
         byte[] buffer = new byte[length];
 
         int totalBytesRead = 0;
@@ -338,6 +353,7 @@ public class ServiceConnection : IDisposable {
         if (length <= 0) {
             return [];
         }
+
         byte[] buffer = new byte[length];
 
         int totalBytesRead = 0;
@@ -429,7 +445,7 @@ public class ServiceConnection : IDisposable {
             return [];
         }
 
-        int size = EndianBitConverter.BigEndian.ToInt32(sizeBytes, 0);
+        int size = BinaryPrimitives.ReadInt32BigEndian(sizeBytes);
         return Receive(size);
     }
 
@@ -443,7 +459,7 @@ public class ServiceConnection : IDisposable {
             return [];
         }
 
-        int size = EndianBitConverter.BigEndian.ToInt32(sizeBytes, 0);
+        int size = BinaryPrimitives.ReadInt32BigEndian(sizeBytes);
         return await ReceiveAsync(size, cancellationToken).ConfigureAwait(false);
     }
 
@@ -527,7 +543,9 @@ public class ServiceConnection : IDisposable {
 
     public void SendPlist(PropertyNode data, PlistFormat format = PlistFormat.Xml) {
         byte[] plistBytes = PropertyList.SaveAsByteArray(data, format);
-        byte[] lengthBytes = BitConverter.GetBytes(EndianBitConverter.BigEndian.ToUInt32(BitConverter.GetBytes(plistBytes.Length), 0));
+
+        byte[] lengthBytes = new byte[sizeof(uint)];
+        BinaryPrimitives.WriteUInt32BigEndian(lengthBytes, (uint) plistBytes.Length);
 
         Send(lengthBytes);
         Send(plistBytes);
@@ -535,7 +553,9 @@ public class ServiceConnection : IDisposable {
 
     public async Task SendPlistAsync(PropertyNode data, PlistFormat format = PlistFormat.Xml, CancellationToken cancellationToken = default) {
         byte[] plistBytes = PropertyList.SaveAsByteArray(data, format);
-        byte[] lengthBytes = BitConverter.GetBytes(EndianBitConverter.BigEndian.ToUInt32(BitConverter.GetBytes(plistBytes.Length), 0));
+
+        byte[] lengthBytes = new byte[sizeof(uint)];
+        BinaryPrimitives.WriteUInt32BigEndian(lengthBytes, (uint) plistBytes.Length);
 
         await SendAsync(lengthBytes, cancellationToken).ConfigureAwait(false);
         await SendAsync(plistBytes, cancellationToken).ConfigureAwait(false);
@@ -565,6 +585,9 @@ public class ServiceConnection : IDisposable {
     }
 
     public bool StartSsl(X509Certificate2 certificate) {
+        if (_sslStream != null) {
+            throw new InvalidOperationException("SSL stream already exists");
+        }
         if (_networkStream == null) {
             throw new InvalidOperationException("Network stream is null");
         }
@@ -588,8 +611,9 @@ public class ServiceConnection : IDisposable {
         // classifiable transport-drop signal that FEEDS reconnect-and-resume. The watchdog bounds only
         // the SSL wait — it does not clip the passcode/trust dialog window (#1999 intent preserved).
         SslStream handshakeStream = _sslStream;
+        // TLS v1.2 is supported since iOS 5 so we should specify this as a minimum
         Task handshakeTask = Task.Run(() =>
-            handshakeStream.AuthenticateAsClient(string.Empty, [certificate], SslProtocols.None, false));
+            handshakeStream.AuthenticateAsClient(string.Empty, [certificate], SslProtocols.Tls12 | SslProtocols.Tls13, false));
         try {
             if (!handshakeTask.Wait(_timeoutPolicy.SslHandshakeWatchdog)) {
                 // Watchdog tripped. Dispose the stream so the blocked AuthenticateAsClient unwinds,
@@ -653,6 +677,9 @@ public class ServiceConnection : IDisposable {
     }
 
     public async Task<bool> StartSslAsync(X509Certificate2 certificate) {
+        if (_sslStream != null) {
+            throw new InvalidOperationException("SSL stream already exists");
+        }
         if (_networkStream == null) {
             throw new InvalidOperationException("Network stream is null");
         }

@@ -11,7 +11,7 @@ namespace NetimobiledeviceTest.DeviceLink;
 /// append correctly. When a PRIOR backup session was interrupted mid-file, a partial copy can remain
 /// on disk. On the next attempt the device re-sends the WHOLE file -- and the open+seek-to-end would
 /// APPEND the re-send onto the stale partial (partial bytes + full bytes), silently corrupting the
-/// file. The fix (<see cref="DeviceLinkService.DeleteStalePartial"/>) removes any pre-existing file
+/// file. The fix (<see cref="DeviceLinkService.RemoveExpiredFile"/>) removes any pre-existing file
 /// at the start of a fresh transfer so the re-send is a clean replacement.
 ///
 /// These tests exercise the EXACT production write sequence against the filesystem so they would
@@ -32,11 +32,11 @@ public class DeviceLinkPartialFileTruncationTests
 
     /// <summary>
     /// Mirrors the production receive sequence for the FIRST chunk of a new file transfer:
-    /// DeleteStalePartial -> File.OpenWrite -> Seek(End) -> write the whole re-sent content.
+    /// RemoveExpiredFile -> File.OpenWrite -> Seek(End) -> write the whole re-sent content.
     /// </summary>
     private static void ReceiveWholeFile(string localPath, byte[] resentContent)
     {
-        DeviceLinkService.DeleteStalePartial(localPath);
+        DeviceLinkService.RemoveExpiredFile(localPath);
         using FileStream fs = File.OpenWrite(localPath);
         fs.Seek(0, SeekOrigin.End);
         fs.Write(resentContent, 0, resentContent.Length);
@@ -90,7 +90,7 @@ public class DeviceLinkPartialFileTruncationTests
 
             byte[] whole = new byte[5000];
 
-            // Reproduce the OLD behavior (no DeleteStalePartial) to confirm it corrupts.
+            // Reproduce the OLD behavior (no RemoveExpiredFile) to confirm it corrupts.
             using (FileStream fs = File.OpenWrite(path)) {
                 fs.Seek(0, SeekOrigin.End);
                 fs.Write(whole, 0, whole.Length);
@@ -109,15 +109,15 @@ public class DeviceLinkPartialFileTruncationTests
     }
 
     [TestMethod]
-    [Description("DeleteStalePartial is a no-op when the target file does not already exist.")]
-    public void DeleteStalePartial_NoPreExistingFile_IsNoOpAndAllowsCleanWrite()
+    [Description("RemoveExpiredFile is a no-op when the target file does not already exist.")]
+    public void RemoveExpiredFile_NoPreExistingFile_IsNoOpAndAllowsCleanWrite()
     {
         string path = CreateTempPath();
         try {
             Assert.IsFalse(File.Exists(path), "Precondition: no file at the target path.");
 
             // Must not throw on a non-existent path.
-            DeviceLinkService.DeleteStalePartial(path);
+            DeviceLinkService.RemoveExpiredFile(path);
 
             byte[] whole = new byte[1234];
             for (int i = 0; i < whole.Length; i++) {
@@ -152,12 +152,12 @@ public class DeviceLinkPartialFileTruncationTests
             }
 
             // First chunk of a NEW file: delete stale (none), open, seek-end, write.
-            DeviceLinkService.DeleteStalePartial(path);
+            DeviceLinkService.RemoveExpiredFile(path);
             using (FileStream fs = File.OpenWrite(path)) {
                 fs.Seek(0, SeekOrigin.End);
                 fs.Write(chunk1, 0, chunk1.Length);
                 // Subsequent chunk WITHIN the same session: stream stays open, seek-end, append.
-                // (No DeleteStalePartial call -- it only runs when _fileStream == null.)
+                // (No RemoveExpiredFile call -- it only runs when _fileStream == null.)
                 fs.Seek(0, SeekOrigin.End);
                 fs.Write(chunk2, 0, chunk2.Length);
             }
@@ -178,16 +178,16 @@ public class DeviceLinkPartialFileTruncationTests
     }
 
     [TestMethod]
-    [Description("Regression guard: DeleteStalePartial exists as an internal static method on DeviceLinkService.")]
-    public void DeleteStalePartial_MethodExists()
+    [Description("Regression guard: RemoveExpiredFile exists as an internal static method on DeviceLinkService.")]
+    public void RemoveExpiredFile_MethodExists()
     {
         System.Reflection.MethodInfo? method = typeof(DeviceLinkService).GetMethod(
-            "DeleteStalePartial",
+            "RemoveExpiredFile",
             System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static);
 
         Assert.IsNotNull(method,
-            "DeviceLinkService.DeleteStalePartial must exist. This is the fork-only data-corruption " +
-            "GATE for #2046. If this test fails after an upstream merge, restore the delete-guard " +
-            "before File.OpenWrite in UploadFiles.");
+            "DeviceLinkService.RemoveExpiredFile must exist. This is the data-corruption GATE for " +
+            "#2046 (upstream c4904fc fixes the same defect). If this test fails after an upstream " +
+            "merge, restore the delete-guard before File.OpenWrite in UploadFiles.");
     }
 }

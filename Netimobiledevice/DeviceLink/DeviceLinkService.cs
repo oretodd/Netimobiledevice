@@ -395,18 +395,6 @@ internal sealed class DeviceLinkService : IDisposable {
     }
 
     /// <summary>
-    /// ScribeHold fork (data-corruption GATE, #2046): removes any pre-existing file at the given
-    /// local path so the upcoming whole-file transfer replaces it instead of appending onto a stale
-    /// partial left by an interrupted prior backup session. No-op when the path does not exist.
-    /// Internal + static so the receive loop and the fork regression test exercise identical logic.
-    /// </summary>
-    internal static void DeleteStalePartial(string localPath) {
-        if (!string.IsNullOrEmpty(localPath) && File.Exists(localPath)) {
-            File.Delete(localPath);
-        }
-    }
-
-    /// <summary>
     /// Manages the ListDirectory device message.
     /// </summary>
     /// <param name="msg">The message received from the device.</param>
@@ -423,12 +411,12 @@ internal sealed class DeviceLinkService : IDisposable {
         DictionaryNode dirList = [];
         DirectoryInfo dir = new DirectoryInfo(path);
         if (dir.Exists) {
-            foreach (FileSystemInfo entry in dir.GetFileSystemInfos()) {
+            foreach (FileSystemInfo entry in dir.EnumerateFileSystemInfos()) {
                 cancellationToken.ThrowIfCancellationRequested();
                 DictionaryNode entryDict = new DictionaryNode {
                     { "DLFileModificationDate", new DateNode(entry.LastWriteTime) },
                     { "DLFileSize", new IntegerNode(entry is FileInfo fileInfo ? fileInfo.Length : 0L) },
-                    { "DLFileType", new StringNode(entry.Attributes.HasFlag(FileAttributes.Directory) ? "DLFileTypeDirectory" : "DLFileTypeRegular") }
+                    { "DLFileType", new StringNode(entry is DirectoryInfo ? "DLFileTypeDirectory" : "DLFileTypeRegular") }
                 };
                 dirList.Add(entry.Name, entryDict);
             }
@@ -825,6 +813,17 @@ internal sealed class DeviceLinkService : IDisposable {
     }
 
     /// <summary>
+    /// Removes any pre-existing file at the given local path so the upcoming whole-file transfer 
+    /// replaces it instead of potentially appending onto an expired file left by an interrupted 
+    /// prior backup session.
+    /// </summary>
+    internal static void RemoveExpiredFile(string path) {
+        if (!string.IsNullOrEmpty(path) && File.Exists(path)) {
+            File.Delete(path);
+        }
+    }
+
+    /// <summary>
     /// Manages the RemoveItems device message.
     /// </summary>
     /// <param name="msg">The message received from the device.</param>
@@ -953,7 +952,7 @@ internal sealed class DeviceLinkService : IDisposable {
             if (backupFile != null) {
                 // Ensure the directory requested exists before writing to it.
                 string? pathDir = Path.GetDirectoryName(backupFile.LocalPath);
-                if (!string.IsNullOrWhiteSpace(pathDir) && !Directory.Exists(backupFile.LocalPath)) {
+                if (!string.IsNullOrWhiteSpace(pathDir) && !Directory.Exists(pathDir)) {
                     Directory.CreateDirectory(pathDir);
                 }
 
@@ -968,25 +967,15 @@ internal sealed class DeviceLinkService : IDisposable {
                 // ScribeHold fork: classify once per file (at first chunk). If discarding, skip
                 // File.OpenWrite and drain all chunks without writing. _fileStream stays null for
                 // discarded files.
-                if (_fileStream == null && !_discarding) {
+                if (_fileStream is null && !_discarding) {
                     _discarding = ShouldDiscardFile?.Invoke(backupFile.DevicePath) ?? false;
                     if (!_discarding) {
-                        // ScribeHold fork (data-corruption GATE, #2046): delete any pre-existing
-                        // file at the LocalPath before opening the write stream. When a prior backup
-                        // session was interrupted mid-file, a partial copy can remain on disk; the
-                        // device re-sends the WHOLE file. File.OpenWrite + Seek(End) below would
-                        // APPEND the re-send onto that partial (partial bytes + full bytes), silently
-                        // corrupting the backup. Removing the stale file first makes the re-send a
-                        // clean replacement. Generalizes the prior Status.plist-only delete-guard to
-                        // every file (BackupFile.LocalPath is deterministic). Only runs at the start
-                        // of a new file (_fileStream == null) -- the in-session multi-chunk append
-                        // path below (_fileStream != null) is untouched.
-                        DeleteStalePartial(backupFile.LocalPath);
+                        RemoveExpiredFile(backupFile.LocalPath);
                         _fileStream = File.OpenWrite(backupFile.LocalPath);
                         _fileStream.Seek(0, SeekOrigin.End);
                     }
                 }
-                else if (_fileStream != null) {
+                else if (_fileStream is not null) {
                     _fileStream.Seek(0, SeekOrigin.End);
                 }
 
@@ -1021,7 +1010,7 @@ internal sealed class DeviceLinkService : IDisposable {
                     byte[] msgBuffer = await _service.ReceiveAsync(size, cancellationToken).ConfigureAwait(false);
                     string errorMessage = Encoding.UTF8.GetString(msgBuffer);
 
-                    _logger.LogWarning("Failed to fully upload {localPath}. Device file name {devicePath}. Reason: {msg}", backupFile.LocalPath, backupFile.DevicePath, errorMessage);
+                    _logger.LogWarning("Failed to fully upload {localPath}. Device file name {devicePath}. Reason: {errorMessage}", backupFile.LocalPath, backupFile.DevicePath, errorMessage);
                     OnFileTransferError(backupFile, $"{code}: {msg} [ExpectedSize: {backupFile.ExpectedFileSize}, ActualReceived: {backupFile.FileSize} ]");
                     _discarding = false;
 
@@ -1048,7 +1037,6 @@ internal sealed class DeviceLinkService : IDisposable {
 
         await guard.SendTerminatingStatusAsync(0, null, null, cancellationToken).ConfigureAwait(false);
     }
-
 
     /// <summary>
     /// ScribeHold fork: returns cumulative receive/write throughput counters and resets them to
@@ -1105,7 +1093,7 @@ internal sealed class DeviceLinkService : IDisposable {
     }
 
     public async Task<ResultCode> DlLoop(CancellationToken cancellationToken = default) {
-        Started?.Invoke(this, new BackupStartedEventArgs(this._iosVersion));
+        Started?.Invoke(this, new BackupStartedEventArgs(_iosVersion));
         FailedFiles.Clear();
         // ScribeHold fork (#2081): reset the Finished latch per loop so a reused service instance never
         // carries a prior session's terminal state into a new backup.
@@ -1240,9 +1228,6 @@ internal sealed class DeviceLinkService : IDisposable {
                 }
 
                 default: {
-                    // #2199 (P2-3): guard the progress read. A KNOWN handler whose message is shorter than
-                    // expected (a truncated/new-shape message from a future iOS) must not IndexOutOfRange
-                    // the whole backup — skip the progress update and let the handler run.
                     if (message.Count > 3) {
                         UpdateProgressForMessage(message[3].AsRealNode());
                     }
