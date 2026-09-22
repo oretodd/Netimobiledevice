@@ -258,6 +258,16 @@ internal sealed class DeviceLinkService : IDisposable {
 
     public long BytesRead { get; private set; }
 
+    // ScribeHold fork (#3081): msg[3] of DLMessageUploadFiles is read fresh on every invocation, and
+    // DlLoop dispatches that message many times per session — so whether it is a whole-backup total or
+    // a per-batch size is unsettled, and no log has ever recorded it. These record the series so one
+    // real backup decides it: a constant FirstDeclaredTotalSize == MaxDeclaredTotalSize across a
+    // DeclaredTotalSizeObservations > 1 run means whole-backup; a varying one means per-batch.
+    public long FirstDeclaredTotalSize { get; private set; }
+    public long MaxDeclaredTotalSize { get; private set; }
+    public int DeclaredTotalSizeObservations { get; private set; }
+    public bool DeclaredTotalSizeVaried { get; private set; }
+
     /// <summary>
     /// Event raised when a file is about to be transferred from the device.
     /// </summary>
@@ -933,6 +943,33 @@ internal sealed class DeviceLinkService : IDisposable {
     /// </summary>
     /// <param name="msg">The message received from the device.</param>
     /// <returns>The number of files processed.</returns>
+    // Logs at Information deliberately: the Netimobiledevice category is floored at Warning unless
+    // EnableDiagnosticLogging is on, so the LogDebug this replaced never once reached a log file —
+    // which is why the value is still unobserved. Emitted only on the first observation and on each
+    // change, so a many-batch backup adds a handful of lines, not one per message.
+    internal void RecordDeclaredTotalSize(long declaredTotalSize) {
+        DeclaredTotalSizeObservations++;
+
+        bool isFirst = DeclaredTotalSizeObservations == 1;
+        if (isFirst) {
+            FirstDeclaredTotalSize = declaredTotalSize;
+        }
+        else if (declaredTotalSize != FirstDeclaredTotalSize) {
+            DeclaredTotalSizeVaried = true;
+        }
+
+        bool changed = declaredTotalSize != MaxDeclaredTotalSize;
+        if (declaredTotalSize > MaxDeclaredTotalSize) {
+            MaxDeclaredTotalSize = declaredTotalSize;
+        }
+
+        if (isFirst || changed) {
+            _logger.LogInformation(
+                "[DECLARED-TOTAL] UploadFiles#{Observation} declared={Declared} first={First} max={Max} varied={Varied}",
+                DeclaredTotalSizeObservations, declaredTotalSize, FirstDeclaredTotalSize, MaxDeclaredTotalSize, DeclaredTotalSizeVaried);
+        }
+    }
+
     private async Task UploadFiles(ArrayNode msg, CancellationToken cancellationToken) {
         // ScribeHold fork (#2181): the terminating DLMessageStatusResponse after the transfer loop is
         // what the device blocks on. Route it through the guarantee so a cancellation that trips while
@@ -940,11 +977,9 @@ internal sealed class DeviceLinkService : IDisposable {
         // via DisposeAsync) before propagating — the device is never left blocking.
         await using IDeviceLinkResponseGuarantee guard = _responseGuarantees.Create();
 
-        long startTicks = DateTime.UtcNow.Ticks;
-
         long backupTotalSize = (long) msg[3].AsIntegerNode().Value;
         if (backupTotalSize > 0) {
-            _logger.LogDebug("Backup total size: {backupTotalSize}", backupTotalSize);
+            RecordDeclaredTotalSize(backupTotalSize);
         }
 
         while (!cancellationToken.IsCancellationRequested) {
