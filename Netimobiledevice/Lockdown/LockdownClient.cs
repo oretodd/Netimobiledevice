@@ -626,7 +626,7 @@ public abstract class LockdownClient : LockdownServiceProvider, IDisposable {
         Pair();
 
         // Get sessionId
-        if (ValidatePairing()) {
+        if (!ValidatePairing()) {
             throw new FatalPairingException();
         }
 
