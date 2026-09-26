@@ -6,6 +6,7 @@ using Netimobiledevice.NotificationProxy;
 using Netimobiledevice.Plist;
 using Netimobiledevice.Usbmuxd;
 using System;
+using System.Diagnostics;
 using System.Collections.Generic;
 using System.IO;
 using System.Security.Cryptography.X509Certificates;
@@ -245,7 +246,7 @@ public abstract class LockdownClient : LockdownServiceProvider, IDisposable {
         }
     }
 
-    private LockdownError Pair() {
+    private PairingCertificates CreatePairingCertificates() {
         _devicePublicKey = GetValue(null, "DevicePublicKey")?.AsDataNode().Value ?? [];
         if (_devicePublicKey == null || _devicePublicKey.Length == 0) {
             _logger.LogDebug("Unable to retrieve DevicePublicKey");
@@ -254,8 +255,10 @@ public abstract class LockdownClient : LockdownServiceProvider, IDisposable {
         }
 
         _logger.LogDebug("Creating host key & certificate");
-        PairingCertificates pairingCertificates = CertificateGenerator.GeneratePairingCertificates(_devicePublicKey);
+        return CertificateGenerator.GeneratePairingCertificates(_devicePublicKey);
+    }
 
+    private LockdownError Pair(PairingCertificates pairingCertificates) {
         DictionaryNode newPairRecord = new DictionaryNode {
             { "DevicePublicKey", new DataNode(_devicePublicKey) },
             { "DeviceCertificate", new DataNode(Encoding.UTF8.GetBytes(pairingCertificates.DeviceCertificatePem)) },
@@ -442,11 +445,7 @@ public abstract class LockdownClient : LockdownServiceProvider, IDisposable {
             return;
         }
 
-        PairDevice();
-
-        if (!ValidatePairing()) {
-            throw new FatalPairingException();
-        }
+        PairDevice(timeout);
     }
 
     protected virtual void FetchPairRecord() {
@@ -548,8 +547,9 @@ public abstract class LockdownClient : LockdownServiceProvider, IDisposable {
 
             LockdownError? err = null;
             PairingState? lastPairingReport = null;
+            PairingCertificates pairingCertificates = CreatePairingCertificates();
             while (!cancellationToken.IsCancellationRequested) {
-                err = Pair();
+                err = Pair(pairingCertificates);
                 switch (err) {
                     case LockdownError.Success: {
                         np.Stop();
@@ -595,14 +595,21 @@ public abstract class LockdownClient : LockdownServiceProvider, IDisposable {
     /// <param name="timeout">How long to wait when pairing the iOS device</param>
     /// <returns>If the device is currently paired or if the pairing was successful or not</returns>
     /// <exception cref="FatalPairingException">Exception thrown when pairing should have succeeded but failed for some reason.</exception>
-    public virtual bool PairDevice() {
+    public virtual bool PairDevice() => PairDevice(-1);
+
+    private bool PairDevice(float timeoutSeconds) {
         bool currentlyPaired = ValidatePairing();
         if (currentlyPaired) {
             return true;
         }
 
-        // The device is not paired so we attempt to pair it.
-        Pair();
+        // A pending trust dialog or a locked device answers every Pair request until the user acts on it.
+        PairingCertificates pairingCertificates = CreatePairingCertificates();
+        Stopwatch waited = Stopwatch.StartNew();
+        while (Pair(pairingCertificates) is LockdownError.PairingDialogResponsePending or LockdownError.PasswordProtected
+               && waited.Elapsed.TotalSeconds < timeoutSeconds) {
+            Thread.Sleep(200);
+        }
 
         // Get sessionId
         if (!ValidatePairing()) {
