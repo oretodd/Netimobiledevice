@@ -297,7 +297,7 @@ public abstract class LockdownClient : LockdownServiceProvider, IDisposable {
         }
     }
 
-    private LockdownError Pair() {
+    private PairingCertificates CreatePairingCertificates() {
         _devicePublicKey = GetValue(null, "DevicePublicKey")?.AsDataNode().Value ?? [];
         if (_devicePublicKey == null || _devicePublicKey.Length == 0) {
             _logger.LogDebug("Unable to retrieve DevicePublicKey");
@@ -306,8 +306,10 @@ public abstract class LockdownClient : LockdownServiceProvider, IDisposable {
         }
 
         _logger.LogDebug("Creating host key & certificate");
-        PairingCertificates pairingCertificates = CertificateGenerator.GeneratePairingCertificates(_devicePublicKey);
+        return CertificateGenerator.GeneratePairingCertificates(_devicePublicKey);
+    }
 
+    private LockdownError Pair(PairingCertificates pairingCertificates) {
         DictionaryNode newPairRecord = new DictionaryNode {
             { "DevicePublicKey", new DataNode(_devicePublicKey) },
             { "DeviceCertificate", new DataNode(Encoding.UTF8.GetBytes(pairingCertificates.DeviceCertificatePem)) },
@@ -566,8 +568,9 @@ public abstract class LockdownClient : LockdownServiceProvider, IDisposable {
 
             LockdownError? err = null;
             PairingState? lastPairingReport = null;
+            PairingCertificates pairingCertificates = CreatePairingCertificates();
             while (!cancellationToken.IsCancellationRequested) {
-                err = Pair();
+                err = Pair(pairingCertificates);
                 switch (err) {
                     case LockdownError.Success: {
                         np.Stop();
@@ -622,8 +625,9 @@ public abstract class LockdownClient : LockdownServiceProvider, IDisposable {
         }
 
         // A pending trust dialog or a locked device answers every Pair request until the user acts on it.
+        PairingCertificates pairingCertificates = CreatePairingCertificates();
         Stopwatch waited = Stopwatch.StartNew();
-        while (Pair() is LockdownError.PairingDialogResponsePending or LockdownError.PasswordProtected
+        while (Pair(pairingCertificates) is LockdownError.PairingDialogResponsePending or LockdownError.PasswordProtected
                && waited.Elapsed.TotalSeconds < timeoutSeconds) {
             Thread.Sleep(200);
         }
