@@ -6,7 +6,6 @@ using Netimobiledevice.Usbmuxd;
 using System;
 using System.Buffers.Binary;
 using System.IO;
-using System.Linq;
 using System.Net;
 using System.Net.Security;
 using System.Net.Sockets;
@@ -326,7 +325,7 @@ public sealed class ServiceConnection : IServiceConnection {
                 // ScribeHold fork (#2077): version-exchange-window-bounded plaintext dump + close
                 // classification (see ReceiveAsync for the full rationale).
                 LogVersionExchangeFin(buffer, totalBytesRead, length);
-                break;
+                throw new EndOfStreamException($"Connection closed after {totalBytesRead}/{length} bytes");
             }
             totalBytesRead += bytesRead;
         }
@@ -339,10 +338,6 @@ public sealed class ServiceConnection : IServiceConnection {
         // otherwise), so it is free when off.
         if (_logger.IsEnabled(LogLevel.Trace)) {
             _logger.LogTrace("ServiceConnection.Receive read {Read}/{Expected} bytes", totalBytesRead, length);
-        }
-
-        if (totalBytesRead < buffer.Length) {
-            return [.. buffer.Take(totalBytesRead)];
         }
         return buffer;
     }
@@ -372,20 +367,6 @@ public sealed class ServiceConnection : IServiceConnection {
                 using (linkedCancellationTokenSource) {
                     try {
                         bytesRead = await Stream.ReadAsync(buffer.AsMemory(totalBytesRead, readSize), linkedCancellationTokenSource.Token).ConfigureAwait(false);
-                        if (bytesRead == 0) {
-                            // ScribeHold fork (#2068): record WHERE the FIN landed — offset 0 of a 4-byte
-                            // size-prefix read is the empty-reply-FIN-at-version-exchange signature.
-                            _logger.LogError(
-                                "Read zero bytes so the connection has been broken (FIN at offset {Offset}/{Expected} bytes)",
-                                totalBytesRead, size);
-                            // ScribeHold fork (#2077): at the version-exchange window only, dump the
-                            // decrypted partial bytes (if any), confirm whether the host had sent
-                            // anything first, and classify the close as graceful (close_notify / clean
-                            // FIN) vs a hard RST — the decisive USB-vs-WiFi signal. Bounded to the
-                            // version-exchange window so transfer-phase user content is never dumped.
-                            LogVersionExchangeFin(buffer, totalBytesRead, size);
-                            break;
-                        }
                     }
                     catch (OperationCanceledException) {
                         if (localTaskComplete.IsCancellationRequested) {
@@ -399,6 +380,17 @@ public sealed class ServiceConnection : IServiceConnection {
                 bytesRead = await Stream.ReadAsync(buffer.AsMemory(totalBytesRead, readSize), cancellationToken).ConfigureAwait(false);
             }
 
+            if (bytesRead == 0) {
+                // ScribeHold fork (#2068): record WHERE the FIN landed — offset 0 of a 4-byte
+                // size-prefix read is the empty-reply-FIN-at-version-exchange signature.
+                _logger.LogError(
+                    "Read zero bytes so the connection has been broken (FIN at offset {Offset}/{Expected} bytes)",
+                    totalBytesRead, size);
+                // ScribeHold fork (#2077): at the version-exchange window only, dump the decrypted partial
+                // bytes and classify the close as graceful (close_notify / clean FIN) vs a hard RST.
+                LogVersionExchangeFin(buffer, totalBytesRead, size);
+                throw new EndOfStreamException($"Connection closed after {totalBytesRead}/{size} bytes");
+            }
             totalBytesRead += bytesRead;
         }
 
@@ -409,10 +401,6 @@ public sealed class ServiceConnection : IServiceConnection {
         // diagnosis while leaving it off the Debug channel EnableDiagnosticLogging raises; free when off.
         if (_logger.IsEnabled(LogLevel.Trace)) {
             _logger.LogTrace("ServiceConnection.ReceiveAsync read {Read}/{Expected} bytes", totalBytesRead, size);
-        }
-
-        if (totalBytesRead < buffer.Length) {
-            return [.. buffer.Take(totalBytesRead)];
         }
         return buffer;
     }
@@ -439,10 +427,6 @@ public sealed class ServiceConnection : IServiceConnection {
     /// <returns>The data without the u32 field length as a byte array</returns>
     public byte[] ReceivePrefixed() {
         byte[] sizeBytes = Receive(4);
-        if (sizeBytes.Length != 4) {
-            return [];
-        }
-
         int size = BinaryPrimitives.ReadInt32BigEndian(sizeBytes);
         return Receive(size);
     }
@@ -453,10 +437,6 @@ public sealed class ServiceConnection : IServiceConnection {
     /// <returns>The data without the u32 field length as a byte array</returns>
     public async Task<byte[]> ReceivePrefixedAsync(CancellationToken cancellationToken = default) {
         byte[] sizeBytes = await ReceiveAsync(4, cancellationToken).ConfigureAwait(false);
-        if (sizeBytes.Length != 4) {
-            return [];
-        }
-
         int size = BinaryPrimitives.ReadInt32BigEndian(sizeBytes);
         return await ReceiveAsync(size, cancellationToken).ConfigureAwait(false);
     }
