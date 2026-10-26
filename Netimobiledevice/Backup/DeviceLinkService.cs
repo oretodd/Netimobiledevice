@@ -439,21 +439,38 @@ internal sealed class DeviceLinkService : IDisposable {
     /// Manages the CopyItem device message.
     /// </summary>
     /// <param name="msg">The message received from the device.</param>
-    /// <returns>The errno result of the operation.</returns>
     private async Task CopyItem(ArrayNode msg, CancellationToken cancellationToken) {
         // ScribeHold fork (#2181): route the terminating response through the guarantee so a throw
         // mid-copy still discharges exactly one DLMessageStatusResponse before propagating.
         await using IDeviceLinkResponseGuarantee guard = _responseGuarantees.Create();
 
-        FileInfo source = new FileInfo(Path.Combine(_rootPath, msg[1].AsStringNode().Value));
-        FileInfo dest = new FileInfo(Path.Combine(_rootPath, msg[2].AsStringNode().Value));
-        if (source.Attributes.HasFlag(FileAttributes.Directory)) {
-            _logger.LogError("Trying to coppy a whole directory rather than an individual file");
-        }
-        else {
-            source.CopyTo(dest.FullName);
+        string source = Path.Combine(_rootPath, msg[1].AsStringNode().Value);
+        string dest = Path.Combine(_rootPath, msg[2].AsStringNode().Value);
+        if (Path.Exists(source)) {
+            DeletePath(dest);
+            CopyPath(source, dest);
         }
         await guard.SendTerminatingStatusAsync(0, string.Empty, null, cancellationToken).ConfigureAwait(false);
+    }
+
+    private static void CopyPath(string source, string dest) {
+        if (!Directory.Exists(source)) {
+            File.Copy(source, dest);
+            return;
+        }
+        Directory.CreateDirectory(dest);
+        foreach (string entry in Directory.EnumerateFileSystemEntries(source)) {
+            CopyPath(entry, Path.Combine(dest, Path.GetFileName(entry)));
+        }
+    }
+
+    private static void DeletePath(string path) {
+        if (File.Exists(path)) {
+            File.Delete(path);
+        }
+        else if (Directory.Exists(path)) {
+            Directory.Delete(path, true);
+        }
     }
 
     /// <summary>
@@ -645,7 +662,6 @@ internal sealed class DeviceLinkService : IDisposable {
     /// Manages the MoveItems device message.
     /// </summary>
     /// <param name="msg">The message received from the device.</param>
-    /// <returns>The number of items moved.</returns>
     private async Task MoveItems(ArrayNode msg, CancellationToken cancellationToken) {
         // ScribeHold fork (#2181): the terminating DLMessageStatusResponse is guaranteed even if
         // cancellation trips mid-move — the loop body throws on cancel, and DisposeAsync discharges the
@@ -657,21 +673,18 @@ internal sealed class DeviceLinkService : IDisposable {
             cancellationToken.ThrowIfCancellationRequested();
 
             string newPath = move.Value.AsStringNode().Value;
-            if (!string.IsNullOrEmpty(newPath)) {
-                FileInfo newFile = new FileInfo(Path.Combine(_rootPath, newPath));
-                if (newFile.Exists) {
-                    if (newFile.Attributes.HasFlag(FileAttributes.Directory)) {
-                        new DirectoryInfo(newFile.FullName).Delete(true);
-                    }
-                    else {
-                        newFile.Delete();
-                    }
-                }
+            string source = Path.Combine(_rootPath, move.Key);
+            if (string.IsNullOrEmpty(newPath) || !Path.Exists(source)) {
+                continue;
+            }
 
-                FileInfo oldFile = new FileInfo(Path.Combine(_rootPath, move.Key));
-                if (oldFile.Exists) {
-                    oldFile.MoveTo(newFile.FullName);
-                }
+            string dest = Path.Combine(_rootPath, newPath);
+            DeletePath(dest);
+            if (Directory.Exists(source)) {
+                Directory.Move(source, dest);
+            }
+            else {
+                File.Move(source, dest);
             }
         }
 
@@ -857,13 +870,7 @@ internal sealed class DeviceLinkService : IDisposable {
                 _logger.LogWarning("Empty file to remove.");
             }
             else {
-                string path = Path.Combine(_rootPath, filename.Value);
-                if (File.Exists(path)) {
-                    File.Delete(path);
-                }
-                else if (Directory.Exists(path)) {
-                    Directory.Delete(path, true);
-                }
+                DeletePath(Path.Combine(_rootPath, filename.Value));
             }
         }
 
