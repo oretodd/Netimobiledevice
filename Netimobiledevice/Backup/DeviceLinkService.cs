@@ -363,7 +363,7 @@ internal sealed class DeviceLinkService : IDisposable {
             { DeviceLinkMessage.Disconnect, DisconnectAsync },
             { DeviceLinkMessage.DownloadFiles, DownloadFiles },
             { DeviceLinkMessage.GetFreeDiskSpace, GetFreeDiskSpace },
-            { DeviceLinkMessage.PurgeDiskSpace, GetFreeDiskSpace },
+            { DeviceLinkMessage.PurgeDiskSpace, PurgeDiskSpace },
             { DeviceLinkMessage.MoveFiles, MoveItems },
             { DeviceLinkMessage.MoveItems, MoveItems },
             { DeviceLinkMessage.RemoveFiles, RemoveItems },
@@ -439,21 +439,41 @@ internal sealed class DeviceLinkService : IDisposable {
     /// Manages the CopyItem device message.
     /// </summary>
     /// <param name="msg">The message received from the device.</param>
-    /// <returns>The errno result of the operation.</returns>
     private async Task CopyItem(ArrayNode msg, CancellationToken cancellationToken) {
         // ScribeHold fork (#2181): route the terminating response through the guarantee so a throw
         // mid-copy still discharges exactly one DLMessageStatusResponse before propagating.
         await using IDeviceLinkResponseGuarantee guard = _responseGuarantees.Create();
 
-        FileInfo source = new FileInfo(Path.Combine(_rootPath, msg[1].AsStringNode().Value));
-        FileInfo dest = new FileInfo(Path.Combine(_rootPath, msg[2].AsStringNode().Value));
-        if (source.Attributes.HasFlag(FileAttributes.Directory)) {
-            _logger.LogError("Trying to coppy a whole directory rather than an individual file");
-        }
-        else {
-            source.CopyTo(dest.FullName);
+        string source = Path.Combine(_rootPath, msg[1].AsStringNode().Value);
+        string dest = Path.Combine(_rootPath, msg[2].AsStringNode().Value);
+        if (Path.Exists(source) && !IsSamePath(source, dest)) {
+            DeletePath(dest);
+            CopyPath(source, dest);
         }
         await guard.SendTerminatingStatusAsync(0, string.Empty, null, cancellationToken).ConfigureAwait(false);
+    }
+
+    private static void CopyPath(string source, string dest) {
+        if (!Directory.Exists(source)) {
+            File.Copy(source, dest);
+            return;
+        }
+        Directory.CreateDirectory(dest);
+        foreach (string entry in Directory.EnumerateFileSystemEntries(source)) {
+            CopyPath(entry, Path.Combine(dest, Path.GetFileName(entry)));
+        }
+    }
+
+    private static bool IsSamePath(string a, string b) =>
+        string.Equals(Path.GetFullPath(a), Path.GetFullPath(b), StringComparison.OrdinalIgnoreCase);
+
+    private static void DeletePath(string path) {
+        if (File.Exists(path)) {
+            File.Delete(path);
+        }
+        else if (Directory.Exists(path)) {
+            Directory.Delete(path, true);
+        }
     }
 
     /// <summary>
@@ -475,20 +495,13 @@ internal sealed class DeviceLinkService : IDisposable {
     /// </summary>
     /// <param name="errorNo">The errno code.</param>
     private static DictionaryNode CreateErrorReport(ErrNo errorNo) {
-        string errMsg;
-        int errCode = -(int) errorNo;
-
-        if (errorNo == ErrNo.ENOENT) {
-            errCode = -6;
-            errMsg = "No such file or directory.";
-        }
-        else if (errorNo == ErrNo.EEXIST) {
-            errCode = -7;
-            errMsg = "File or directory already exists.";
-        }
-        else {
-            errMsg = $"Unspecified error: ({errorNo})";
-        }
+        (int errCode, string errMsg) = errorNo switch {
+            ErrNo.ENOENT => (-6, "No such file or directory."),
+            ErrNo.EEXIST => (-7, "File or directory already exists."),
+            ErrNo.EISDIR => (-9, "Is a directory."),
+            ErrNo.EIO => (-11, "Input/output error."),
+            _ => (-(int) errorNo, $"Unspecified error: ({errorNo})")
+        };
 
         DictionaryNode dict = new DictionaryNode() {
             { "DLFileErrorString", new StringNode(errMsg) },
@@ -566,32 +579,17 @@ internal sealed class DeviceLinkService : IDisposable {
             await SendPath(filename.Value, cancellationToken).ConfigureAwait(false);
 
             string filePath = Path.Combine(_rootPath, filename.Value);
-            if (File.Exists(filePath)) {
-                await using (FileStream fs = File.OpenRead(filePath)) {
-                    // #2199 (P2-5): rent a ~4 MiB chunk from the shared pool instead of allocating a fresh
-                    // 128 MiB LOH buffer per file. The old code ALSO built a second full copy per read
-                    // ([FileData, ..chunk[0..bytesRead]]) — up to 256 MiB of LOH traffic per chunk while the
-                    // device waited. We now stream each chunk with THREE writes (length prefix, the single
-                    // FileData code byte, then the rented slice directly) — byte-identical on the wire to the
-                    // prefixed [FileData + payload] frame, with zero per-chunk allocation.
-                    byte[] chunk = ArrayPool<byte>.Shared.Rent(FILE_DATA_CHUNK_SIZE);
-                    try {
-                        int bytesRead;
-                        while ((bytesRead = await fs.ReadAsync(chunk.AsMemory(0, FILE_DATA_CHUNK_SIZE), cancellationToken).ConfigureAwait(false)) > 0) {
-                            await SendFileDataChunkAsync(chunk, bytesRead, cancellationToken).ConfigureAwait(false);
-                        }
-                    }
-                    finally {
-                        ArrayPool<byte>.Shared.Return(chunk);
-                    }
-                }
+            ErrNo errorCode = Directory.Exists(filePath) ? ErrNo.EISDIR : File.Exists(filePath) ? ErrNo.ENOERR : ErrNo.ENOENT;
+            if (errorCode == ErrNo.ENOERR) {
+                errorCode = await SendFileContentsAsync(filePath, cancellationToken).ConfigureAwait(false);
+            }
 
+            if (errorCode == ErrNo.ENOERR) {
                 byte[] buffer = [(byte) ResultCode.Success];
                 await SendPrefixed(buffer, buffer.Length, cancellationToken).ConfigureAwait(false);
                 obligation.EndFileFraming();
             }
             else {
-                ErrNo errorCode = ErrNo.ENOENT;
                 _logger.LogDebug("Sending Error Code: {code}", errorCode);
                 DictionaryNode errReport = CreateErrorReport(errorCode);
                 errList.Add(filename.Value, errReport);
@@ -607,6 +605,32 @@ internal sealed class DeviceLinkService : IDisposable {
         }
         else {
             await obligation.SendTerminatingStatusAsync(BULK_OPERATION_ERROR, "Multi status", errList, cancellationToken).ConfigureAwait(false);
+        }
+    }
+
+    private async Task<ErrNo> SendFileContentsAsync(string filePath, CancellationToken cancellationToken) {
+        FileStream? fs = null;
+        byte[] chunk = ArrayPool<byte>.Shared.Rent(FILE_DATA_CHUNK_SIZE);
+        try {
+            while (true) {
+                int bytesRead;
+                try {
+                    fs ??= File.OpenRead(filePath);
+                    bytesRead = await fs.ReadAsync(chunk.AsMemory(0, FILE_DATA_CHUNK_SIZE), cancellationToken).ConfigureAwait(false);
+                }
+                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) {
+                    _logger.LogWarning(ex, "Could not read {filePath} for the device", filePath);
+                    return ErrNo.EIO;
+                }
+                if (bytesRead == 0) {
+                    return ErrNo.ENOERR;
+                }
+                await SendFileDataChunkAsync(chunk, bytesRead, cancellationToken).ConfigureAwait(false);
+            }
+        }
+        finally {
+            fs?.Dispose();
+            ArrayPool<byte>.Shared.Return(chunk);
         }
     }
 
@@ -641,11 +665,17 @@ internal sealed class DeviceLinkService : IDisposable {
         await guard.SendTerminatingStatusAsync(0, null, spaceItem, cancellationToken).ConfigureAwait(false);
     }
 
+    private async Task PurgeDiskSpace(ArrayNode msg, CancellationToken cancellationToken) {
+        await using IDeviceLinkResponseGuarantee guard = _responseGuarantees.Create();
+
+        _logger.LogInformation("Device asked the host to purge disk space at {rootPath}; the host cannot purge, so the device decides how to proceed", _rootPath);
+        await guard.SendTerminatingStatusAsync(-1, $"{DeviceLinkMessage.PurgeDiskSpace} failed to purge", new IntegerNode(0), cancellationToken).ConfigureAwait(false);
+    }
+
     /// <summary>
     /// Manages the MoveItems device message.
     /// </summary>
     /// <param name="msg">The message received from the device.</param>
-    /// <returns>The number of items moved.</returns>
     private async Task MoveItems(ArrayNode msg, CancellationToken cancellationToken) {
         // ScribeHold fork (#2181): the terminating DLMessageStatusResponse is guaranteed even if
         // cancellation trips mid-move — the loop body throws on cancel, and DisposeAsync discharges the
@@ -657,21 +687,20 @@ internal sealed class DeviceLinkService : IDisposable {
             cancellationToken.ThrowIfCancellationRequested();
 
             string newPath = move.Value.AsStringNode().Value;
-            if (!string.IsNullOrEmpty(newPath)) {
-                FileInfo newFile = new FileInfo(Path.Combine(_rootPath, newPath));
-                if (newFile.Exists) {
-                    if (newFile.Attributes.HasFlag(FileAttributes.Directory)) {
-                        new DirectoryInfo(newFile.FullName).Delete(true);
-                    }
-                    else {
-                        newFile.Delete();
-                    }
-                }
+            string source = Path.Combine(_rootPath, move.Key);
+            if (string.IsNullOrEmpty(newPath) || !Path.Exists(source)) {
+                continue;
+            }
 
-                FileInfo oldFile = new FileInfo(Path.Combine(_rootPath, move.Key));
-                if (oldFile.Exists) {
-                    oldFile.MoveTo(newFile.FullName);
-                }
+            string dest = Path.Combine(_rootPath, newPath);
+            if (!IsSamePath(source, dest)) {
+                DeletePath(dest);
+            }
+            if (Directory.Exists(source)) {
+                Directory.Move(source, dest);
+            }
+            else {
+                File.Move(source, dest);
             }
         }
 
@@ -850,13 +879,7 @@ internal sealed class DeviceLinkService : IDisposable {
                 _logger.LogWarning("Empty file to remove.");
             }
             else {
-                string path = Path.Combine(_rootPath, filename.Value);
-                if (File.Exists(path)) {
-                    File.Delete(path);
-                }
-                else if (Directory.Exists(path)) {
-                    Directory.Delete(path, true);
-                }
+                DeletePath(Path.Combine(_rootPath, filename.Value));
             }
         }
 
