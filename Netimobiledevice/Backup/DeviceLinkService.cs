@@ -363,7 +363,7 @@ internal sealed class DeviceLinkService : IDisposable {
             { DeviceLinkMessage.Disconnect, DisconnectAsync },
             { DeviceLinkMessage.DownloadFiles, DownloadFiles },
             { DeviceLinkMessage.GetFreeDiskSpace, GetFreeDiskSpace },
-            { DeviceLinkMessage.PurgeDiskSpace, GetFreeDiskSpace },
+            { DeviceLinkMessage.PurgeDiskSpace, PurgeDiskSpace },
             { DeviceLinkMessage.MoveFiles, MoveItems },
             { DeviceLinkMessage.MoveItems, MoveItems },
             { DeviceLinkMessage.RemoveFiles, RemoveItems },
@@ -475,20 +475,13 @@ internal sealed class DeviceLinkService : IDisposable {
     /// </summary>
     /// <param name="errorNo">The errno code.</param>
     private static DictionaryNode CreateErrorReport(ErrNo errorNo) {
-        string errMsg;
-        int errCode = -(int) errorNo;
-
-        if (errorNo == ErrNo.ENOENT) {
-            errCode = -6;
-            errMsg = "No such file or directory.";
-        }
-        else if (errorNo == ErrNo.EEXIST) {
-            errCode = -7;
-            errMsg = "File or directory already exists.";
-        }
-        else {
-            errMsg = $"Unspecified error: ({errorNo})";
-        }
+        (int errCode, string errMsg) = errorNo switch {
+            ErrNo.ENOENT => (-6, "No such file or directory."),
+            ErrNo.EEXIST => (-7, "File or directory already exists."),
+            ErrNo.EISDIR => (-9, "Is a directory."),
+            ErrNo.EIO => (-11, "Input/output error."),
+            _ => (-(int) errorNo, $"Unspecified error: ({errorNo})")
+        };
 
         DictionaryNode dict = new DictionaryNode() {
             { "DLFileErrorString", new StringNode(errMsg) },
@@ -566,32 +559,17 @@ internal sealed class DeviceLinkService : IDisposable {
             await SendPath(filename.Value, cancellationToken).ConfigureAwait(false);
 
             string filePath = Path.Combine(_rootPath, filename.Value);
-            if (File.Exists(filePath)) {
-                await using (FileStream fs = File.OpenRead(filePath)) {
-                    // #2199 (P2-5): rent a ~4 MiB chunk from the shared pool instead of allocating a fresh
-                    // 128 MiB LOH buffer per file. The old code ALSO built a second full copy per read
-                    // ([FileData, ..chunk[0..bytesRead]]) — up to 256 MiB of LOH traffic per chunk while the
-                    // device waited. We now stream each chunk with THREE writes (length prefix, the single
-                    // FileData code byte, then the rented slice directly) — byte-identical on the wire to the
-                    // prefixed [FileData + payload] frame, with zero per-chunk allocation.
-                    byte[] chunk = ArrayPool<byte>.Shared.Rent(FILE_DATA_CHUNK_SIZE);
-                    try {
-                        int bytesRead;
-                        while ((bytesRead = await fs.ReadAsync(chunk.AsMemory(0, FILE_DATA_CHUNK_SIZE), cancellationToken).ConfigureAwait(false)) > 0) {
-                            await SendFileDataChunkAsync(chunk, bytesRead, cancellationToken).ConfigureAwait(false);
-                        }
-                    }
-                    finally {
-                        ArrayPool<byte>.Shared.Return(chunk);
-                    }
-                }
+            ErrNo errorCode = Directory.Exists(filePath) ? ErrNo.EISDIR : File.Exists(filePath) ? ErrNo.ENOERR : ErrNo.ENOENT;
+            if (errorCode == ErrNo.ENOERR) {
+                errorCode = await SendFileContentsAsync(filePath, cancellationToken).ConfigureAwait(false);
+            }
 
+            if (errorCode == ErrNo.ENOERR) {
                 byte[] buffer = [(byte) ResultCode.Success];
                 await SendPrefixed(buffer, buffer.Length, cancellationToken).ConfigureAwait(false);
                 obligation.EndFileFraming();
             }
             else {
-                ErrNo errorCode = ErrNo.ENOENT;
                 _logger.LogDebug("Sending Error Code: {code}", errorCode);
                 DictionaryNode errReport = CreateErrorReport(errorCode);
                 errList.Add(filename.Value, errReport);
@@ -607,6 +585,41 @@ internal sealed class DeviceLinkService : IDisposable {
         }
         else {
             await obligation.SendTerminatingStatusAsync(BULK_OPERATION_ERROR, "Multi status", errList, cancellationToken).ConfigureAwait(false);
+        }
+    }
+
+    private async Task<ErrNo> SendFileContentsAsync(string filePath, CancellationToken cancellationToken) {
+        FileStream fs;
+        try {
+            fs = File.OpenRead(filePath);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) {
+            _logger.LogWarning(ex, "Could not open {filePath} for the device", filePath);
+            return ErrNo.EIO;
+        }
+
+        await using (fs) {
+            // #2199 (P2-5): one pooled chunk per file; each chunk goes out as three writes with no copy.
+            byte[] chunk = ArrayPool<byte>.Shared.Rent(FILE_DATA_CHUNK_SIZE);
+            try {
+                while (true) {
+                    int bytesRead;
+                    try {
+                        bytesRead = await fs.ReadAsync(chunk.AsMemory(0, FILE_DATA_CHUNK_SIZE), cancellationToken).ConfigureAwait(false);
+                    }
+                    catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) {
+                        _logger.LogWarning(ex, "Could not read {filePath} for the device", filePath);
+                        return ErrNo.EIO;
+                    }
+                    if (bytesRead == 0) {
+                        return ErrNo.ENOERR;
+                    }
+                    await SendFileDataChunkAsync(chunk, bytesRead, cancellationToken).ConfigureAwait(false);
+                }
+            }
+            finally {
+                ArrayPool<byte>.Shared.Return(chunk);
+            }
         }
     }
 
@@ -639,6 +652,13 @@ internal sealed class DeviceLinkService : IDisposable {
             spaceItem = new IntegerNode(freeSpace);
         }
         await guard.SendTerminatingStatusAsync(0, null, spaceItem, cancellationToken).ConfigureAwait(false);
+    }
+
+    private async Task PurgeDiskSpace(ArrayNode msg, CancellationToken cancellationToken) {
+        await using IDeviceLinkResponseGuarantee guard = _responseGuarantees.Create();
+
+        _logger.LogInformation("Device asked the host to purge disk space at {rootPath}; the host cannot purge, so the device decides how to proceed", _rootPath);
+        await guard.SendTerminatingStatusAsync(-1, $"{DeviceLinkMessage.PurgeDiskSpace} failed to purge", new IntegerNode(0), cancellationToken).ConfigureAwait(false);
     }
 
     /// <summary>
