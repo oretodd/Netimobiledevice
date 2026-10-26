@@ -1,8 +1,7 @@
 ﻿using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
-using Netimobiledevice.DeviceLink;
+using Netimobiledevice.Backup;
 using Netimobiledevice.Lockdown.Pairing;
-using Netimobiledevice.NotificationProxy;
 using Netimobiledevice.Plist;
 using Netimobiledevice.Usbmuxd;
 using System;
@@ -64,7 +63,7 @@ public abstract class LockdownClient : LockdownServiceProvider, IDisposable {
     /// The pairing record for the connected device
     /// </summary>
     protected DictionaryNode? _pairRecord;
-    protected readonly ServiceConnection? _service;
+    protected readonly IServiceConnection? _service;
 
     /// <summary>
     /// The connection medium for this client. Defaults to Usbmux 
@@ -115,7 +114,7 @@ public abstract class LockdownClient : LockdownServiceProvider, IDisposable {
     /// <param name="pairingRecordsCacheDirectory">Use the following location to search and save pair records</param>
     /// <param name="port">lockdownd service port</param>
     /// <param name="logger"></param>
-    protected LockdownClient(ServiceConnection service, string hostId, string identifier = "", string label = DEFAULT_CLIENT_NAME, string systemBuid = SYSTEM_BUID,
+    protected LockdownClient(IServiceConnection service, string hostId, string identifier = "", string label = DEFAULT_CLIENT_NAME, string systemBuid = SYSTEM_BUID,
         DictionaryNode? pairRecord = null, DirectoryInfo? pairingRecordsCacheDirectory = null, ushort port = SERVICE_PORT, ILogger? logger = null) : base() {
         _logger = logger ?? NullLogger.Instance;
         _service = service;
@@ -226,7 +225,7 @@ public abstract class LockdownClient : LockdownServiceProvider, IDisposable {
     private async Task<DictionaryNode> RequestAsync(string request, DictionaryNode? options = null, bool verifyRequest = true, CancellationToken cancellationToken = default) {
         DictionaryNode message = CreateRequestMessage(request, options);
         if (_service != null) {
-            PropertyNode? response = await _service.SendReceivePlistAsync(message, cancellationToken).ConfigureAwait(false);
+            PropertyNode? response = await _service.SendReceivePlistAsync(message, cancellationToken: cancellationToken).ConfigureAwait(false);
             if (response is DictionaryNode responseDict) {
                 return VerifyRequestResponse(request, verifyRequest, responseDict);
             }
@@ -542,45 +541,39 @@ public abstract class LockdownClient : LockdownServiceProvider, IDisposable {
     /// <param name="cancellationToken">A cancelation token used to cancel stop the operation</param>
     /// <returns>Return <see langword="true"/> if the user accept pairing else <see langword="false"/>.</returns>
     public virtual async Task<bool> PairAsync(IProgress<PairingState> progress, CancellationToken cancellationToken) {
-        using (NotificationProxyService np = new NotificationProxyService(this, true, Logger)) {
-            await np.ObserveNotificationAsync(ReceivableNotification.RequestPair).ConfigureAwait(false);
-
-            LockdownError? err = null;
-            PairingState? lastPairingReport = null;
-            PairingCertificates pairingCertificates = CreatePairingCertificates();
-            while (!cancellationToken.IsCancellationRequested) {
-                err = Pair(pairingCertificates);
-                switch (err) {
-                    case LockdownError.Success: {
-                        np.Stop();
-                        progress.Report(PairingState.Paired);
-                        return IsPaired = true;
-                    }
-                    case LockdownError.UserDeniedPairing: {
-                        progress.Report(PairingState.UserDeniedPairing);
-                        return IsPaired = false;
-                    }
-                    case LockdownError.PasswordProtected: {
-                        if (lastPairingReport != PairingState.PasswordProtected) {
-                            progress.Report(PairingState.PasswordProtected);
-                            lastPairingReport = PairingState.PasswordProtected;
-                        }
-                        break;
-                    }
-                    case LockdownError.PairingDialogResponsePending: {
-                        if (lastPairingReport != PairingState.PairingDialogResponsePending) {
-                            progress.Report(PairingState.PairingDialogResponsePending);
-                            lastPairingReport = PairingState.PairingDialogResponsePending;
-                        }
-                        break;
-                    }
-                    default: {
-                        IsPaired = false;
-                        throw ((LockdownError) err).GetException() ?? new LockdownException(LockdownError.UnknownError);
-                    }
+        PairingState? lastPairingReport = null;
+        PairingCertificates pairingCertificates = CreatePairingCertificates();
+        while (!cancellationToken.IsCancellationRequested) {
+            LockdownError? err = Pair(pairingCertificates);
+            switch (err) {
+                case LockdownError.Success: {
+                    progress.Report(PairingState.Paired);
+                    return IsPaired = true;
                 }
-                await Task.Delay(200, cancellationToken).ConfigureAwait(false);
+                case LockdownError.UserDeniedPairing: {
+                    progress.Report(PairingState.UserDeniedPairing);
+                    return IsPaired = false;
+                }
+                case LockdownError.PasswordProtected: {
+                    if (lastPairingReport != PairingState.PasswordProtected) {
+                        progress.Report(PairingState.PasswordProtected);
+                        lastPairingReport = PairingState.PasswordProtected;
+                    }
+                    break;
+                }
+                case LockdownError.PairingDialogResponsePending: {
+                    if (lastPairingReport != PairingState.PairingDialogResponsePending) {
+                        progress.Report(PairingState.PairingDialogResponsePending);
+                        lastPairingReport = PairingState.PairingDialogResponsePending;
+                    }
+                    break;
+                }
+                default: {
+                    IsPaired = false;
+                    throw ((LockdownError) err).GetException() ?? new LockdownException(LockdownError.UnknownError);
+                }
             }
+            await Task.Delay(200, cancellationToken).ConfigureAwait(false);
         }
 
         if (IsPaired) {
@@ -669,7 +662,7 @@ public abstract class LockdownClient : LockdownServiceProvider, IDisposable {
     /// <returns></returns>
     public abstract Task<ServiceConnection> CreateServiceConnectionAsync(ushort port);
 
-    public override ServiceConnection StartLockdownService(string name, bool useEscrowBag = false, bool useTrustedConnection = true) {
+    public override IServiceConnection StartLockdownService(string name, bool useEscrowBag = false, bool useTrustedConnection = true) {
         DictionaryNode attr = GetServiceConnectionAttributes(name, useEscrowBag, useTrustedConnection).AsDictionaryNode();
         LogStartServiceResponse(name, useEscrowBag, attr);
         ServiceConnection serviceConnection = CreateServiceConnection((ushort) attr["Port"].AsIntegerNode().Value);
@@ -694,7 +687,12 @@ public abstract class LockdownClient : LockdownServiceProvider, IDisposable {
         return serviceConnection;
     }
 
-    public override async Task<ServiceConnection> StartLockdownServiceAsync(string name, bool useEscrowBag = false, bool useTrustedConnection = true) {
+    public override async Task<IServiceConnection> StartLockdownServiceAsync(
+        string name,
+        bool useEscrowBag = false,
+        bool useTrustedConnection = true,
+        CancellationToken cancellationToken = default
+    ) {
         DictionaryNode attr = GetServiceConnectionAttributes(name, useEscrowBag, useTrustedConnection).AsDictionaryNode();
         LogStartServiceResponse(name, useEscrowBag, attr);
         ServiceConnection serviceConnection = await CreateServiceConnectionAsync((ushort) attr["Port"].AsIntegerNode().Value).ConfigureAwait(false);

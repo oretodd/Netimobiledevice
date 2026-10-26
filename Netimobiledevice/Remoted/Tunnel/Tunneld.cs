@@ -1,9 +1,8 @@
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
-using Microsoft.VisualBasic;
 using Microsoft.VisualStudio.Threading;
+using Netimobiledevice.Bonjour;
 using Netimobiledevice.Lockdown;
-using Netimobiledevice.Remoted.Bonjour;
 using Netimobiledevice.Usbmuxd;
 using System;
 using System.Collections.Concurrent;
@@ -73,7 +72,7 @@ public class Tunneld(
 
             using (RemotedProcessStopper stopper = new RemotedProcessStopper()) {
                 try {
-                    await rsd.ConnectAsync().ConfigureAwait(false);
+                    await rsd.ConnectAsync(CancellationToken.None).ConfigureAwait(false);
                 }
                 catch (Exception) {
                     throw new TaskCanceledException();
@@ -208,7 +207,8 @@ public class Tunneld(
 
             if (added.Any()) {
                 // A new interface was attached
-                foreach (ServiceInstance answer in await BonjourService.BrowseRemotedAsync()) {
+                MdnsBrowser mdnsBrowser = new MdnsBrowser(new MdnsSocketFactory(), new MdnsInterfaceResolver());
+                foreach (ServiceInstance answer in await mdnsBrowser.BrowseRemotedAsync(TimeSpan.FromSeconds(2), cancellationToken)) {
                     foreach (Address address in answer.Addresses) {
                         if (address.Interface.StartsWith("utun", StringComparison.InvariantCulture)) {
                             // Skip already established tunnels
@@ -422,7 +422,7 @@ public class Tunneld(
         foreach (KeyValuePair<string, TunnelDefinition> tunnel in tunnels) {
             RemoteServiceDiscoveryService rsd = new RemoteServiceDiscoveryService(tunnel.Value.TunnelAddres, tunnel.Value.TunnelPort, tunnel.Value.InterfaceId);
             try {
-                await rsd.ConnectAsync();
+                await rsd.ConnectAsync(CancellationToken.None);
                 rsds.Add(rsd);
             }
             catch (Exception ex) {

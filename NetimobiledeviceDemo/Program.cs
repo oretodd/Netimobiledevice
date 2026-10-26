@@ -1,113 +1,167 @@
 ﻿using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
 using Netimobiledevice;
-using Netimobiledevice.Backup;
-using Netimobiledevice.Heartbeat;
 using Netimobiledevice.Lockdown;
-using Netimobiledevice.Lockdown.Pairing;
 using Netimobiledevice.NotificationProxy;
+using Netimobiledevice.Plist;
 using Netimobiledevice.Remoted;
 using Netimobiledevice.Remoted.Tunnel;
+using Netimobiledevice.Services;
+using Netimobiledevice.Services.HouseArrest;
+using Netimobiledevice.Services.Mobilebackup2;
+using Netimobiledevice.Services.Springboard;
 using Netimobiledevice.Usbmuxd;
-using System.ComponentModel;
 
 namespace NetimobiledeviceDemo;
 
 public class Program {
+    private static ILogger logger = NullLogger.Instance;
     private static readonly CancellationTokenSource tokenSource = new CancellationTokenSource();
 
     internal static async Task Main() {
-        using ILoggerFactory factory = LoggerFactory.Create(builder => builder.SetMinimumLevel(LogLevel.Debug).AddConsole());
-        ILogger logger = factory.CreateLogger("NetimobiledeviceDemo");
-        logger.LogInformation("Hello World! Logging is {Description}.", "fun");
-
         TaskScheduler.UnobservedTaskException += (sender, args) => {
-            Console.WriteLine($"UnobservedTaskException error: {args.Exception}");
+            logger.LogError("UnobservedTaskException error: {exception}", args.Exception);
         };
 
         Console.CancelKeyPress += (sender, eventArgs) => {
-            Console.WriteLine("Cancellation requested...");
+            logger.LogInformation("Cancellation requested...");
             tokenSource.Cancel();
+
             // Prevent the process from terminating immediately
             eventArgs.Cancel = true;
         };
-        Console.WriteLine("Press Ctrl+C to cancel the operation.");
+        logger.LogInformation("Press Ctrl+C to cancel the operation.");
 
-        List<UsbmuxdDevice> devices = Usbmux.GetDeviceList();
-        if (devices.Count == 0) {
-            logger.LogError("No device is connected to the system.");
-            return;
-        }
+        using (ILoggerFactory factory = LoggerFactory.Create(builder => builder.SetMinimumLevel(LogLevel.Debug).AddConsole())) {
+            logger = factory.CreateLogger("NetimobiledeviceDemo");
 
-        logger.LogDebug("There's {deviceCount} devices connected", devices.Count);
-        foreach (UsbmuxdDevice device in devices) {
-            Console.WriteLine($"Device found: {device.DeviceId} - {device.Serial}");
-        }
+            List<UsbmuxdDevice> devices = await Usbmux.GetDeviceListAsync(cancellationToken: tokenSource.Token);
+            if (devices.Count == 0) {
+                logger.LogError("No device is connected to the system.");
+                return;
+            }
+            else if (logger.IsEnabled(LogLevel.Information)) {
+                logger.LogInformation("There's {deviceCount} devices connected", devices.Count);
+                foreach (UsbmuxdDevice device in devices) {
+                    logger.LogInformation("Device found: {DeviceId} - {Serial}", device.DeviceId, device.Serial);
+                }
+            }
 
-        using (LockdownClient lockdown = await MobileDevice.CreateUsingUsbmuxAsync(autopair: false, logger: logger)) {
-            Progress<PairingState> progress = new();
-            progress.ProgressChanged += Progress_ProgressChanged;
-            if (!lockdown.IsPaired) {
-                await lockdown.PairAsync(progress);
+            using (LockdownClient lockdown = await MobileDevice.CreateUsingUsbmuxAsync(logger: logger)) {
+                await DemoFeatureRunThrough(lockdown, tokenSource.Token);
             }
         }
+    }
 
-        await Remoted(logger);
+    private static async Task DemoFeatureRunThrough(LockdownServiceProvider lsp, CancellationToken ct) {
+        await using (AfcService afc = new AfcService(lsp, logger: logger)) {
+            await afc.StartAsync(ct);
 
-        using (LockdownClient lockdown = await MobileDevice.CreateUsingUsbmuxAsync(logger: logger)) {
-            using (HeartbeatService hb = new HeartbeatService(lockdown, logger)) {
-                hb.Start();
-
-                using (NotificationProxyService np = new NotificationProxyService(lockdown)) {
-                    np.ReceivedNotification += NotificationProxy_ReceivedNotification;
-                    await np.ObserveNotificationAsync(ReceivableNotification.ActivationState).ConfigureAwait(false);
-                    await np.ObserveNotificationAsync(ReceivableNotification.AddressBookPreferenceChanged).ConfigureAwait(false);
-                    await np.ObserveNotificationAsync(ReceivableNotification.AppInstalled).ConfigureAwait(false);
-                    await np.ObserveNotificationAsync(ReceivableNotification.AppUninstalled).ConfigureAwait(false);
-                    await np.ObserveNotificationAsync(ReceivableNotification.AttemptActivation).ConfigureAwait(false);
-                    await np.ObserveNotificationAsync(ReceivableNotification.BrickState).ConfigureAwait(false);
-                    await np.ObserveNotificationAsync(ReceivableNotification.DeveloperImageMounted).ConfigureAwait(false);
-                    await np.ObserveNotificationAsync(ReceivableNotification.DeviceNameChanged).ConfigureAwait(false);
-                    await np.ObserveNotificationAsync(ReceivableNotification.DiskUsageChanged).ConfigureAwait(false);
-                    await np.ObserveNotificationAsync(ReceivableNotification.DsDomainChanged).ConfigureAwait(false);
-                    await np.ObserveNotificationAsync(ReceivableNotification.HostAttached).ConfigureAwait(false);
-                    await np.ObserveNotificationAsync(ReceivableNotification.HostDetached).ConfigureAwait(false);
-                    await np.ObserveNotificationAsync(ReceivableNotification.ItdbprepDidEnd).ConfigureAwait(false);
-                    await np.ObserveNotificationAsync(ReceivableNotification.LanguageChanged).ConfigureAwait(false);
-                    await np.ObserveNotificationAsync(ReceivableNotification.LocalAuthenticationUiDismissed).ConfigureAwait(false);
-                    await np.ObserveNotificationAsync(ReceivableNotification.LocalAuthenticationUiPresented).ConfigureAwait(false);
-                    await np.ObserveNotificationAsync(ReceivableNotification.PhoneNumberChanged).ConfigureAwait(false);
-                    await np.ObserveNotificationAsync(ReceivableNotification.RegistrationFailed).ConfigureAwait(false);
-                    await np.ObserveNotificationAsync(ReceivableNotification.RequestPair).ConfigureAwait(false);
-                    await np.ObserveNotificationAsync(ReceivableNotification.SyncCancelRequest).ConfigureAwait(false);
-                    await np.ObserveNotificationAsync(ReceivableNotification.SyncResumeRequst).ConfigureAwait(false);
-                    await np.ObserveNotificationAsync(ReceivableNotification.SyncSuspendRequst).ConfigureAwait(false);
-                    await np.ObserveNotificationAsync(ReceivableNotification.TimezoneChanged).ConfigureAwait(false);
-                    await np.ObserveNotificationAsync(ReceivableNotification.TrustedHostAttached).ConfigureAwait(false);
-
-                    await Task.Delay(100000, tokenSource.Token).ConfigureAwait(false);
+            Dictionary<string, string> deviceInfo = await afc.GetDeviceInfoAsync(ct);
+            if (logger.IsEnabled(LogLevel.Information)) {
+                logger.LogInformation("Attached AFC device info:");
+                foreach (KeyValuePair<string, string> info in deviceInfo) {
+                    logger.LogInformation("{Key} - {Value}", info.Key, info.Value);
+                    await Task.Delay(500, ct);
                 }
             }
         }
 
-        using (UsbmuxLockdownClient lockdown = await MobileDevice.CreateUsingUsbmuxAsync(logger: logger)) {
-            using (Mobilebackup2Service mb2 = new Mobilebackup2Service(lockdown, logger: logger)) {
-                mb2.BeforeReceivingFile += BackupJob_BeforeReceivingFile;
-                mb2.Completed += BackupJob_Completed;
-                mb2.Error += BackupJob_Error;
-                mb2.FileReceived += BackupJob_FileReceived;
-                mb2.FileReceiving += BackupJob_FileReceiving;
-                mb2.FileTransferError += BackupJob_FileTransferError;
-                mb2.PasscodeRequiredForBackup += BackupJob_PasscodeRequiredForBackup;
-                mb2.Progress += BackupJob_Progress;
-                mb2.Status += BackupJob_Status;
-                mb2.Started += BackupJob_Started;
-
-                await mb2.Backup(false, false, true, "backups", cancellationToken: tokenSource.Token);
+        // Listen to the heartbeat for ~5 seconds
+        await using (HeartbeatService hb = new HeartbeatService(lsp, logger)) {
+            await hb.ConnectAsync(ct);
+            try {
+                await hb.StartAsync(TimeSpan.FromSeconds(5), ct);
+            }
+            catch (Exception ex) when (ex is TimeoutException) {
+                // Nothing to do as this is the expected timeout.
             }
         }
 
-        while (true) {
-            await Task.Delay(1000, tokenSource.Token);
+        try {
+            HouseArrestService ha = await HouseArrestService.CreateAsync(lsp, "test.bundle.app", true, ct);
+            await using (ha) { }
+        }
+        catch (HouseArrestException ex) {
+            logger.LogWarning("Failed to start HouseArrestService: {reason}", ex);
+        }
+
+        // Get all installed apps and list them out
+        await using (InstallationProxyService ip = new InstallationProxyService(lsp, logger)) {
+            await ip.ConnectAsync(ct);
+
+            DictionaryNode apps = await ip.GetAppsAsync(Netimobiledevice.Services.InstallationProxy.ApplicationType.Any, true, ct: ct);
+            foreach (KeyValuePair<string, PropertyNode> app in apps) {
+                if (logger.IsEnabled(LogLevel.Information)) {
+                    logger.LogInformation("App bundle found: {appIdentifier}", app.Key);
+                }
+                await Task.Delay(100, ct);
+            }
+        }
+
+        // Copy and write to screen all of the available provisioning profiles.
+        await using (MisagentService ma = new MisagentService(lsp, logger)) {
+            await ma.ConnectAsync(ct);
+
+            IReadOnlyList<DictionaryNode> profiles = await ma.CopyAllAsync(ct);
+            foreach (DictionaryNode profile in profiles) {
+                if (logger.IsEnabled(LogLevel.Information)) {
+                    logger.LogInformation("Profile found: {profile}", PropertyList.SaveAsString(profile, PlistFormat.Xml));
+                    await Task.Delay(500, ct);
+                }
+            }
+        }
+
+        await using (Mobilebackup2Service mb2 = new Mobilebackup2Service(lsp, logger: logger)) {
+            await mb2.ConnectAsync(ct);
+
+            await mb2.BackupAsync(
+                fullBackup: false,
+                backupDirectory: "Backups",
+                progressCallback: BackupProgressCallback,
+                filterCallback: BackupFilterCallback,
+                password: "123456",
+                patchManifest: true,
+                cancellationToken: ct
+            );
+        }
+
+        // Get the current orientation of the device.
+        await using (SpringBoardServicesService sb = new SpringBoardServicesService(lsp, logger)) {
+            await sb.ConnectAsync(ct);
+
+            ScreenOrientation orientation = await sb.GetInterfaceOrientationAsync(ct);
+            if (logger.IsEnabled(LogLevel.Information)) {
+                logger.LogInformation("Device Interface Orientation: {orientation}", orientation);
+            }
+            await Task.Delay(500, ct);
+        }
+
+        // Read 100 lines of the syslog then exit.
+        await using (SyslogService sl = new SyslogService(lsp, logger)) {
+            await sl.ConnectAsync(ct);
+
+            int count = 0;
+            await foreach (string line in sl.WatchAsync(ct)) {
+                if (logger.IsEnabled(LogLevel.Debug)) {
+                    logger.LogDebug("{syslog}", line);
+                }
+
+                count++;
+                if (count >= 100) {
+                    break;
+                }
+            }
+        }
+    }
+
+    private static bool BackupFilterCallback(BackupFile backupFile) {
+        return true;
+    }
+
+    private static void BackupProgressCallback(double progress) {
+        if (logger.IsEnabled(LogLevel.Information)) {
+            logger.LogInformation("Backup progress: {progress}", progress);
         }
     }
 
@@ -115,50 +169,7 @@ public class Program {
         Console.WriteLine(e.Event);
     }
 
-    private static void BackupJob_Started(object? sender, EventArgs e) {
-        Console.WriteLine($"BackupJob_Started");
-    }
-
-    private static void BackupJob_Status(object? sender, StatusEventArgs e) {
-        Console.WriteLine($"BackupJob_Status");
-    }
-
-    private static void BackupJob_Progress(object? sender, ProgressChangedEventArgs e) {
-        Console.WriteLine($"BackupJob_Progress");
-    }
-
-    private static void BackupJob_PasscodeRequiredForBackup(object? sender, EventArgs e) {
-        Console.WriteLine($"BackupJob_PasscodeRequiredForBackup");
-    }
-
-    private static void BackupJob_FileTransferError(object? sender, BackupFileErrorEventArgs e) {
-        Console.WriteLine($"BackupJob_FileTransferError");
-    }
-
-    private static void BackupJob_FileReceiving(object? sender, BackupFileEventArgs e) {
-        Console.WriteLine($"BackupJob_FileReceiving");
-    }
-
-    private static void BackupJob_Completed(object? sender, BackupResultEventArgs e) {
-        Console.WriteLine($"BackupJob_Completed");
-    }
-
-    private static void BackupJob_Error(object? sender, ErrorEventArgs e) {
-        Console.WriteLine($"BackupJob_Error");
-    }
-
-    private static void BackupJob_FileReceived(object? sender, BackupFileEventArgs e) {
-        Console.WriteLine($"BackupJob_FileReceived");
-    }
-
-    private static void BackupJob_BeforeReceivingFile(object? sender, BackupFileEventArgs e) {
-        Console.WriteLine($"BackupJob_BeforeReceivingFile");
-    }
-
-    private static void Progress_ProgressChanged(object? sender, PairingState e) {
-        Console.WriteLine($"Pair Progress Changed: {e}");
-    }
-
+    // TODO
     private static async Task Remoted(ILogger logger) {
         Tunneld tunneld = new Tunneld(TunnelProtocol.Tcp, logger: logger);
         tunneld.Start();
@@ -166,19 +177,7 @@ public class Program {
         await Task.Delay(10 * 1000);
 
         RemoteServiceDiscoveryService rsd = await tunneld.GetDevice() ?? throw new LockdownException("No device found");
-        using (Mobilebackup2Service mb2 = new Mobilebackup2Service(rsd, logger: logger)) {
-            mb2.BeforeReceivingFile += BackupJob_BeforeReceivingFile;
-            mb2.Completed += BackupJob_Completed;
-            mb2.Error += BackupJob_Error;
-            mb2.FileReceived += BackupJob_FileReceived;
-            mb2.FileReceiving += BackupJob_FileReceiving;
-            mb2.FileTransferError += BackupJob_FileTransferError;
-            mb2.PasscodeRequiredForBackup += BackupJob_PasscodeRequiredForBackup;
-            mb2.Progress += BackupJob_Progress;
-            mb2.Status += BackupJob_Status;
-            mb2.Started += BackupJob_Started;
-
-            await mb2.Backup(false, false, true, "backups", cancellationToken: tokenSource.Token);
+        await using (Mobilebackup2Service mb2 = new Mobilebackup2Service(rsd, logger: logger)) {
         }
 
         await Task.Delay(5 * 1000);

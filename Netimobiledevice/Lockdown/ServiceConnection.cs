@@ -1,6 +1,6 @@
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
-using Netimobiledevice.DeviceLink;
+using Netimobiledevice.Backup;
 using Netimobiledevice.Plist;
 using Netimobiledevice.Usbmuxd;
 using System;
@@ -17,10 +17,8 @@ using System.Threading.Tasks;
 
 namespace Netimobiledevice.Lockdown;
 
-/// <summary>
-/// A wrapper for usbmux tcp-relay connections
-/// </summary>
-public sealed class ServiceConnection : IDisposable, IAsyncDisposable {
+/// <inheritdoc />
+public sealed class ServiceConnection : IServiceConnection {
     private const int MAX_READ_SIZE = 32768;
 
     // ScribeHold fork (#2198, P1-1): the async-send chunk size. SendAsync splits every payload into
@@ -349,16 +347,16 @@ public sealed class ServiceConnection : IDisposable, IAsyncDisposable {
         return buffer;
     }
 
-    public async Task<byte[]> ReceiveAsync(int length, CancellationToken cancellationToken) {
-        if (length <= 0) {
+    public async ValueTask<byte[]> ReceiveAsync(int size, CancellationToken cancellationToken = default) {
+        if (size <= 0) {
             return [];
         }
 
-        byte[] buffer = new byte[length];
+        byte[] buffer = new byte[size];
 
         int totalBytesRead = 0;
-        while (totalBytesRead < length) {
-            int remainingSize = length - totalBytesRead;
+        while (totalBytesRead < size) {
+            int remainingSize = size - totalBytesRead;
             int readSize = remainingSize;
             if (remainingSize > MAX_READ_SIZE) {
                 readSize = MAX_READ_SIZE;
@@ -376,16 +374,16 @@ public sealed class ServiceConnection : IDisposable, IAsyncDisposable {
                         bytesRead = await Stream.ReadAsync(buffer.AsMemory(totalBytesRead, readSize), linkedCancellationTokenSource.Token).ConfigureAwait(false);
                         if (bytesRead == 0) {
                             // ScribeHold fork (#2068): record WHERE the FIN landed — offset 0 of a 4-byte
-                            // length-prefix read is the empty-reply-FIN-at-version-exchange signature.
+                            // size-prefix read is the empty-reply-FIN-at-version-exchange signature.
                             _logger.LogError(
                                 "Read zero bytes so the connection has been broken (FIN at offset {Offset}/{Expected} bytes)",
-                                totalBytesRead, length);
+                                totalBytesRead, size);
                             // ScribeHold fork (#2077): at the version-exchange window only, dump the
                             // decrypted partial bytes (if any), confirm whether the host had sent
                             // anything first, and classify the close as graceful (close_notify / clean
                             // FIN) vs a hard RST — the decisive USB-vs-WiFi signal. Bounded to the
                             // version-exchange window so transfer-phase user content is never dumped.
-                            LogVersionExchangeFin(buffer, totalBytesRead, length);
+                            LogVersionExchangeFin(buffer, totalBytesRead, size);
                             break;
                         }
                     }
@@ -410,7 +408,7 @@ public sealed class ServiceConnection : IDisposable, IAsyncDisposable {
         // drowning the Debug channel across a multi-GB backup. Trace keeps it for the deepest wire
         // diagnosis while leaving it off the Debug channel EnableDiagnosticLogging raises; free when off.
         if (_logger.IsEnabled(LogLevel.Trace)) {
-            _logger.LogTrace("ServiceConnection.ReceiveAsync read {Read}/{Expected} bytes", totalBytesRead, length);
+            _logger.LogTrace("ServiceConnection.ReceiveAsync read {Read}/{Expected} bytes", totalBytesRead, size);
         }
 
         if (totalBytesRead < buffer.Length) {
@@ -427,7 +425,7 @@ public sealed class ServiceConnection : IDisposable, IAsyncDisposable {
         return PropertyList.LoadFromByteArray(plistBytes);
     }
 
-    public async Task<PropertyNode?> ReceivePlistAsync(CancellationToken cancellationToken) {
+    public async ValueTask<PropertyNode?> ReceivePlistAsync(CancellationToken cancellationToken = default) {
         byte[] plistBytes = await ReceivePrefixedAsync(cancellationToken).ConfigureAwait(false);
         if (plistBytes.Length == 0) {
             return null;
@@ -471,7 +469,7 @@ public sealed class ServiceConnection : IDisposable, IAsyncDisposable {
         Interlocked.Add(ref _bytesSent, data.Length);
     }
 
-    public async Task SendAsync(ReadOnlyMemory<byte> data, CancellationToken cancellationToken) {
+    public async ValueTask SendAsync(ReadOnlyMemory<byte> data, CancellationToken cancellationToken = default) {
         // ScribeHold fork (#2198, P1-1): bound every async write. Stream.WriteTimeout is SYNC-ONLY in
         // .NET, so the prior bare WriteAsync was UNBOUNDED — a stalled backupd could park a mid-payload
         // write forever (keepalive can't trip: the TCP peer is the local usbmuxd). The bound is applied
@@ -551,14 +549,13 @@ public sealed class ServiceConnection : IDisposable, IAsyncDisposable {
         Send(plistBytes);
     }
 
-    public async Task SendPlistAsync(PropertyNode data, PlistFormat format = PlistFormat.Xml, CancellationToken cancellationToken = default) {
-        byte[] plistBytes = PropertyList.SaveAsByteArray(data, format);
-
+    public async ValueTask SendPlistAsync(PropertyNode plist, PlistFormat format = PlistFormat.Xml, CancellationToken cancellationToken = default) {
+        byte[] plistBytes = PropertyList.SaveAsByteArray(plist, format);
         byte[] lengthBytes = new byte[sizeof(uint)];
         BinaryPrimitives.WriteUInt32BigEndian(lengthBytes, (uint) plistBytes.Length);
 
-        await SendAsync(lengthBytes, cancellationToken).ConfigureAwait(false);
-        await SendAsync(plistBytes, cancellationToken).ConfigureAwait(false);
+        await SendAsync(lengthBytes.AsMemory(), cancellationToken).ConfigureAwait(false);
+        await SendAsync(plistBytes.AsMemory(), cancellationToken).ConfigureAwait(false);
     }
 
     public PropertyNode? SendReceivePlist(PropertyNode data) {
@@ -566,7 +563,7 @@ public sealed class ServiceConnection : IDisposable, IAsyncDisposable {
         return ReceivePlist();
     }
 
-    public async Task<PropertyNode?> SendReceivePlistAsync(PropertyNode data, CancellationToken cancellationToken) {
+    public async ValueTask<PropertyNode?> SendReceivePlistAsync(PropertyNode data, PlistFormat plistFormat = PlistFormat.Xml, CancellationToken cancellationToken = default) {
         await SendPlistAsync(data, cancellationToken: cancellationToken).ConfigureAwait(false);
         return await ReceivePlistAsync(cancellationToken).ConfigureAwait(false);
     }
@@ -762,7 +759,7 @@ public sealed class ServiceConnection : IDisposable, IAsyncDisposable {
 
     /// <summary>
     /// ScribeHold fork (#2077): arm the version-exchange plaintext dump. Called by
-    /// <see cref="Netimobiledevice.DeviceLink.DeviceLinkService"/> immediately before the first
+    /// <see cref="Netimobiledevice.Backup.DeviceLinkService"/> immediately before the first
     /// DeviceLink read on the mb2 service channel (where the empty-reply-FIN wedge bites). While the
     /// window is open, a 0-byte / short read MAY hex-dump the decrypted bytes it returned. The window
     /// MUST be closed (via <see cref="EndVersionExchangeWindow"/>, in a finally) the moment version

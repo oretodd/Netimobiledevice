@@ -1,7 +1,6 @@
 using System.Text;
 using Netimobiledevice.Backup;
-using Netimobiledevice.DeviceLink;
-using Netimobiledevice.EndianBitConversion;
+using System.Buffers.Binary;
 using Netimobiledevice.Plist;
 
 namespace NetimobiledeviceTest.DeviceLink;
@@ -147,7 +146,7 @@ public class DeviceLinkGoldenWireShapeTests
         oldData[0] = (byte) ResultCode.FileData;
         payload.CopyTo(oldData, 1);
         List<byte> oldWire = [];
-        oldWire.AddRange(EndianBitConverter.BigEndian.GetBytes(1 + bytesRead));
+        oldWire.AddRange(BigEndian(1 + bytesRead));
         oldWire.AddRange(oldData);
 
         // NEW path (SendFileDataChunkAsync): THREE writes — BE length prefix (1 + bytesRead), the single
@@ -155,7 +154,7 @@ public class DeviceLinkGoldenWireShapeTests
         byte[] rented = new byte[64 * 1024]; // model an ArrayPool buffer larger than the read
         payload.CopyTo(rented, 0);
         List<byte> newWire = [];
-        newWire.AddRange(EndianBitConverter.BigEndian.GetBytes(1 + bytesRead));
+        newWire.AddRange(BigEndian(1 + bytesRead));
         newWire.Add((byte) ResultCode.FileData);
         newWire.AddRange(rented.AsMemory(0, bytesRead).ToArray());
 
@@ -178,10 +177,16 @@ public class DeviceLinkGoldenWireShapeTests
         // then the single Success (0x00) code byte.
         byte[] buffer = [(byte) ResultCode.Success];
         List<byte> wire = [];
-        wire.AddRange(EndianBitConverter.BigEndian.GetBytes(buffer.Length));
+        wire.AddRange(BigEndian(buffer.Length));
         wire.AddRange(buffer);
 
         Assert.AreEqual("0000000100", ToHex(wire.ToArray()),
             "The per-file success terminator wire bytes changed — a DownloadFiles framing regression (#2199 P2-6).");
+    }
+
+    private static byte[] BigEndian(int value) {
+        byte[] bytes = new byte[sizeof(int)];
+        BinaryPrimitives.WriteInt32BigEndian(bytes, value);
+        return bytes;
     }
 }

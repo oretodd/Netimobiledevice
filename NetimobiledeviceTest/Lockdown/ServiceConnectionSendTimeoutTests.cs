@@ -3,7 +3,7 @@ using System.Net;
 using System.Net.Sockets;
 using System.Reflection;
 using Microsoft.Extensions.Logging.Abstractions;
-using Netimobiledevice.DeviceLink;
+using Netimobiledevice.Backup;
 using Netimobiledevice.Lockdown;
 
 namespace NetimobiledeviceTest.Lockdown;
@@ -42,7 +42,7 @@ public class ServiceConnectionSendTimeoutTests
         Stopwatch sw = Stopwatch.StartNew();
 
         ServiceConnectionSendTimeoutException ex = await Assert.ThrowsExactlyAsync<ServiceConnectionSendTimeoutException>(
-            () => connection.SendAsync(payload, CancellationToken.None),
+            () => connection.SendAsync(payload, CancellationToken.None).AsTask(),
             "A write the peer never drains must trip the per-chunk write bound, not park forever.");
         sw.Stop();
 

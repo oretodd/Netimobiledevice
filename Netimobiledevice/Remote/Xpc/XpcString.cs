@@ -1,0 +1,22 @@
+﻿using Netimobiledevice.Utils;
+using System.Text;
+
+namespace Netimobiledevice.Remote.Xpc;
+
+public class XpcString(string? data) : XpcObject<string>(data?.TrimEnd('\0')) {
+    public override bool IsAligned => true;
+
+    public override bool IsPrefixed => true;
+
+    public override XpcMessageType Type => XpcMessageType.String;
+
+    public static XpcString Deserialise(byte[] data) {
+        data = GetPrefixSizeFromData(data);
+        return new XpcString(Encoding.UTF8.GetString(data));
+    }
+
+    public override byte[] Serialise() {
+        string str = Data ?? string.Empty;
+        return CString.GetBytes(str);
+    }
+}

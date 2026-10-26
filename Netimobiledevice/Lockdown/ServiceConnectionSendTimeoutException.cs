@@ -5,7 +5,7 @@ namespace Netimobiledevice.Lockdown;
 /// <summary>
 /// ScribeHold fork (#2198, P1-1): raised when a PER-CHUNK async socket write in
 /// <see cref="ServiceConnection.SendAsync"/> exceeds the transport policy's write bound
-/// (<see cref="Netimobiledevice.DeviceLink.TransportTimeoutPolicy.WriteBoundSec"/>). Async writes were
+/// (<see cref="Netimobiledevice.Backup.TransportTimeoutPolicy.WriteBoundSec"/>). Async writes were
 /// previously UNBOUNDED — <c>Stream.WriteTimeout</c> is sync-only in .NET — so a stalled <c>backupd</c>
 /// could park a mid-Manifest.db 128 MiB DownloadFiles chunk write forever (the best-evidence mechanism
 /// of the original 51-minute wedge; TCP keepalive cannot trip because the TCP peer is the local
