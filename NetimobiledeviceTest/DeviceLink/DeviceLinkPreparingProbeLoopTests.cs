@@ -4,7 +4,6 @@ using System.Net.Sockets;
 using System.Reflection;
 using Microsoft.Extensions.Logging.Abstractions;
 using Netimobiledevice.Backup;
-using Netimobiledevice.DeviceLink;
 using Netimobiledevice.Lockdown;
 
 namespace NetimobiledeviceTest.DeviceLink;

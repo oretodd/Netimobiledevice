@@ -1,5 +1,4 @@
 using Netimobiledevice.Backup;
-using Netimobiledevice.DeviceLink;
 
 namespace NetimobiledeviceTest.DeviceLink;
 

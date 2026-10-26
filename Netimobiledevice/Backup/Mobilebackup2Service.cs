@@ -1,17 +1,16 @@
 ﻿using Microsoft.Extensions.Logging;
-using Netimobiledevice.Afc;
-using Netimobiledevice.DeviceLink;
-using Netimobiledevice.InstallationProxy;
 using Netimobiledevice.Lockdown;
 using Netimobiledevice.NotificationProxy;
 using Netimobiledevice.Plist;
-using Netimobiledevice.SpringBoardServices;
+using Netimobiledevice.Services;
+using Netimobiledevice.Services.Afc;
 using System;
 using System.ComponentModel;
 using System.IO;
 using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
+using BackupLock = Netimobiledevice.Services.Mobilebackup2.BackupLock;
 
 namespace Netimobiledevice.Backup;
 
@@ -25,9 +24,8 @@ public sealed class Mobilebackup2Service(
     ILogger? logger = null
 ) : LockdownService(
     lockdown,
-    LOCKDOWN_SERVICE_NAME,
-    RSD_SERVICE_NAME,
-    useEscrowBag: true,
+    lockdown is LockdownClient ? LOCKDOWN_SERVICE_NAME : RSD_SERVICE_NAME,
+    includeEscrowBag: true,
     logger: logger
 ) {
     private const int MOBILEBACKUP2_VERSION_MAJOR = 400;
@@ -92,6 +90,12 @@ public sealed class Mobilebackup2Service(
     /// <summary>
     /// iTunes files to be inserted into the Info.plist file.
     /// </summary>
+    private static readonly string[] ObservedNotifications = [
+        ReceivableNotification.SyncCancelRequest,
+        ReceivableNotification.LocalAuthenticationUiPresented,
+        ReceivableNotification.LocalAuthenticationUiDismissed
+    ];
+
     private static readonly string[] iTunesFiles = [
         "ApertureAlbumPrefs",
         "IC-Info.sidb",
@@ -147,71 +151,6 @@ public sealed class Mobilebackup2Service(
     /// </summary>
     public event EventHandler<StatusEventArgs>? Status;
 
-    private static bool BackupExists(string backupDirectory, string identifier) {
-        string deviceDirectory = Path.Combine(backupDirectory, identifier);
-        bool infoPlistExists = File.Exists(Path.Combine(deviceDirectory, "Info.plist"));
-        bool manifestPlistExists = File.Exists(Path.Combine(deviceDirectory, "Manifest.plist"));
-        bool statusPlistExists = File.Exists(Path.Combine(deviceDirectory, "Status.plist"));
-        return infoPlistExists && manifestPlistExists && statusPlistExists;
-    }
-
-    private async Task<ResultCode> ChangeBackupEncryptionPassword(string? oldPassword, string? newPassword, BackupEncryptionFlags flag, CancellationToken cancellationToken) {
-        DictionaryNode backupDomain = Lockdown.GetValue("com.apple.mobile.backup", null)?.AsDictionaryNode() ?? [];
-        backupDomain.TryGetValue("WillEncrypt", out PropertyNode? willEncryptNode);
-        bool willEncryptBackup = willEncryptNode?.AsBooleanNode().Value ?? false;
-
-        switch (flag) {
-            case BackupEncryptionFlags.Enable: {
-                if (willEncryptBackup) {
-                    Logger.LogError("ERROR Backup encryption is already enabled. Aborting.");
-                    throw new InvalidOperationException("Can't set backup password as one already exists");
-                }
-                else if (string.IsNullOrEmpty(newPassword)) {
-                    Logger.LogError("No backup password given. Aborting.");
-                    throw new ArgumentException("password can't be null or empty");
-                }
-                break;
-            }
-            case BackupEncryptionFlags.ChangePassword: {
-                if (!willEncryptBackup) {
-                    Logger.LogError("Error Backup encryption is not enabled so can't change password. Aborting");
-                    throw new InvalidOperationException("Backup encryption isn't enabled so can't change password");
-                }
-                break;
-            }
-            case BackupEncryptionFlags.Disable: {
-                if (!willEncryptBackup) {
-                    Logger.LogError("ERROR Backup encryption is already disabled. Aborting.");
-                    throw new InvalidOperationException("Can't remove backup password as none exists");
-                }
-                else if (string.IsNullOrEmpty(oldPassword)) {
-                    Logger.LogError("No backup password given. Aborting.");
-                    throw new ArgumentException("password can't be null or empty");
-                }
-                break;
-            }
-        }
-
-        if (string.IsNullOrEmpty(newPassword) && string.IsNullOrEmpty(oldPassword)) {
-            throw new Mobilebackup2Exception("Both newPassword and oldPassword can't be null or empty");
-        }
-
-        using (DeviceLinkService dl = await GetDeviceLink(string.Empty, true, true, cancellationToken).ConfigureAwait(false)) {
-            DictionaryNode message = new DictionaryNode() {
-                { "MessageName", new StringNode("ChangePassword") },
-                { "TargetIdentifier", new StringNode(Lockdown.Udid) },
-            };
-            if (!string.IsNullOrEmpty(oldPassword)) {
-                message.Add("OldPassword", new StringNode(oldPassword));
-            }
-            if (!string.IsNullOrEmpty(newPassword)) {
-                message.Add("NewPassword", new StringNode(newPassword));
-            }
-            await dl.SendProcessMessage(message, cancellationToken).ConfigureAwait(false);
-            return await dl.DlLoop(cancellationToken).ConfigureAwait(false);
-        }
-    }
-
     /// <summary>
     /// Creates the Info.plist dictionary.
     /// </summary>
@@ -225,10 +164,12 @@ public sealed class Mobilebackup2Service(
 
         DictionaryNode appDict = [];
         ArrayNode installedApps = [];
-        using (InstallationProxyService installationProxyService = new InstallationProxyService(Lockdown)) {
-            using (SpringBoardServicesService springBoardServicesService = new SpringBoardServicesService(Lockdown)) {
+        await using (InstallationProxyService installationProxyService = new InstallationProxyService(Lockdown)) {
+            await using (SpringBoardServicesService springBoardServicesService = new SpringBoardServicesService(Lockdown)) {
+                await installationProxyService.ConnectAsync(cancellationToken).ConfigureAwait(false);
+                await springBoardServicesService.ConnectAsync(cancellationToken).ConfigureAwait(false);
                 try {
-                    ArrayNode apps = await installationProxyService.Browse(
+                    ArrayNode apps = await installationProxyService.BrowseAsync(
                         new DictionaryNode() { { "ApplicationType", new StringNode("User") } },
                         [
                             new StringNode("CFBundleIdentifier"),
@@ -251,7 +192,7 @@ public sealed class Mobilebackup2Service(
                         }
                     }
                 }
-                catch (Exception ex) {
+                catch (Exception ex) when (ex is not OperationCanceledException) {
                     Logger.LogWarning(ex, "Failed to create application list for Info.plist");
                 }
 
@@ -259,16 +200,10 @@ public sealed class Mobilebackup2Service(
                 foreach (string iTuneFile in iTunesFiles) {
                     string filePath = $"/iTunes_Control/iTunes/{iTuneFile}";
                     try {
-                        byte[] dataBuffer = await afc.GetFileContents(filePath, cancellationToken) ?? [];
+                        byte[] dataBuffer = await afc.GetFileContentsAsync(filePath, cancellationToken).ConfigureAwait(false);
                         files.Add(iTuneFile, new DataNode(dataBuffer));
                     }
-                    catch (AfcException ex) {
-                        if (ex.AfcError == AfcError.ObjectNotFound) {
-                            continue;
-                        }
-                        else {
-                            throw;
-                        }
+                    catch (AfcFileNotFoundException) {
                     }
                 }
 
@@ -304,13 +239,10 @@ public sealed class Mobilebackup2Service(
                 }
 
                 try {
-                    byte[] dataBuffer = await afc.GetFileContents("/Books/iBooksData2.plist", cancellationToken).ConfigureAwait(false) ?? [];
+                    byte[] dataBuffer = await afc.GetFileContentsAsync("/Books/iBooksData2.plist", cancellationToken).ConfigureAwait(false);
                     info.Add("iBooks Data 2", new DataNode(dataBuffer));
                 }
-                catch (AfcException ex) {
-                    if (ex.AfcError != AfcError.ObjectNotFound) {
-                        throw;
-                    }
+                catch (AfcFileNotFoundException) {
                 }
 
                 if (itunesSettings != null) {
@@ -358,7 +290,9 @@ public sealed class Mobilebackup2Service(
     }
 
     private async Task<DeviceLinkService> GetDeviceLink(string backupDirectory, bool ignoreTransferErrors, bool performBackupSizeCheck, CancellationToken cancellationToken) {
-        DeviceLinkService dl = new DeviceLinkService(this.Service, backupDirectory, this.Lockdown.OsVersion, ignoreTransferErrors, performBackupSizeCheck, Logger);
+        await ConnectAsync(cancellationToken).ConfigureAwait(false);
+        ServiceConnection service = Service as ServiceConnection ?? throw new Mobilebackup2Exception("mobilebackup2 service failed to connect");
+        DeviceLinkService dl = new DeviceLinkService(service, backupDirectory, this.Lockdown.OsVersion, ignoreTransferErrors, performBackupSizeCheck, Logger);
         dl.ShouldDiscardFile = this.ShouldDiscardFile;
         // #2197 (P0-B): forward the presence probe BEFORE the version exchange so it is armed for both the
         // version-exchange reads and the subsequent Preparing-phase wait.
@@ -448,92 +382,108 @@ public sealed class Mobilebackup2Service(
             dl.Status += DeviceLink_Status;
             dl.Started += DeviceLink_Started;
 
-            using (NotificationProxyService np = new NotificationProxyService(this.Lockdown)) {
-                np.ReceivedNotification += NotificationProxy_ReceivedNotification;
-                await np.ObserveNotificationAsync(ReceivableNotification.SyncCancelRequest).ConfigureAwait(false);
-                await np.ObserveNotificationAsync(ReceivableNotification.LocalAuthenticationUiPresented).ConfigureAwait(false);
-                await np.ObserveNotificationAsync(ReceivableNotification.LocalAuthenticationUiDismissed).ConfigureAwait(false);
-                np.Start();
+            await using (NotificationProxyService np = new NotificationProxyService(this.Lockdown, logger: Logger)) {
+                await np.ConnectAsync(_internalCts.Token).ConfigureAwait(false);
+                // The default 10s read timeout would end the listener during any quiet stretch; notificationCts bounds it instead.
+                np.Service!.SetTimeout(Timeout.Infinite);
+                foreach (string notification in ObservedNotifications) {
+                    await np.NotifyRegisterDispatchAsync(notification, _internalCts.Token).ConfigureAwait(false);
+                }
+                using CancellationTokenSource notificationCts = new CancellationTokenSource();
+                Task notificationTask = ReceiveNotificationsAsync(np, notificationCts.Token);
 
-                using (AfcService afc = new AfcService(this.Lockdown)) {
-                    using (BackupLock backupLock = new BackupLock(afc, np)) {
-                        await backupLock.AquireBackupLock(_internalCts.Token).ConfigureAwait(false);
+                try {
+                    await using (AfcService afc = new AfcService(this.Lockdown)) {
+                        await afc.ConnectAsync(_internalCts.Token).ConfigureAwait(false);
+                        await using (BackupLock? backupLock = await AcquireBackupLockAsync(afc, np, _internalCts.Token).ConfigureAwait(false)) {
 
-                        // Create Info.plist
-                        // #2199 (P2-1): on a RESUME with a valid Info.plist already on disk, reuse it and
-                        // skip CreateInfoPlist's full instproxy Browse + per-app SpringBoard icon fetch +
-                        // iTunes AFC reads — the device is mid-transfer on a snapshot it already accepted and
-                        // does not need a freshly rebuilt manifest. First-attempt (or a missing/torn file)
-                        // still rebuilds.
-                        string infoPlistPath = Path.Combine(deviceDirectory, "Info.plist");
-                        if (isResume && IsInfoPlistValid(infoPlistPath)) {
-                            Logger.LogInformation(
-                                "Resume with a valid Info.plist at {InfoPlistPath} — reusing it and skipping the full CreateInfoPlist rebuild (instproxy Browse + icon fetch + AFC reads) (#2199 P2-1)",
-                                infoPlistPath);
-                        }
-                        else {
-                            DictionaryNode infoPlist = await CreateInfoPlist(afc, _internalCts.Token).ConfigureAwait(false);
-                            // #2199 (P2-1): FileMode.Create TRUNCATES. The prior File.OpenWrite is
-                            // FileMode.OpenOrCreate WITHOUT truncation — when the new plist is shorter than the
-                            // last one (e.g. an app was uninstalled) the stale tail bytes after </plist>
-                            // survived, handing the device a malformed plist. Truncate-on-open fixes it.
-                            using (FileStream fs = new FileStream(infoPlistPath, FileMode.Create, FileAccess.Write)) {
-                                byte[] infoPlistData = PropertyList.SaveAsByteArray(infoPlist, PlistFormat.Xml);
-                                await fs.WriteAsync(infoPlistData, _internalCts.Token).ConfigureAwait(false);
-                                FileReceived?.Invoke(this, new BackupFileEventArgs(new BackupFile(string.Empty, infoPlistPath, deviceDirectory)));
+                            // Create Info.plist
+                            // #2199 (P2-1): on a RESUME with a valid Info.plist already on disk, reuse it and
+                            // skip CreateInfoPlist's full instproxy Browse + per-app SpringBoard icon fetch +
+                            // iTunes AFC reads — the device is mid-transfer on a snapshot it already accepted and
+                            // does not need a freshly rebuilt manifest. First-attempt (or a missing/torn file)
+                            // still rebuilds.
+                            string infoPlistPath = Path.Combine(deviceDirectory, "Info.plist");
+                            if (isResume && IsInfoPlistValid(infoPlistPath)) {
+                                Logger.LogInformation(
+                                    "Resume with a valid Info.plist at {InfoPlistPath} — reusing it and skipping the full CreateInfoPlist rebuild (instproxy Browse + icon fetch + AFC reads) (#2199 P2-1)",
+                                    infoPlistPath);
                             }
-                        }
+                            else {
+                                DictionaryNode infoPlist = await CreateInfoPlist(afc, _internalCts.Token).ConfigureAwait(false);
+                                // #2199 (P2-1): FileMode.Create TRUNCATES. The prior File.OpenWrite is
+                                // FileMode.OpenOrCreate WITHOUT truncation — when the new plist is shorter than the
+                                // last one (e.g. an app was uninstalled) the stale tail bytes after </plist>
+                                // survived, handing the device a malformed plist. Truncate-on-open fixes it.
+                                using (FileStream fs = new FileStream(infoPlistPath, FileMode.Create, FileAccess.Write)) {
+                                    byte[] infoPlistData = PropertyList.SaveAsByteArray(infoPlist, PlistFormat.Xml);
+                                    await fs.WriteAsync(infoPlistData, _internalCts.Token).ConfigureAwait(false);
+                                    FileReceived?.Invoke(this, new BackupFileEventArgs(new BackupFile(string.Empty, infoPlistPath, deviceDirectory)));
+                                }
+                            }
 
-                        // Create Manifest.plist if doesn't exist.
-                        string manifestPlistPath = Path.Combine(deviceDirectory, "Manifest.plist");
-                        if (fullBackup && File.Exists(manifestPlistPath)) {
-                            File.Delete(manifestPlistPath);
-                        }
-                        else if (!fullBackup && !File.Exists(manifestPlistPath)) {
-                            // #2197 (P0-E): make the silent incremental→full degradation LOUD. When
-                            // Manifest.plist is missing an incremental backup silently becomes a FULL
-                            // backup — a full re-transfer of the whole device. The behavior is UNCHANGED
-                            // here (never alter it); this WARN just makes the degradation diagnosable in a
-                            // single run instead of being invisible.
-                            Logger.LogWarning(
-                                "Requested incremental backup but Manifest.plist is missing at {ManifestPath} — degrading to a FULL backup (whole-device re-transfer) (#2197 P0-E)",
-                                manifestPlistPath);
-                            fullBackup = true;
-                        }
+                            // Create Manifest.plist if doesn't exist.
+                            string manifestPlistPath = Path.Combine(deviceDirectory, "Manifest.plist");
+                            if (fullBackup && File.Exists(manifestPlistPath)) {
+                                File.Delete(manifestPlistPath);
+                            }
+                            else if (!fullBackup && !File.Exists(manifestPlistPath)) {
+                                // #2197 (P0-E): make the silent incremental→full degradation LOUD. When
+                                // Manifest.plist is missing an incremental backup silently becomes a FULL
+                                // backup — a full re-transfer of the whole device. The behavior is UNCHANGED
+                                // here (never alter it); this WARN just makes the degradation diagnosable in a
+                                // single run instead of being invisible.
+                                Logger.LogWarning(
+                                    "Requested incremental backup but Manifest.plist is missing at {ManifestPath} — degrading to a FULL backup (whole-device re-transfer) (#2197 P0-E)",
+                                    manifestPlistPath);
+                                fullBackup = true;
+                            }
 
-                        // Create Status.plist file if doesn't exist.
-                        // #2198 (P1-3): written ATOMICALLY (temp + move-overwrite) so an interrupted
-                        // write can never leave a torn Status.plist that poisons the next incremental
-                        // attempt; and an EXISTING torn/unparseable Status.plist is repaired to a clean
-                        // incremental baseline at attempt start (never silently degrading to FULL).
-                        string statusPlistPath = Path.Combine(deviceDirectory, "Status.plist");
-                        if (fullBackup || !File.Exists(statusPlistPath)) {
-                            BackupStatus status = new BackupStatus() { IsFullBackup = fullBackup };
-                            await AtomicFile.WriteAllBytesAsync(statusPlistPath, PropertyList.SaveAsByteArray(status.ToPlist(), PlistFormat.Binary), _internalCts.Token).ConfigureAwait(false);
-                        }
-                        else if (!IsStatusPlistReadable(statusPlistPath)) {
-                            Logger.LogWarning(
-                                "Status.plist at {StatusPath} is torn/unparseable — rewriting a clean incremental baseline (New/Finished); the backup stays INCREMENTAL, never degrading to full (#2198 P1-3)",
-                                statusPlistPath);
-                            BackupStatus repaired = new BackupStatus() { IsFullBackup = false };
-                            await AtomicFile.WriteAllBytesAsync(statusPlistPath, PropertyList.SaveAsByteArray(repaired.ToPlist(), PlistFormat.Binary), _internalCts.Token).ConfigureAwait(false);
-                        }
+                            // Create Status.plist file if doesn't exist.
+                            // #2198 (P1-3): written ATOMICALLY (temp + move-overwrite) so an interrupted
+                            // write can never leave a torn Status.plist that poisons the next incremental
+                            // attempt; and an EXISTING torn/unparseable Status.plist is repaired to a clean
+                            // incremental baseline at attempt start (never silently degrading to FULL).
+                            string statusPlistPath = Path.Combine(deviceDirectory, "Status.plist");
+                            if (fullBackup || !File.Exists(statusPlistPath)) {
+                                BackupStatus status = new BackupStatus() { IsFullBackup = fullBackup };
+                                await AtomicFile.WriteAllBytesAsync(statusPlistPath, PropertyList.SaveAsByteArray(status.ToPlist(), PlistFormat.Binary), _internalCts.Token).ConfigureAwait(false);
+                            }
+                            else if (!IsStatusPlistReadable(statusPlistPath)) {
+                                Logger.LogWarning(
+                                    "Status.plist at {StatusPath} is torn/unparseable — rewriting a clean incremental baseline (New/Finished); the backup stays INCREMENTAL, never degrading to full (#2198 P1-3)",
+                                    statusPlistPath);
+                                BackupStatus repaired = new BackupStatus() { IsFullBackup = false };
+                                await AtomicFile.WriteAllBytesAsync(statusPlistPath, PropertyList.SaveAsByteArray(repaired.ToPlist(), PlistFormat.Binary), _internalCts.Token).ConfigureAwait(false);
+                            }
 
-                        DictionaryNode message = new DictionaryNode() {
+                            DictionaryNode message = new DictionaryNode() {
                                 { "MessageName", new StringNode("Backup") },
                                 { "TargetIdentifier", new StringNode(Lockdown.Udid) }
                             };
-                        await dl.SendProcessMessage(message, cancellationToken).ConfigureAwait(false);
+                            await dl.SendProcessMessage(message, cancellationToken).ConfigureAwait(false);
 
-                        // Wait for 3 seconds to see if the device passcode is requested and then keep
-                        // waiting till the passcode has been entered — but never past the PasscodeWaitMax
-                        // deadline (#2198 P1-4): an unanswered prompt surfaces a dedicated
-                        // PasscodeWaitTimeoutException (an actionable terminal, never a generic fatal).
-                        await WaitForPasscodeEntryAsync(
-                            () => _passcodeRequired, PasscodePollInterval, PasscodeWaitMax, Logger,
-                            _internalCts.Token).ConfigureAwait(false);
+                            // Wait for 3 seconds to see if the device passcode is requested and then keep
+                            // waiting till the passcode has been entered — but never past the PasscodeWaitMax
+                            // deadline (#2198 P1-4): an unanswered prompt surfaces a dedicated
+                            // PasscodeWaitTimeoutException (an actionable terminal, never a generic fatal).
+                            await WaitForPasscodeEntryAsync(
+                                () => _passcodeRequired, PasscodePollInterval, PasscodeWaitMax, Logger,
+                                _internalCts.Token).ConfigureAwait(false);
 
-                        return await dl.DlLoop(_internalCts.Token).ConfigureAwait(false);
+                            return await dl.DlLoop(_internalCts.Token).ConfigureAwait(false);
+                        }
+                    }
+                }
+                finally {
+                    notificationCts.Cancel();
+                    try {
+                        await notificationTask.ConfigureAwait(false);
+                    }
+                    catch (OperationCanceledException) {
+                    }
+                    catch (Exception ex) {
+                        Logger.LogWarning(ex, "Notification proxy listener faulted during the backup");
                     }
                 }
             }
@@ -615,6 +565,7 @@ public sealed class Mobilebackup2Service(
             // #2198 (P1-1): a bounded per-chunk send timeout is the write-side twin of the inter-message
             // read timeout — same drop-class, same quiet abandon, same reconnect-and-resume.
             or ServiceConnectionSendTimeoutException
+            or ConnectionTerminatedException
             or IOException;
     }
 
@@ -695,8 +646,37 @@ public sealed class Mobilebackup2Service(
         }
     }
 
-    private void NotificationProxy_ReceivedNotification(object? sender, ReceivedNotificationEventArgs e) {
-        if (e.Event == ReceivableNotification.LocalAuthenticationUiPresented) {
+    private async Task<BackupLock?> AcquireBackupLockAsync(AfcService afc, NotificationProxyService np, CancellationToken cancellationToken) {
+        try {
+            return await BackupLock.Create(afc, np, cancellationToken).ConfigureAwait(false);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException) {
+            try {
+                await np.NotifyPostAsync(SendableNotificaton.SyncDidFinish, cancellationToken).ConfigureAwait(false);
+            }
+            catch (Exception) {
+            }
+            // A sync lock still held by the session we are resuming must not end the backup; the device releases it on disconnect.
+            if (ex is AfcException) {
+                Logger.LogWarning(ex, "Could not acquire the iTunes sync lock; continuing the backup without it");
+                return null;
+            }
+            throw;
+        }
+    }
+
+    private async Task ReceiveNotificationsAsync(NotificationProxyService np, CancellationToken cancellationToken) {
+        await foreach (DictionaryNode notification in np.ReceiveNotificationAsync(cancellationToken).ConfigureAwait(false)) {
+            // An empty message means the proxy connection closed; ServiceConnection returns short reads instead of throwing.
+            if (!notification.TryGetValue("Name", out PropertyNode? name)) {
+                return;
+            }
+            HandleNotification(name.AsStringNode().Value);
+        }
+    }
+
+    private void HandleNotification(string name) {
+        if (name == ReceivableNotification.LocalAuthenticationUiPresented) {
             // iOS versions 15.7.1 and anything 16.1 or newer will require you to input a passcode before
             // it can start a backup so we make sure to notify the user about this.
             if ((Lockdown.OsVersion >= new Version(15, 7, 1) && Lockdown.OsVersion < new Version(16, 0)) ||
@@ -705,127 +685,11 @@ public sealed class Mobilebackup2Service(
                 PasscodeRequiredForBackup?.Invoke(this, EventArgs.Empty);
             }
         }
-        else if (e.Event == ReceivableNotification.LocalAuthenticationUiDismissed) {
+        else if (name == ReceivableNotification.LocalAuthenticationUiDismissed) {
             _passcodeRequired = false;
         }
-        else if (e.Event == ReceivableNotification.SyncCancelRequest) {
+        else if (name == ReceivableNotification.SyncCancelRequest) {
             _internalCts.Cancel();
         }
-    }
-
-    /// <summary>
-    /// Restore a pre existing backup to the connected device.
-    /// </summary>
-    /// <param name="backupDirectory">Path to the backup directory being restored</param>
-    /// <param name="system">Whether to restore system files; defaults to false</param>
-    /// <param name="reboot">Reboots the device when done; defaults to false</param>
-    /// <param name="copy">Create a copy of the backup folder before restoring; defaults to true</param>
-    /// <param name="settings">Restore device settings; defaults to true</param>
-    /// <param name="remove">Remove items which aren't being restored; defaults to false</param>
-    /// <param name="password">The password for the backup if it is encrypted</param>
-    /// <param name="source">Identifier of device to restore it's backup</param>
-    public async Task<ResultCode> Restore(string backupDirectory, bool system = false, bool reboot = false,
-        bool copy = true,
-        bool settings = true, bool remove = false, string password = "", string source = "",
-        bool ignoreTransferErrors = false, CancellationToken cancellationToken = default) {
-        if (string.IsNullOrEmpty(source)) {
-            source = Lockdown.Udid;
-        }
-
-        if (!BackupExists(backupDirectory, source)) {
-            throw new Mobilebackup2Exception("Backup not found");
-        }
-
-        using (DeviceLinkService dl =
-               await GetDeviceLink(backupDirectory, ignoreTransferErrors, true, cancellationToken)
-                   .ConfigureAwait(false)) {
-            dl.BeforeReceivingFile += DeviceLink_BeforeReceivingFile;
-            dl.Completed += DeviceLink_Completed;
-            dl.FileReceived += DeviceLink_FileReceived;
-            dl.FileReceiving += DeviceLink_FileReceiving;
-            dl.FileTransferError += DeviceLink_FileTransferError;
-            dl.Progress += DeviceLink_Progress;
-            dl.Status += DeviceLink_Status;
-            dl.Started += DeviceLink_Started;
-
-            using (NotificationProxyService np = new NotificationProxyService(this.Lockdown)) {
-                using (AfcService afc = new AfcService(this.Lockdown)) {
-                    using (BackupLock backupLock = new BackupLock(afc, np)) {
-                        await backupLock.AquireBackupLock(cancellationToken).ConfigureAwait(false);
-
-                        string manifestPlistPath = Path.Combine(backupDirectory, source, "Manifest.plist");
-                        DictionaryNode manifestPlist;
-                        using (FileStream fs = new FileStream(manifestPlistPath, FileMode.Open, FileAccess.Read)) {
-                            PropertyNode plist = await PropertyList.LoadAsync(fs).ConfigureAwait(false);
-                            manifestPlist = plist.AsDictionaryNode();
-                        }
-
-                        bool isEncrypted = false;
-                        if (manifestPlist.TryGetValue("IsEncrypted", out PropertyNode? isEncryptedNode)) {
-                            isEncrypted = isEncryptedNode.AsBooleanNode().Value;
-                        }
-
-                        DictionaryNode options = new DictionaryNode() {
-                            { "RestoreShouldReboot", new BooleanNode(reboot) },
-                            { "RestoreDontCopyBackup", new BooleanNode(!copy) },
-                            { "RestorePreserveSettings", new BooleanNode(settings) },
-                            { "RestoreSystemFiles", new BooleanNode(system) },
-                            { "RemoveItemsNotRestored", new BooleanNode(remove) }
-                        };
-
-                        if (isEncrypted) {
-                            if (string.IsNullOrEmpty(password)) {
-                                options.Add("Password", new StringNode(password));
-                            }
-                            else {
-                                Logger.LogError("Backup is encrypted, but no password is supplied");
-                                throw new Mobilebackup2Exception("Password missing from encrypted backup restore");
-                            }
-                        }
-
-                        DictionaryNode message = new DictionaryNode() {
-                            { "MessageName", new StringNode("Restore") },
-                            { "TargetIdentifier", new StringNode(Lockdown.Udid) },
-                            { "SourceIdentifier", new StringNode(source) },
-                            { "Options", options },
-                        };
-                        await dl.SendProcessMessage(message, cancellationToken).ConfigureAwait(false);
-
-                        return await dl.DlLoop(cancellationToken).ConfigureAwait(false);
-                    }
-                }
-            }
-        }
-    }
-
-    /// <summary>
-    /// 
-    /// </summary>
-    /// <param name="currentPassword"></param>
-    /// <param name="newPassword"></param>
-    public async Task<ResultCode> ChangeBackupPassword(string currentPassword, string newPassword,
-        CancellationToken cancellationToken = default) {
-        return await ChangeBackupEncryptionPassword(currentPassword, newPassword,
-            BackupEncryptionFlags.ChangePassword, cancellationToken).ConfigureAwait(false);
-    }
-
-    /// <summary>
-    /// Enables encrypted backups by setting a password for backups to use provided
-    /// the phone currently has encrypted backups disabled. 
-    /// </summary>
-    /// <param name="password">The password to set for backup encryption</param>
-    public async Task<ResultCode> SetBackupPassword(string password, CancellationToken cancellationToken = default) {
-        return await ChangeBackupEncryptionPassword(null, password, BackupEncryptionFlags.Enable, cancellationToken)
-            .ConfigureAwait(false);
-    }
-
-    /// <summary>
-    /// Disables encrypted backups on the device by removing the password for backups
-    /// </summary>
-    /// <param name="currentPassword">The current password for the enabled backup encryption</param>
-    public async Task<ResultCode> RemoveBackupPassword(string currentPassword,
-        CancellationToken cancellationToken = default) {
-        return await ChangeBackupEncryptionPassword(currentPassword, null, BackupEncryptionFlags.Disable,
-            cancellationToken).ConfigureAwait(false);
     }
 }

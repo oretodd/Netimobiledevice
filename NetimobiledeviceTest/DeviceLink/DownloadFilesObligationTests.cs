@@ -1,6 +1,5 @@
 using Microsoft.Extensions.Logging.Abstractions;
 using Netimobiledevice.Backup;
-using Netimobiledevice.DeviceLink;
 using Netimobiledevice.Plist;
 
 namespace NetimobiledeviceTest.DeviceLink;

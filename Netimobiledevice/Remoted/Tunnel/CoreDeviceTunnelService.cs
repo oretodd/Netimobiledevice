@@ -1,23 +1,21 @@
-﻿using Netimobiledevice.Remoted.Xpc;
-using System.Collections.Generic;
+﻿using Netimobiledevice.Remote;
+using Netimobiledevice.Remote.Xpc;
+using System.Threading;
 using System.Threading.Tasks;
 
 namespace Netimobiledevice.Remoted.Tunnel;
 
-public class CoreDeviceTunnelService : RemotePairingProtocol
-{
+public class CoreDeviceTunnelService : RemotePairingProtocol {
     private const string SERVICE_NAME = "com.apple.internal.dt.coredevice.untrusted.tunnelservice";
 
     private readonly RemoteService _remoteService;
     private int? version;
 
-    public CoreDeviceTunnelService(RemoteServiceDiscoveryService rsd) : base()
-    {
+    public CoreDeviceTunnelService(RemoteServiceDiscoveryService rsd) : base() {
         _remoteService = new RemoteService(rsd, SERVICE_NAME);
     }
 
-    public override void Close()
-    {
+    public override void Close() {
         _remoteService.Close();
     }
 
@@ -26,7 +24,7 @@ public class CoreDeviceTunnelService : RemotePairingProtocol
             throw new NetimobiledeviceException("Service is null");
         }
 
-        XpcDictionary response = await _remoteService.Service.ReceiveResponse();
+        XpcDictionary response = await _remoteService.Service.ReceiveResponse(CancellationToken.None);
         return response["value"].AsXpcDictionary();
     }
 
@@ -35,11 +33,11 @@ public class CoreDeviceTunnelService : RemotePairingProtocol
             throw new NetimobiledeviceException("Service is null");
         }
 
-        Dictionary<string, XpcObject> request = new Dictionary<string, XpcObject>() {
+        XpcDictionary request = new XpcDictionary() {
             { "mangledTypeName", new XpcString("RemotePairing.ControlChannelMessageEnvelope") },
             { "value", data }
         };
 
-        await _remoteService.Service.SendRequestAsync(request).ConfigureAwait(false);
+        await _remoteService.Service.SendRequestAsync(request, CancellationToken.None).ConfigureAwait(false);
     }
 }
