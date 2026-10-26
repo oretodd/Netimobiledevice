@@ -82,6 +82,25 @@ public class DeviceLinkHandlerReplyTests
         }
     }
 
+    [TestMethod]
+    [Timeout(15000)]
+    public async Task DownloadFiles_StreamsAReadableFileThenSuccess()
+    {
+        File.WriteAllBytes(Path.Combine(_root, "ok.bin"), [1, 2, 3]);
+        using SocketPair pair = SocketPair.CreateConnected();
+        using DeviceLinkService dl = CreateService(pair);
+
+        await InvokeHandler(dl, DeviceLinkMessage.DownloadFiles,
+            [new StringNode(DeviceLinkMessage.DownloadFiles), new ArrayNode { new StringNode("ok.bin") }]);
+
+        Assert.AreEqual("ok.bin", Encoding.UTF8.GetString(ReadFrame(pair.Server)));
+        CollectionAssert.AreEqual(new byte[] { (byte)ResultCode.FileData, 1, 2, 3 }, ReadFrame(pair.Server));
+        CollectionAssert.AreEqual(new byte[] { (byte)ResultCode.Success }, ReadFrame(pair.Server));
+        Assert.AreEqual(0, ReadFrame(pair.Server).Length);
+        ArrayNode status = PropertyList.LoadFromByteArray(ReadFrame(pair.Server)).AsArrayNode();
+        Assert.AreEqual(0L, status[1].AsIntegerNode().SignedValue);
+    }
+
     private DeviceLinkService CreateService(SocketPair pair) =>
         new(CreateServiceConnection(pair.Client), _root, new Version(17, 0), logger: NullLogger.Instance);
 

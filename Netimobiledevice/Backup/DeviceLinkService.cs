@@ -589,37 +589,28 @@ internal sealed class DeviceLinkService : IDisposable {
     }
 
     private async Task<ErrNo> SendFileContentsAsync(string filePath, CancellationToken cancellationToken) {
-        FileStream fs;
+        FileStream? fs = null;
+        byte[] chunk = ArrayPool<byte>.Shared.Rent(FILE_DATA_CHUNK_SIZE);
         try {
-            fs = File.OpenRead(filePath);
-        }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) {
-            _logger.LogWarning(ex, "Could not open {filePath} for the device", filePath);
-            return ErrNo.EIO;
-        }
-
-        await using (fs) {
-            // #2199 (P2-5): one pooled chunk per file; each chunk goes out as three writes with no copy.
-            byte[] chunk = ArrayPool<byte>.Shared.Rent(FILE_DATA_CHUNK_SIZE);
-            try {
-                while (true) {
-                    int bytesRead;
-                    try {
-                        bytesRead = await fs.ReadAsync(chunk.AsMemory(0, FILE_DATA_CHUNK_SIZE), cancellationToken).ConfigureAwait(false);
-                    }
-                    catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) {
-                        _logger.LogWarning(ex, "Could not read {filePath} for the device", filePath);
-                        return ErrNo.EIO;
-                    }
-                    if (bytesRead == 0) {
-                        return ErrNo.ENOERR;
-                    }
-                    await SendFileDataChunkAsync(chunk, bytesRead, cancellationToken).ConfigureAwait(false);
+            while (true) {
+                int bytesRead;
+                try {
+                    fs ??= File.OpenRead(filePath);
+                    bytesRead = await fs.ReadAsync(chunk.AsMemory(0, FILE_DATA_CHUNK_SIZE), cancellationToken).ConfigureAwait(false);
                 }
+                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) {
+                    _logger.LogWarning(ex, "Could not read {filePath} for the device", filePath);
+                    return ErrNo.EIO;
+                }
+                if (bytesRead == 0) {
+                    return ErrNo.ENOERR;
+                }
+                await SendFileDataChunkAsync(chunk, bytesRead, cancellationToken).ConfigureAwait(false);
             }
-            finally {
-                ArrayPool<byte>.Shared.Return(chunk);
-            }
+        }
+        finally {
+            fs?.Dispose();
+            ArrayPool<byte>.Shared.Return(chunk);
         }
     }
 
