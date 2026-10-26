@@ -65,6 +65,45 @@ public class DeviceLinkFileOperationTests
 
     [TestMethod]
     [Timeout(15000)]
+    public async Task MoveItems_DestinationIsSourceWithDifferentCase_KeepsContents()
+    {
+        File.WriteAllText(Path.Combine(_root, "file"), "keep");
+        Directory.CreateDirectory(Path.Combine(_root, "dir"));
+        File.WriteAllText(Path.Combine(_root, "dir", "a.txt"), "keep");
+
+        await RunAsync(MoveMessage("file", "FILE"));
+        await RunAsync(MoveMessage("dir", "DIR"));
+
+        Assert.AreEqual("keep", File.ReadAllText(Path.Combine(_root, "FILE")));
+        Assert.AreEqual("keep", File.ReadAllText(Path.Combine(_root, "DIR", "a.txt")));
+    }
+
+    [TestMethod]
+    [Timeout(15000)]
+    public async Task CopyItem_FileSource_ReplacesDestination()
+    {
+        File.WriteAllText(Path.Combine(_root, "src"), "new");
+        File.WriteAllText(Path.Combine(_root, "dest"), "old");
+
+        await RunAsync([new StringNode(DeviceLinkMessage.CopyItem), new StringNode("src"), new StringNode("dest")]);
+
+        Assert.AreEqual("new", File.ReadAllText(Path.Combine(_root, "src")));
+        Assert.AreEqual("new", File.ReadAllText(Path.Combine(_root, "dest")));
+    }
+
+    [TestMethod]
+    [Timeout(15000)]
+    public async Task CopyItem_DestinationIsSource_KeepsContents()
+    {
+        File.WriteAllText(Path.Combine(_root, "file"), "keep");
+
+        await RunAsync([new StringNode(DeviceLinkMessage.CopyItem), new StringNode("file"), new StringNode("file")]);
+
+        Assert.AreEqual("keep", File.ReadAllText(Path.Combine(_root, "file")));
+    }
+
+    [TestMethod]
+    [Timeout(15000)]
     public async Task CopyItem_DirectorySource_ReplacesDestinationWithCopy()
     {
         Directory.CreateDirectory(Path.Combine(_root, "src", "sub"));

@@ -446,7 +446,7 @@ internal sealed class DeviceLinkService : IDisposable {
 
         string source = Path.Combine(_rootPath, msg[1].AsStringNode().Value);
         string dest = Path.Combine(_rootPath, msg[2].AsStringNode().Value);
-        if (Path.Exists(source)) {
+        if (Path.Exists(source) && !IsSamePath(source, dest)) {
             DeletePath(dest);
             CopyPath(source, dest);
         }
@@ -463,6 +463,9 @@ internal sealed class DeviceLinkService : IDisposable {
             CopyPath(entry, Path.Combine(dest, Path.GetFileName(entry)));
         }
     }
+
+    private static bool IsSamePath(string a, string b) =>
+        string.Equals(Path.GetFullPath(a), Path.GetFullPath(b), StringComparison.OrdinalIgnoreCase);
 
     private static void DeletePath(string path) {
         if (File.Exists(path)) {
@@ -679,7 +682,9 @@ internal sealed class DeviceLinkService : IDisposable {
             }
 
             string dest = Path.Combine(_rootPath, newPath);
-            DeletePath(dest);
+            if (!IsSamePath(source, dest)) {
+                DeletePath(dest);
+            }
             if (Directory.Exists(source)) {
                 Directory.Move(source, dest);
             }
