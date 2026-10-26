@@ -667,7 +667,6 @@ public sealed class Mobilebackup2Service(
 
     private async Task ReceiveNotificationsAsync(NotificationProxyService np, CancellationToken cancellationToken) {
         await foreach (DictionaryNode notification in np.ReceiveNotificationAsync(cancellationToken).ConfigureAwait(false)) {
-            // An empty message means the proxy connection closed; ServiceConnection returns short reads instead of throwing.
             if (!notification.TryGetValue("Name", out PropertyNode? name)) {
                 return;
             }

@@ -809,16 +809,9 @@ internal sealed class DeviceLinkService : IDisposable {
         return (ResultCode) code;
     }
 
-    /// <summary>
-    /// Reads an Int32 value from the backup service.
-    /// </summary>
-    /// <returns>The Int32 value read.</returns>
     private async Task<int> ReadInt32(CancellationToken cancellationToken) {
         byte[] buffer = await _service.ReceiveAsync(sizeof(int), cancellationToken).ConfigureAwait(false);
-        if (buffer.Length > 0) {
-            return BinaryPrimitives.ReadInt32BigEndian(buffer);
-        }
-        return -1;
+        return BinaryPrimitives.ReadInt32BigEndian(buffer);
     }
 
     /// <summary>
@@ -1308,11 +1301,14 @@ internal sealed class DeviceLinkService : IDisposable {
     }
 
     public async Task<ArrayNode> ReceiveMessage(CancellationToken cancellationToken) {
-        PropertyNode? message = await _service.ReceivePlistAsync(cancellationToken).ConfigureAwait(false);
-        if (message == null) {
+        try {
+            PropertyNode? message = await _service.ReceivePlistAsync(cancellationToken).ConfigureAwait(false);
+            return message?.AsArrayNode() ?? [];
+        }
+        catch (EndOfStreamException) {
+            // The #2081 Finished completion and #2198 P1-2 drop classification key on [] at peer FIN.
             return [];
         }
-        return message.AsArrayNode();
     }
 
     /// <summary>
