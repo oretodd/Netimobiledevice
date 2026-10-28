@@ -1074,15 +1074,19 @@ internal sealed class DeviceLinkService : IDisposable {
                     continue;
                 }
 
-                if (code == ResultCode.Success) {
-                    if (_discarding) {
-                        // Create zero-byte stub so Manifest.db references and subsequent incremental
-                        // backup logic (File.Exists check) remain consistent.
-                        using (File.Create(backupFile.LocalPath)) { }
-                        _discarding = false;
-                    }
-                    OnFileReceived(backupFile);
+                if (code != ResultCode.Success) {
+                    CloseFileStream();
+                    _discarding = false;
+                    throw new DeviceLinkException($"Unexpected code {code} (size {size}) while receiving {backupFile.DevicePath}");
                 }
+
+                if (_discarding) {
+                    // Create zero-byte stub so Manifest.db references and subsequent incremental
+                    // backup logic (File.Exists check) remain consistent.
+                    using (File.Create(backupFile.LocalPath)) { }
+                    _discarding = false;
+                }
+                OnFileReceived(backupFile);
             }
             else if (_service.IsConnected) {
                 break;

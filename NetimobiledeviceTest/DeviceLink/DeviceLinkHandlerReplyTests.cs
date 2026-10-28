@@ -101,6 +101,37 @@ public class DeviceLinkHandlerReplyTests
         Assert.AreEqual(0L, status[1].AsIntegerNode().SignedValue);
     }
 
+    [TestMethod]
+    [Timeout(15000)]
+    [DataRow(new byte[] { (byte)ResultCode.LocalError }, DisplayName = "unexpected code")]
+    [DataRow(new byte[] { (byte)ResultCode.FileData }, DisplayName = "zero-length FileData")]
+    public async Task UploadFiles_UnexpectedFrameMidFile_ThrowsAndLeavesTheFileClosedAndUnappended(byte[] badFrame)
+    {
+        using SocketPair pair = SocketPair.CreateConnected();
+        using DeviceLinkService dl = CreateService(pair);
+        pair.Server.Send([
+            .. Frame(Encoding.UTF8.GetBytes("dev/a")), .. Frame(Encoding.UTF8.GetBytes("a.bin")),
+            .. Frame([(byte)ResultCode.FileData, 1, 2, 3]), .. Frame(badFrame),
+            .. Frame(Encoding.UTF8.GetBytes("dev/b")), .. Frame(Encoding.UTF8.GetBytes("b.bin")),
+            .. Frame([(byte)ResultCode.FileData, 9, 9]), .. Frame([(byte)ResultCode.Success]),
+            .. BigEndian(0)]);
+
+        await Assert.ThrowsExactlyAsync<DeviceLinkException>(() => InvokeHandler(dl, DeviceLinkMessage.UploadFiles,
+            [new StringNode(DeviceLinkMessage.UploadFiles), new DictionaryNode(), new IntegerNode(0), new IntegerNode(0)]));
+
+        CollectionAssert.AreEqual(new byte[] { 1, 2, 3 }, File.ReadAllBytes(Path.Combine(_root, "a.bin")));
+        Assert.IsFalse(File.Exists(Path.Combine(_root, "b.bin")));
+    }
+
+    private static byte[] Frame(byte[] payload) => [.. BigEndian(payload.Length), .. payload];
+
+    private static byte[] BigEndian(int value)
+    {
+        byte[] bytes = new byte[sizeof(int)];
+        BinaryPrimitives.WriteInt32BigEndian(bytes, value);
+        return bytes;
+    }
+
     private DeviceLinkService CreateService(SocketPair pair) =>
         new(CreateServiceConnection(pair.Client), _root, new Version(17, 0), logger: NullLogger.Instance);
 
