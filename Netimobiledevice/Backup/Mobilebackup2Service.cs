@@ -362,15 +362,10 @@ public sealed class Mobilebackup2Service(
         string deviceDirectory = Path.Combine(backupDirectory, Lockdown.Udid);
         Directory.CreateDirectory(deviceDirectory);
 
-        // #2197 (P0-C): true once we observe a drop-class exception the host coordinator will RESUME
-        // (an inter-message timeout, the new version-exchange timeout, or a transport-drop IOException). On a
-        // quiet abandon we must NOT send CancelBackup (a non-standard, fork-invented mb2 message that
-        // tells the device to cancel the very session we are about to resume) and must NOT send
-        // DLMessageDisconnect — we just tear the socket down (DeviceLinkService.Dispose closes it), so the
-        // resumed session finds backupd still holding the in-progress snapshot.
+        // A resumable drop must leave backupd holding the snapshot, so it gets neither CancelBackup nor
+        // DLMessageDisconnect.
         bool quietAbandon = false;
-        // #2197 (P0-D): GetDeviceLink is now INSIDE the try so a version-exchange failure still runs the
-        // finally (app-layer teardown + throughput capture + dispose), rather than escaping it.
+        ResultCode result = ResultCode.Skipped;
         DeviceLinkService? dl = null;
         try {
             dl = await GetDeviceLink(backupDirectory, ignoreTransferErrors, performBackupSizeCheck, _internalCts.Token).ConfigureAwait(false);
@@ -472,7 +467,7 @@ public sealed class Mobilebackup2Service(
                                 () => _passcodeRequired, PasscodePollInterval, PasscodeWaitMax, Logger,
                                 _internalCts.Token).ConfigureAwait(false);
 
-                            return await dl.DlLoop(_internalCts.Token).ConfigureAwait(false);
+                            return result = await dl.DlLoop(_internalCts.Token).ConfigureAwait(false);
                         }
                     }
                 }
@@ -490,55 +485,15 @@ public sealed class Mobilebackup2Service(
             }
         }
         catch (Exception ex) when (IsResumeDropClass(ex)) {
-            // #2197 (P0-C): a drop-class the host will RESUME. Flag it so the finally SKIPS the
-            // CancelBackup + Disconnect that would tell the busy device to cancel the very session we are
-            // about to resume, and just tears the socket down. Rethrow so the coordinator classifies it.
             quietAbandon = true;
             throw;
         }
         finally {
-            // #2197 (P0-C): the app-layer teardown. On a normal/terminal unwind we send CancelBackup then
-            // let Dispose close the socket. On a QUIET ABANDON (a drop-class the host will resume) we skip
-            // BOTH CancelBackup (a non-standard fork-invented mb2 message that cancels the very session we
-            // are about to resume) and DLMessageDisconnect — we just tear the socket down. Either way the
-            // outcome is LOGGED (previously swallowed), so a live run explains what teardown happened.
             if (dl != null) {
-                if (quietAbandon) {
-                    Logger.LogInformation(
-                        "Backup teardown: quiet abandon (drop-class the host will resume) — CancelBackup + Disconnect SKIPPED, tearing the socket down only (#2197 P0-C)");
-                }
-                else {
-                    // ScribeHold fork: send CancelBackup to cleanly terminate the backup session on the
-                    // device side. On successful completion the device has already closed its end of the
-                    // connection, so the write may throw SocketError 10053 (WSAECONNABORTED) or hang
-                    // indefinitely on a half-closed SSL socket. Use a 5-second timeout to prevent hanging
-                    // forever, and scope the catches so we don't swallow unexpected exceptions.
-                    try {
-                        using var cancelBackupCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-                        cancelBackupCts.CancelAfter(TimeSpan.FromSeconds(5));
-                        DictionaryNode message = new DictionaryNode() {
-                            { "MessageName", new StringNode("CancelBackup") },
-                            { "TargetIdentifier", new StringNode(Lockdown.Udid) }
-                        };
-                        await dl.SendProcessMessage(message, cancelBackupCts.Token).ConfigureAwait(false);
-                        Logger.LogInformation("Backup teardown: CancelBackup sent (#2197 P0-E)");
-                    }
-                    catch (IOException ex) {
-                        Logger.LogInformation("Backup teardown: CancelBackup send failed (expected on a closed peer): {Message} (#2197 P0-E)", ex.Message);
-                    }
-                    catch (OperationCanceledException) {
-                        Logger.LogInformation("Backup teardown: CancelBackup send timed out after 5s (#2197 P0-E)");
-                    }
-                }
-
-                // ScribeHold fork: capture throughput stats before dl is disposed. Exposed to the
-                // caller via LastBackupThroughputStats so they can log under their own category.
-                // Runs regardless of CancelBackup outcome so stats are never lost.
+                await CancelUnfinishedBackupAsync(dl, Lockdown.Udid, result, quietAbandon, Logger).ConfigureAwait(false);
                 LastBackupThroughputStats = dl.GetAndResetThroughputStats();
 
                 try {
-                    // #2197 (P0-C): Dispose closes the socket. On a quiet abandon it must NOT send the
-                    // DLMessageDisconnect — DeviceLinkService.Dispose honors DisposeQuietly for that.
                     if (quietAbandon) {
                         dl.DisposeQuietly();
                     }
@@ -550,6 +505,28 @@ public sealed class Mobilebackup2Service(
                     // Do nothing for these exceptions
                 }
             }
+        }
+    }
+
+    internal static async Task CancelUnfinishedBackupAsync(DeviceLinkService dl, string udid, ResultCode result, bool quietAbandon, ILogger logger) {
+        if (quietAbandon) {
+            logger.LogInformation("Backup teardown: quiet abandon — CancelBackup + Disconnect skipped, closing the socket only");
+            return;
+        }
+        if (result == ResultCode.Success) {
+            return;
+        }
+        // Not linked to the caller's token: on a host cancellation that token is already cancelled.
+        using CancellationTokenSource timeoutCts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+        try {
+            await dl.SendProcessMessage(new DictionaryNode() {
+                { "MessageName", new StringNode("CancelBackup") },
+                { "TargetIdentifier", new StringNode(udid) }
+            }, timeoutCts.Token).ConfigureAwait(false);
+            logger.LogInformation("Backup teardown: CancelBackup sent");
+        }
+        catch (Exception ex) when (ex is IOException or OperationCanceledException) {
+            logger.LogInformation("Backup teardown: CancelBackup not delivered within 5s or to a closed peer: {Message}", ex.Message);
         }
     }
 
