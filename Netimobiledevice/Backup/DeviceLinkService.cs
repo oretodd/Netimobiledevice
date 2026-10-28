@@ -1081,8 +1081,6 @@ internal sealed class DeviceLinkService : IDisposable {
                 }
 
                 if (_discarding) {
-                    // Create zero-byte stub so Manifest.db references and subsequent incremental
-                    // backup logic (File.Exists check) remain consistent.
                     using (File.Create(backupFile.LocalPath)) { }
                     _discarding = false;
                 }
