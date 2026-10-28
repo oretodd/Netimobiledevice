@@ -26,7 +26,7 @@ public class CancelBackupTeardownTests
     [Timeout(15000)]
     public async Task QuietAbandon_SendsNoCancelBackup()
     {
-        string? first = await RunTeardownAsync(result: null, quietAbandon: true);
+        string? first = await RunTeardownAsync(ResultCode.Skipped, quietAbandon: true);
 
         Assert.AreEqual("Marker", first);
     }
@@ -35,7 +35,7 @@ public class CancelBackupTeardownTests
     [Timeout(15000)]
     public async Task FailedBackup_SendsCancelBackup()
     {
-        string? first = await RunTeardownAsync(result: null, quietAbandon: false);
+        string? first = await RunTeardownAsync(ResultCode.LocalError, quietAbandon: false);
 
         Assert.AreEqual("CancelBackup", first);
     }
@@ -50,7 +50,7 @@ public class CancelBackupTeardownTests
     }
 
     // Runs the teardown, then sends a marker; returns the MessageName of the first ProcessMessage the device sees.
-    private static async Task<string?> RunTeardownAsync(ResultCode? result, bool quietAbandon)
+    private static async Task<string?> RunTeardownAsync(ResultCode result, bool quietAbandon)
     {
         using var listener = new TcpListener(IPAddress.Loopback, 0);
         listener.Start();

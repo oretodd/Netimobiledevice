@@ -365,7 +365,7 @@ public sealed class Mobilebackup2Service(
         // A resumable drop must leave backupd holding the snapshot, so it gets neither CancelBackup nor
         // DLMessageDisconnect.
         bool quietAbandon = false;
-        ResultCode? result = null;
+        ResultCode result = ResultCode.Skipped;
         // #2197 (P0-D): GetDeviceLink is now INSIDE the try so a version-exchange failure still runs the
         // finally (app-layer teardown + throughput capture + dispose), rather than escaping it.
         DeviceLinkService? dl = null;
@@ -469,8 +469,7 @@ public sealed class Mobilebackup2Service(
                                 () => _passcodeRequired, PasscodePollInterval, PasscodeWaitMax, Logger,
                                 _internalCts.Token).ConfigureAwait(false);
 
-                            result = await dl.DlLoop(_internalCts.Token).ConfigureAwait(false);
-                            return result.Value;
+                            return result = await dl.DlLoop(_internalCts.Token).ConfigureAwait(false);
                         }
                     }
                 }
@@ -511,7 +510,7 @@ public sealed class Mobilebackup2Service(
         }
     }
 
-    internal static async Task CancelUnfinishedBackupAsync(DeviceLinkService dl, string udid, ResultCode? result, bool quietAbandon, ILogger logger) {
+    internal static async Task CancelUnfinishedBackupAsync(DeviceLinkService dl, string udid, ResultCode result, bool quietAbandon, ILogger logger) {
         if (quietAbandon) {
             logger.LogInformation("Backup teardown: quiet abandon — CancelBackup + Disconnect skipped, closing the socket only");
             return;
@@ -522,18 +521,14 @@ public sealed class Mobilebackup2Service(
         // Not linked to the caller's token: on a host cancellation that token is already cancelled.
         using CancellationTokenSource timeoutCts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
         try {
-            DictionaryNode message = new DictionaryNode() {
+            await dl.SendProcessMessage(new DictionaryNode() {
                 { "MessageName", new StringNode("CancelBackup") },
                 { "TargetIdentifier", new StringNode(udid) }
-            };
-            await dl.SendProcessMessage(message, timeoutCts.Token).ConfigureAwait(false);
+            }, timeoutCts.Token).ConfigureAwait(false);
             logger.LogInformation("Backup teardown: CancelBackup sent");
         }
-        catch (IOException ex) {
-            logger.LogInformation("Backup teardown: CancelBackup send failed (expected on a closed peer): {Message}", ex.Message);
-        }
-        catch (OperationCanceledException) {
-            logger.LogInformation("Backup teardown: CancelBackup send timed out after 5s");
+        catch (Exception ex) when (ex is IOException or OperationCanceledException) {
+            logger.LogInformation("Backup teardown: CancelBackup not delivered within 5s or to a closed peer: {Message}", ex.Message);
         }
     }
 
