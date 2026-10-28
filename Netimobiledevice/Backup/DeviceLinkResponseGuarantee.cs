@@ -21,7 +21,7 @@ public delegate Task DeviceLinkStatusSender(int errorCode, string? errorMessage,
 /// ScribeHold fork (#2181): guarantees a DeviceLink handler discharges its
 /// <c>DLMessageStatusResponse</c> obligation exactly once, even if the handler's cancellation token
 /// trips mid-body. The handler honors cancellation for its own loop work (enumerate / move / remove),
-/// but the terminating status is ALWAYS sent — on <see cref="CancellationToken.None"/> if necessary —
+/// but the terminating status is ALWAYS sent — on a fresh, time-bounded token if necessary —
 /// before the cancellation is propagated, so the device is never left blocking.
 ///
 /// Send-exactly-once is latched internally: a second terminating send is a no-op.
@@ -99,10 +99,10 @@ public sealed class DeviceLinkResponseGuarantee : IDeviceLinkResponseGuarantee
     /// <summary>
     /// If the handler never sent its terminating response (returned early on a <c>break</c>, threw, or
     /// was cancelled mid-body), discharge an error terminating status so the device is never left
-    /// blocking and never records the failed operation as done. Sent on a fresh, time-bounded token — NOT the handler's token (which is usually
-    /// already cancelled, which is precisely why the handler failed to respond) — so the response still
-    /// goes out before the cancellation propagates, while a wedged socket cannot hang the dispose past
-    /// <see cref="DisposeFallbackSendTimeout"/> (#2189).
+    /// blocking and never records the failed operation as done. Sent on a fresh, time-bounded token —
+    /// NOT the handler's token (which is usually already cancelled, which is precisely why the handler
+    /// failed to respond) — so the response still goes out before the cancellation propagates, while a
+    /// wedged socket cannot hang the dispose past <see cref="DisposeFallbackSendTimeout"/> (#2189).
     /// </summary>
     public async ValueTask DisposeAsync()
     {
