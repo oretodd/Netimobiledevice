@@ -72,6 +72,9 @@ public sealed class Mobilebackup2Service(
     /// </summary>
     public (long RxBytes, TimeSpan RxTime, long WxBytes, TimeSpan WxTime)? LastBackupThroughputStats { get; private set; }
 
+    // The device's Status.plist cannot answer this: the device overwrites it and never reports the escalation to full.
+    public bool? LastBackupWasFull { get; private set; }
+
     /// <summary>
     /// ScribeHold fork: optional delegate to classify whether a backup file should be discarded
     /// (bytes drained but not written to disk). Set before calling <see cref="Backup"/> to enable
@@ -418,22 +421,8 @@ public sealed class Mobilebackup2Service(
                                 }
                             }
 
-                            // Create Manifest.plist if doesn't exist.
-                            string manifestPlistPath = Path.Combine(deviceDirectory, "Manifest.plist");
-                            if (fullBackup && File.Exists(manifestPlistPath)) {
-                                File.Delete(manifestPlistPath);
-                            }
-                            else if (!fullBackup && !File.Exists(manifestPlistPath)) {
-                                // #2197 (P0-E): make the silent incremental→full degradation LOUD. When
-                                // Manifest.plist is missing an incremental backup silently becomes a FULL
-                                // backup — a full re-transfer of the whole device. The behavior is UNCHANGED
-                                // here (never alter it); this WARN just makes the degradation diagnosable in a
-                                // single run instead of being invisible.
-                                Logger.LogWarning(
-                                    "Requested incremental backup but Manifest.plist is missing at {ManifestPath} — degrading to a FULL backup (whole-device re-transfer) (#2197 P0-E)",
-                                    manifestPlistPath);
-                                fullBackup = true;
-                            }
+                            fullBackup = PrepareManifestForBackup(Path.Combine(deviceDirectory, "Manifest.plist"), fullBackup, Logger);
+                            LastBackupWasFull = fullBackup;
 
                             // Create Status.plist file if doesn't exist.
                             // #2198 (P1-3): written ATOMICALLY (temp + move-overwrite) so an interrupted
@@ -506,6 +495,21 @@ public sealed class Mobilebackup2Service(
                 }
             }
         }
+    }
+
+    // A requested incremental with no Manifest.plist is run as a full backup.
+    internal static bool PrepareManifestForBackup(string manifestPlistPath, bool fullBackup, ILogger logger) {
+        bool manifestExists = File.Exists(manifestPlistPath);
+        if (fullBackup && manifestExists) {
+            File.Delete(manifestPlistPath);
+        }
+        else if (!fullBackup && !manifestExists) {
+            logger.LogWarning(
+                "Requested incremental backup but Manifest.plist is missing at {ManifestPath} — degrading to a FULL backup (whole-device re-transfer) (#2197 P0-E)",
+                manifestPlistPath);
+            return true;
+        }
+        return fullBackup;
     }
 
     internal static async Task CancelUnfinishedBackupAsync(DeviceLinkService dl, string udid, ResultCode result, bool quietAbandon, ILogger logger) {
