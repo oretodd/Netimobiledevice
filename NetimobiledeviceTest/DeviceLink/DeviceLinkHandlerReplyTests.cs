@@ -119,6 +119,9 @@ public class DeviceLinkHandlerReplyTests
         await Assert.ThrowsExactlyAsync<DeviceLinkException>(() => InvokeHandler(dl, DeviceLinkMessage.UploadFiles,
             [new StringNode(DeviceLinkMessage.UploadFiles), new DictionaryNode(), new IntegerNode(0), new IntegerNode(0)]));
 
+        ArrayNode status = PropertyList.LoadFromByteArray(ReadFrame(pair.Server)).AsArrayNode();
+        Assert.IsTrue(status[1].AsIntegerNode().SignedValue < 0, "A failed UploadFiles must reply with an error status.");
+        Assert.IsFalse(pair.Server.Poll(200_000, SelectMode.SelectRead), "UploadFiles must send exactly one response.");
         CollectionAssert.AreEqual(new byte[] { 1, 2, 3 }, File.ReadAllBytes(Path.Combine(_root, "a.bin")));
         Assert.IsFalse(File.Exists(Path.Combine(_root, "b.bin")));
     }
