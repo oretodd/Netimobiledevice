@@ -366,8 +366,6 @@ public sealed class Mobilebackup2Service(
         // DLMessageDisconnect.
         bool quietAbandon = false;
         ResultCode result = ResultCode.Skipped;
-        // #2197 (P0-D): GetDeviceLink is now INSIDE the try so a version-exchange failure still runs the
-        // finally (app-layer teardown + throughput capture + dispose), rather than escaping it.
         DeviceLinkService? dl = null;
         try {
             dl = await GetDeviceLink(backupDirectory, ignoreTransferErrors, performBackupSizeCheck, _internalCts.Token).ConfigureAwait(false);
