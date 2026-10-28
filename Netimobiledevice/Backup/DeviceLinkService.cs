@@ -1144,8 +1144,13 @@ internal sealed class DeviceLinkService : IDisposable {
             _service.Close();
         }
         finally {
-            _internalCancellationTokenSource.Dispose();
-            GC.SuppressFinalize(this);
+            try {
+                CloseFileStream();
+            }
+            finally {
+                _internalCancellationTokenSource.Dispose();
+                GC.SuppressFinalize(this);
+            }
         }
     }
 
