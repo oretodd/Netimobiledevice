@@ -17,7 +17,7 @@ namespace NetimobiledeviceTest.DeviceLink;
 ///
 /// The fix routes every handler's terminating response through <see cref="DeviceLinkResponseGuarantee"/>,
 /// which sends EXACTLY ONE terminating response even when the handler is cancelled mid-body — the
-/// response is discharged on <see cref="CancellationToken.None"/> in <c>DisposeAsync</c> before the
+/// response is discharged on a fresh, uncancelled token in <c>DisposeAsync</c> before the
 /// cancellation propagates. These tests pin that guarantee (the single testable place the
 /// exactly-one-response semantics live) without a live socket, by driving it with a capturing fake
 /// sender that models the handler-usage shape.
@@ -80,7 +80,7 @@ public class DeviceLinkResponseGuaranteeTests
         Assert.AreEqual(1, sender.Sent.Count,
             "Exactly ONE terminating DLMessageStatusResponse must be sent even when the handler is cancelled mid-body (the device is never left blocking).");
         Assert.IsFalse(sender.Sent[0].TokenWasCancelled,
-            "The guaranteed response must be sent on CancellationToken.None so it goes out even though the handler's own token was cancelled.");
+            "The guaranteed response must be sent on an uncancelled token so it goes out even though the handler's own token was cancelled.");
     }
 
     [TestMethod]
@@ -112,7 +112,7 @@ public class DeviceLinkResponseGuaranteeTests
         Assert.AreEqual(1, sender.Sent.Count,
             "A mid-loop cancellation must still discharge exactly one terminating response.");
         Assert.IsFalse(sender.Sent[0].TokenWasCancelled,
-            "The discharge happens on CancellationToken.None.");
+            "The discharge happens on an uncancelled token.");
     }
 
     // ── Exactly-once / normal-path semantics ───────────────────────────────────────────────────
@@ -149,7 +149,7 @@ public class DeviceLinkResponseGuaranteeTests
 
     [TestMethod]
     [Description("A handler that returns WITHOUT sending (early return) still has exactly one response discharged at dispose.")]
-    public async Task HandlerReturnsWithoutSending_DisposeDischargesDefaultResponse()
+    public async Task HandlerReturnsWithoutSending_DisposeDischargesErrorResponse()
     {
         CapturingSender sender = new();
         DeviceLinkResponseGuarantees guarantees = new(sender.Delegate);
@@ -162,7 +162,7 @@ public class DeviceLinkResponseGuaranteeTests
         Assert.AreEqual(1, sender.Sent.Count,
             "DisposeAsync must discharge a terminating response so no handler path returns owing a response.");
         Assert.AreNotEqual(0, sender.Sent[0].ErrorCode, "A handler that never responded did not succeed; the discharge must not report success.");
-        Assert.IsFalse(sender.Sent[0].TokenWasCancelled, "The default discharge is on CancellationToken.None.");
+        Assert.IsFalse(sender.Sent[0].TokenWasCancelled, "The fallback discharge is on an uncancelled token.");
     }
 
     [TestMethod]

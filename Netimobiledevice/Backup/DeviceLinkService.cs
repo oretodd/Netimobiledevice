@@ -413,7 +413,7 @@ internal sealed class DeviceLinkService : IDisposable {
         // ScribeHold fork (#2181): the response-guarantee ensures exactly one terminating
         // DLMessageStatusResponse is sent even if cancellation trips mid-enumeration. The loop body
         // honors cancellation (ThrowIfCancellationRequested), and if that throws before the explicit
-        // send below, the guarantee's DisposeAsync discharges the response on CancellationToken.None
+        // send below, the guarantee's DisposeAsync discharges an error response
         // before the OperationCanceledException propagates — the device is never left blocking.
         await using IDeviceLinkResponseGuarantee guard = _responseGuarantees.Create();
 
@@ -678,8 +678,8 @@ internal sealed class DeviceLinkService : IDisposable {
     /// <param name="msg">The message received from the device.</param>
     private async Task MoveItems(ArrayNode msg, CancellationToken cancellationToken) {
         // ScribeHold fork (#2181): the terminating DLMessageStatusResponse is guaranteed even if
-        // cancellation trips mid-move — the loop body throws on cancel, and DisposeAsync discharges the
-        // response on CancellationToken.None before propagating. Eliminates the wedge-source
+        // cancellation trips mid-move — the loop body throws on cancel, and DisposeAsync discharges an
+        // error response before propagating. Eliminates the wedge-source
         // if (!IsCancellationRequested) { send } ... break shape (device left blocking on cancel).
         await using IDeviceLinkResponseGuarantee guard = _responseGuarantees.Create();
 
@@ -867,7 +867,7 @@ internal sealed class DeviceLinkService : IDisposable {
         // PER item and, worse, break-ed out of the loop on cancellation WITHOUT sending the final
         // response — leaving the device blocked forever (the silent wedge). Route the single
         // terminating response through the guarantee: the loop body honors cancellation (throws), and
-        // DisposeAsync discharges the response on CancellationToken.None before the cancellation
+        // DisposeAsync discharges an error response before the cancellation
         // propagates, so exactly one response is always sent.
         await using IDeviceLinkResponseGuarantee guard = _responseGuarantees.Create();
 
@@ -995,7 +995,7 @@ internal sealed class DeviceLinkService : IDisposable {
     private async Task UploadFiles(ArrayNode msg, CancellationToken cancellationToken) {
         // ScribeHold fork (#2181): the terminating DLMessageStatusResponse after the transfer loop is
         // what the device blocks on. Route it through the guarantee so a cancellation that trips while
-        // receiving files still discharges exactly one terminating response (on CancellationToken.None
+        // receiving files still discharges exactly one terminating response (an error status
         // via DisposeAsync) before propagating — the device is never left blocking.
         await using IDeviceLinkResponseGuarantee guard = _responseGuarantees.Create();
 
