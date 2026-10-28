@@ -57,7 +57,7 @@ public class DownloadFilesObligationTests
             "FIRST the interrupted file's framing must be completed with a per-file error code so the device exits file-data mode.");
         Assert.AreEqual(TerminatorWire, _wire[1],
             "THEN the FILE_TRANSFER_TERMINATOR (empty dword) ends the transfer framing.");
-        Assert.AreEqual("status:code=0", _wire[2],
+        Assert.AreEqual("status:code=-5", _wire[2],
             "ONLY THEN the terminating status plist goes out — the device is back in plist framing.");
         Assert.AreEqual(1, _statusSends, "Exactly one terminating status, ever.");
     }
@@ -74,7 +74,7 @@ public class DownloadFilesObligationTests
 
         Assert.AreEqual(2, _wire.Count, $"Got: {string.Join(", ", _wire)}");
         Assert.AreEqual(TerminatorWire, _wire[0]);
-        Assert.AreEqual("status:code=0", _wire[1]);
+        Assert.AreEqual("status:code=-5", _wire[1]);
         Assert.AreEqual(1, _statusSends);
     }
 

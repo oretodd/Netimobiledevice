@@ -48,8 +48,8 @@ public interface IDeviceLinkResponseGuarantee : IAsyncDisposable
 /// Lifecycle: created per handled message via <see cref="DeviceLinkResponseGuarantees.Create"/>, used
 /// with <c>await using</c> inside the handler. If the handler sends its response explicitly, dispose
 /// is a no-op; if the handler returns (or throws / is cancelled) WITHOUT responding,
-/// <see cref="DisposeAsync"/> discharges a default success terminating status on
-/// <see cref="CancellationToken.None"/> so no code path leaves the device blocking.
+/// <see cref="DisposeAsync"/> discharges an error terminating status on a fresh token so no code
+/// path leaves the device blocking.
 /// </summary>
 public sealed class DeviceLinkResponseGuarantee : IDeviceLinkResponseGuarantee
 {
@@ -98,8 +98,8 @@ public sealed class DeviceLinkResponseGuarantee : IDeviceLinkResponseGuarantee
 
     /// <summary>
     /// If the handler never sent its terminating response (returned early on a <c>break</c>, threw, or
-    /// was cancelled mid-body), discharge a default success terminating status so the device is never
-    /// left blocking. Sent on a fresh, time-bounded token — NOT the handler's token (which is usually
+    /// was cancelled mid-body), discharge an error terminating status so the device is never left
+    /// blocking and never records the failed operation as done. Sent on a fresh, time-bounded token — NOT the handler's token (which is usually
     /// already cancelled, which is precisely why the handler failed to respond) — so the response still
     /// goes out before the cancellation propagates, while a wedged socket cannot hang the dispose past
     /// <see cref="DisposeFallbackSendTimeout"/> (#2189).
@@ -109,7 +109,7 @@ public sealed class DeviceLinkResponseGuarantee : IDeviceLinkResponseGuarantee
         if (Volatile.Read(ref _responded) != 1) {
             using var timeoutCts = new CancellationTokenSource(DisposeFallbackSendTimeout);
             try {
-                await SendTerminatingStatusAsync(0, null, null, timeoutCts.Token).ConfigureAwait(false);
+                await SendTerminatingStatusAsync(-(int) ErrNo.EIO, "Handler failed before responding", null, timeoutCts.Token).ConfigureAwait(false);
             }
             catch {
                 // Best-effort: the socket may already be gone (the same drop that cancelled the
