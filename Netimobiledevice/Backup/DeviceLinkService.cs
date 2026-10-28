@@ -1133,12 +1133,6 @@ internal sealed class DeviceLinkService : IDisposable {
         CloseAndDisposeCore();
     }
 
-    /// <summary>
-    /// ScribeHold fork (#2197, P0-C): the shared close path — close the underlying service connection
-    /// (the real TCP FIN via ServiceConnection.Close, which now disposes the socket-owning network
-    /// stream) and dispose the internal CTS. Each step is independently guarded so one failure never
-    /// skips the next, and the finalizer is always suppressed.
-    /// </summary>
     private void CloseAndDisposeCore() {
         try {
             _service.Close();
@@ -1146,6 +1140,7 @@ internal sealed class DeviceLinkService : IDisposable {
         finally {
             _internalCancellationTokenSource.Dispose();
             GC.SuppressFinalize(this);
+            CloseFileStream();
         }
     }
 

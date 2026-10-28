@@ -4,6 +4,7 @@ using System.Reflection;
 using Microsoft.Extensions.Logging.Abstractions;
 using Netimobiledevice.Backup;
 using Netimobiledevice.Lockdown;
+using Netimobiledevice.Plist;
 
 namespace NetimobiledeviceTest.DeviceLink;
 
@@ -83,6 +84,67 @@ public class DeviceLinkServiceDisposeTests
         // Must not throw.
         dl.Dispose();
     }
+
+    [TestMethod]
+    [Timeout(15000)]
+    [DataRow(false, DisplayName = "Dispose")]
+    [DataRow(true, DisplayName = "DisposeQuietly")]
+    public async Task Dispose_MidUpload_ReleasesPartialFile(bool quietly)
+    {
+        string root = Path.Combine(Path.GetTempPath(), "dl-dispose-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        try {
+            (ServiceConnection connection, Socket server, Socket _) = CreatePair();
+            using ServiceConnection device = CreateServiceConnection(server, timeout: 5000);
+            var dl = new DeviceLinkService(connection, root, new Version(17, 0), logger: NullLogger.Instance);
+            var chunkWritten = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            dl.FileReceiving += (_, _) => chunkWritten.TrySetResult();
+            Task<ResultCode> loop = dl.DlLoop(CancellationToken.None);
+
+            await device.SendPlistAsync(new ArrayNode {
+                new StringNode(DeviceLinkMessage.UploadFiles), new DictionaryNode(), new RealNode(0.5), new IntegerNode(100)
+            }, PlistFormat.Binary);
+            byte[] payload = [1, 2, 3, 4];
+            await device.SendAsync(Frame(Name("device/partial"), Name("partial"), Int32(1 + payload.Length), [(byte)ResultCode.FileData], payload));
+            await chunkWritten.Task;
+
+            if (quietly) {
+                dl.DisposeQuietly();
+            }
+            else {
+                dl.Dispose();
+            }
+            try {
+                await loop;
+            }
+            catch (Exception) {
+            }
+
+            string partial = Path.Combine(root, "partial");
+            using (new FileStream(partial, FileMode.Open, FileAccess.ReadWrite, FileShare.None)) {
+            }
+            File.Delete(partial);
+            Assert.IsFalse(File.Exists(partial));
+        }
+        finally {
+            Directory.Delete(root, recursive: true);
+        }
+    }
+
+    private static byte[] Int32(int value)
+    {
+        byte[] bytes = new byte[sizeof(int)];
+        System.Buffers.Binary.BinaryPrimitives.WriteInt32BigEndian(bytes, value);
+        return bytes;
+    }
+
+    private static byte[] Name(string name)
+    {
+        byte[] utf8 = System.Text.Encoding.UTF8.GetBytes(name);
+        return [.. Int32(utf8.Length), .. utf8];
+    }
+
+    private static byte[] Frame(params byte[][] parts) => [.. parts.SelectMany(p => p)];
 
     private static (ServiceConnection connection, Socket server, Socket client) CreatePair()
     {
