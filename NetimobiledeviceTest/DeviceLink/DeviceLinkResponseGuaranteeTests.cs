@@ -160,9 +160,29 @@ public class DeviceLinkResponseGuaranteeTests
         }
 
         Assert.AreEqual(1, sender.Sent.Count,
-            "DisposeAsync must discharge a default terminating response so no handler path returns owing a response.");
-        Assert.AreEqual(0, sender.Sent[0].ErrorCode, "The default discharge is a success (0) status.");
+            "DisposeAsync must discharge a terminating response so no handler path returns owing a response.");
+        Assert.AreNotEqual(0, sender.Sent[0].ErrorCode, "A handler that never responded did not succeed; the discharge must not report success.");
         Assert.IsFalse(sender.Sent[0].TokenWasCancelled, "The default discharge is on CancellationToken.None.");
+    }
+
+    [TestMethod]
+    [Description("#3191: a handler that THROWS gets exactly one terminating response carrying a non-zero status and an error message.")]
+    public async Task HandlerThrows_SendsExactlyOneErrorResponse()
+    {
+        CapturingSender sender = new();
+        DeviceLinkResponseGuarantees guarantees = new(sender.Delegate);
+
+        async Task Handler()
+        {
+            await using IDeviceLinkResponseGuarantee guard = guarantees.Create();
+            throw new IOException("move failed");
+        }
+
+        await Assert.ThrowsExactlyAsync<IOException>(Handler);
+
+        Assert.AreEqual(1, sender.Sent.Count);
+        Assert.AreNotEqual(0, sender.Sent[0].ErrorCode, "A failed handler must not be reported to the device as success.");
+        Assert.IsFalse(string.IsNullOrEmpty(sender.Sent[0].ErrorMessage));
     }
 
     [TestMethod]
