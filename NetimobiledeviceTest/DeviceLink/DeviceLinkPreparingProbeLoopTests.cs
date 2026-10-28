@@ -168,7 +168,7 @@ public class DeviceLinkPreparingProbeLoopTests
 
     [TestMethod]
     [Description("#2197 (P0-C): the quiet-abandon classifier flags exactly the drop-classes the host will " +
-                 "resume (inter-message timeout, version-exchange timeout, transient IOException) and NOT a " +
+                 "resume (timeouts, transport-drop IOException) and NOT local file I/O or a " +
                  "user/terminal cancellation.")]
     public void IsResumeDropClass_ClassifiesResumeDropsOnly()
     {
@@ -180,9 +180,21 @@ public class DeviceLinkPreparingProbeLoopTests
             "An inter-message timeout is a resume drop-class (quiet abandon).");
         Assert.IsTrue(Classify(classifier, new DeviceLinkVersionExchangeTimeoutException(TimeSpan.FromSeconds(35))),
             "A version-exchange timeout is a resume drop-class (quiet abandon).");
-        Assert.IsTrue(Classify(classifier, new IOException("socket bump")),
-            "A transient transport IOException is a resume drop-class (quiet abandon).");
+        Assert.IsTrue(Classify(classifier, new ServiceConnectionSendTimeoutException(TimeSpan.FromSeconds(30))),
+            "A send timeout is a resume drop-class (quiet abandon).");
+        Assert.IsTrue(Classify(classifier, new IOException("I/O error occurred.", new SocketException(10054))),
+            "A socket-backed IOException is a resume drop-class (quiet abandon).");
+        Assert.IsTrue(Classify(classifier, new EndOfStreamException("Connection closed after 0/4 bytes")),
+            "A peer FIN is a resume drop-class (quiet abandon).");
+        Assert.IsTrue(Classify(classifier, new IOException("Received an unexpected EOF or 0 bytes from the transport stream.")),
+            "An SslStream EOF is a resume drop-class (quiet abandon).");
 
+        Assert.IsFalse(Classify(classifier, new IOException("There is not enough space on the disk.") { HResult = unchecked((int)0x80070070) }),
+            "A local disk-full IOException takes the normal teardown, not quiet abandon (#3192).");
+        Assert.IsFalse(Classify(classifier, new IOException("The process cannot access the file because it is being used by another process.")),
+            "A local file IOException takes the normal teardown, not quiet abandon (#3192).");
+        Assert.IsFalse(Classify(classifier, new IOException("I/O error occurred.", new SocketException(10061))),
+            "A non-drop socket error is not a resume drop-class.");
         Assert.IsFalse(Classify(classifier, new OperationCanceledException()),
             "A user/terminal cancellation is NOT a quiet-abandon drop-class — the normal CancelBackup path runs.");
         Assert.IsFalse(Classify(classifier, new InvalidOperationException()),

@@ -8,6 +8,7 @@ using System;
 using System.ComponentModel;
 using System.IO;
 using System.Linq;
+using System.Net.Sockets;
 using System.Threading;
 using System.Threading.Tasks;
 using BackupLock = Netimobiledevice.Services.Mobilebackup2.BackupLock;
@@ -362,7 +363,7 @@ public sealed class Mobilebackup2Service(
         Directory.CreateDirectory(deviceDirectory);
 
         // #2197 (P0-C): true once we observe a drop-class exception the host coordinator will RESUME
-        // (an inter-message timeout, the new version-exchange timeout, or a transient IOException). On a
+        // (an inter-message timeout, the new version-exchange timeout, or a transport-drop IOException). On a
         // quiet abandon we must NOT send CancelBackup (a non-standard, fork-invented mb2 message that
         // tells the device to cancel the very session we are about to resume) and must NOT send
         // DLMessageDisconnect — we just tear the socket down (DeviceLinkService.Dispose closes it), so the
@@ -552,21 +553,36 @@ public sealed class Mobilebackup2Service(
         }
     }
 
-    /// <summary>
-    /// ScribeHold fork (#2197, P0-C): true when <paramref name="ex"/> is a drop-class the host coordinator
-    /// will RESUME rather than treat as terminal — a between-message inter-message timeout, the new
-    /// version-exchange timeout, or a transient transport <see cref="IOException"/>. On these we quiet-abandon
-    /// (skip CancelBackup + Disconnect) so the resumed session finds backupd still holding the in-progress
-    /// snapshot. A user/terminal cancellation is NOT a drop-class (the normal CancelBackup path runs).
-    /// </summary>
     private static bool IsResumeDropClass(Exception ex) {
         return ex is DeviceLinkInterMessageTimeoutException
             or DeviceLinkVersionExchangeTimeoutException
-            // #2198 (P1-1): a bounded per-chunk send timeout is the write-side twin of the inter-message
-            // read timeout — same drop-class, same quiet abandon, same reconnect-and-resume.
             or ServiceConnectionSendTimeoutException
             or ConnectionTerminatedException
-            or IOException;
+            || (ex is IOException io && IsTransportDrop(io));
+    }
+
+    private static readonly int[] TransportDropSocketCodes = { 10053, 10054, 10060 };
+
+    // SslStream reports a mid-transfer drop as a bare IOException with no inner SocketException.
+    private static readonly string[] TransportDropMessages = {
+        "unexpected EOF or 0 bytes from the transport stream",
+        "connection was forcibly closed",
+        "connection reset",
+        "connection was reset",
+        "reset by the peer",
+        "connection was aborted",
+    };
+
+    public static bool IsTransportDrop(IOException ex) {
+        for (Exception? cursor = ex; cursor != null; cursor = cursor.InnerException) {
+            string message = cursor.Message;
+            if (cursor is EndOfStreamException
+                || (cursor is SocketException socketEx && TransportDropSocketCodes.Contains(socketEx.ErrorCode))
+                || TransportDropMessages.Any(m => message.Contains(m, StringComparison.OrdinalIgnoreCase))) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /// <summary>
