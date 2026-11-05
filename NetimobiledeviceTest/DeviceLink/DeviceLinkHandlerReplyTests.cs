@@ -103,6 +103,65 @@ public class DeviceLinkHandlerReplyTests
 
     [TestMethod]
     [Timeout(15000)]
+    public async Task DownloadFiles_BeforeTransfer_ReportsEachFileAndOurAnswer()
+    {
+        File.WriteAllBytes(Path.Combine(_root, "Status.plist"), [1, 2, 3]);
+        using SocketPair pair = SocketPair.CreateConnected();
+        using DeviceLinkService dl = CreateService(pair);
+        List<string> requests = [];
+        dl.PreTransferRequest += (_, request) => requests.Add(request);
+
+        await InvokeHandler(dl, DeviceLinkMessage.DownloadFiles,
+            [new StringNode(DeviceLinkMessage.DownloadFiles), new ArrayNode { new StringNode("Status.plist"), new StringNode("Manifest.db") }]);
+
+        CollectionAssert.AreEqual(new[] {
+            "DownloadFiles Status.plist: sent 3 bytes",
+            "DownloadFiles Manifest.db: answered ENOENT (2)"
+        }, requests);
+    }
+
+    [TestMethod]
+    [Timeout(15000)]
+    public async Task DirectoryAndFreeSpaceRequests_BeforeTransfer_ReportOurAnswer()
+    {
+        Directory.CreateDirectory(Path.Combine(_root, "Snapshot"));
+        File.WriteAllBytes(Path.Combine(_root, "Snapshot", "a"), [1]);
+        using SocketPair pair = SocketPair.CreateConnected();
+        using DeviceLinkService dl = new(CreateServiceConnection(pair.Client), _root, new Version(17, 0),
+            performBackupSizeCheck: false, logger: NullLogger.Instance);
+        List<string> requests = [];
+        dl.PreTransferRequest += (_, request) => requests.Add(request);
+
+        await InvokeHandler(dl, DeviceLinkMessage.ContentsOfDirectory,
+            [new StringNode(DeviceLinkMessage.ContentsOfDirectory), new StringNode("Snapshot")]);
+        await InvokeHandler(dl, DeviceLinkMessage.GetFreeDiskSpace,
+            [new StringNode(DeviceLinkMessage.GetFreeDiskSpace), new StringNode(_root)]);
+
+        CollectionAssert.AreEqual(new[] {
+            "ContentsOfDirectory Snapshot: 1 entries",
+            $"GetFreeDiskSpace: answered {long.MaxValue} bytes"
+        }, requests);
+    }
+
+    [TestMethod]
+    [Timeout(15000)]
+    public async Task DownloadFiles_AfterTransferStarted_ReportsNothing()
+    {
+        using SocketPair pair = SocketPair.CreateConnected();
+        using DeviceLinkService dl = CreateService(pair);
+        typeof(DeviceLinkService).GetField("_realTransferStarted", BindingFlags.NonPublic | BindingFlags.Instance)!
+            .SetValue(dl, true);
+        List<string> requests = [];
+        dl.PreTransferRequest += (_, request) => requests.Add(request);
+
+        await InvokeHandler(dl, DeviceLinkMessage.DownloadFiles,
+            [new StringNode(DeviceLinkMessage.DownloadFiles), new ArrayNode { new StringNode("Manifest.db") }]);
+
+        Assert.AreEqual(0, requests.Count);
+    }
+
+    [TestMethod]
+    [Timeout(15000)]
     [DataRow(new byte[] { (byte)ResultCode.LocalError }, DisplayName = "unexpected code")]
     [DataRow(new byte[] { (byte)ResultCode.FileData }, DisplayName = "zero-length FileData")]
     public async Task UploadFiles_UnexpectedFrameMidFile_ThrowsAndLeavesTheFileClosedAndUnappended(byte[] badFrame)

@@ -127,6 +127,18 @@ public class DeviceLinkFileOperationTests
         Assert.AreEqual("good", File.ReadAllText(Path.Combine(_root, "dest")));
     }
 
+    [TestMethod]
+    [Timeout(15000)]
+    public async Task DlLoop_BeforeTransfer_ReportsEveryDeviceRequest()
+    {
+        List<string> requests = await RunAsync(MoveMessage("missing", "dest"));
+
+        CollectionAssert.AreEqual(new[] {
+            "\"DLMessageMoveItems\", DictionaryNode, DictionaryNode, RealNode",
+            "\"DLMessageProcessMessage\", DictionaryNode"
+        }, requests);
+    }
+
     private static ArrayNode MoveMessage(string source, string dest) => [
         new StringNode(DeviceLinkMessage.MoveItems),
         new DictionaryNode { { source, new StringNode(dest) } },
@@ -135,8 +147,9 @@ public class DeviceLinkFileOperationTests
     ];
 
     // Plays the device: sends one request, expects exactly one success status, then ends the session.
-    private async Task RunAsync(ArrayNode request)
+    private async Task<List<string>> RunAsync(ArrayNode request)
     {
+        List<string> requests = [];
         using var listener = new TcpListener(IPAddress.Loopback, 0);
         listener.Start();
         Task<Socket> accept = listener.AcceptSocketAsync();
@@ -147,6 +160,7 @@ public class DeviceLinkFileOperationTests
         ServiceConnection device = CreateServiceConnection(server);
         using var dl = new DeviceLinkService(CreateServiceConnection(client), _root, new Version(17, 0),
             logger: NullLogger.Instance);
+        dl.PreTransferRequest += (_, r) => requests.Add(r);
         Task<ResultCode> loop = dl.DlLoop(CancellationToken.None);
 
         await device.SendPlistAsync(request, PlistFormat.Binary);
@@ -161,6 +175,7 @@ public class DeviceLinkFileOperationTests
 
         Assert.AreEqual(ResultCode.Success, await loop);
         Assert.AreEqual(0, server.Available, "The request must be answered by exactly one status response.");
+        return requests;
     }
 
     private static ServiceConnection CreateServiceConnection(Socket socket)
