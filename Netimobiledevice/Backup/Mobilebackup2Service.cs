@@ -154,6 +154,7 @@ public sealed class Mobilebackup2Service(
     /// Event raised for signaling different kinds of the backup status.
     /// </summary>
     public event EventHandler<StatusEventArgs>? Status;
+    public event EventHandler<string>? PreTransferRequest;
 
     /// <summary>
     /// Creates the Info.plist dictionary.
@@ -380,6 +381,7 @@ public sealed class Mobilebackup2Service(
             dl.Progress += DeviceLink_Progress;
             dl.Status += DeviceLink_Status;
             dl.Started += DeviceLink_Started;
+            dl.PreTransferRequest += (sender, request) => PreTransferRequest?.Invoke(sender, request);
 
             await using (NotificationProxyService np = new NotificationProxyService(this.Lockdown, logger: Logger)) {
                 await np.ConnectAsync(_internalCts.Token).ConfigureAwait(false);

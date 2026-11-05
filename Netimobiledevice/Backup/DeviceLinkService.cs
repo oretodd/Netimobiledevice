@@ -288,6 +288,8 @@ internal sealed class DeviceLinkService : IDisposable {
     /// Event raised when a part of a file has been received from the device.
     /// </summary>
     public event EventHandler<BackupFileEventArgs>? FileReceiving;
+    // The device decides between incremental and full from what these requests return.
+    public event EventHandler<string>? PreTransferRequest;
     /// <summary>
     /// Event raised when a file transfer has failed due an internal device error.
     /// </summary>
@@ -432,6 +434,7 @@ internal sealed class DeviceLinkService : IDisposable {
             }
         }
 
+        OnPreTransferRequest($"ContentsOfDirectory {msg[1].AsStringNode().Value}: {dirList.Count} entries");
         await guard.SendTerminatingStatusAsync(0, null, dirList, cancellationToken).ConfigureAwait(false);
     }
 
@@ -588,9 +591,11 @@ internal sealed class DeviceLinkService : IDisposable {
                 byte[] buffer = [(byte) ResultCode.Success];
                 await SendPrefixed(buffer, buffer.Length, cancellationToken).ConfigureAwait(false);
                 obligation.EndFileFraming();
+                OnPreTransferRequest($"DownloadFiles {filename.Value}: sent {new FileInfo(filePath).Length} bytes");
             }
             else {
                 _logger.LogDebug("Sending Error Code: {code}", errorCode);
+                OnPreTransferRequest($"DownloadFiles {filename.Value}: answered {errorCode} ({(int) errorCode})");
                 DictionaryNode errReport = CreateErrorReport(errorCode);
                 errList.Add(filename.Value, errReport);
                 await SendError(errReport, cancellationToken).ConfigureAwait(false);
@@ -662,6 +667,7 @@ internal sealed class DeviceLinkService : IDisposable {
             }
             spaceItem = new IntegerNode(freeSpace);
         }
+        OnPreTransferRequest($"GetFreeDiskSpace: answered {spaceItem.Value} bytes");
         await guard.SendTerminatingStatusAsync(0, null, spaceItem, cancellationToken).ConfigureAwait(false);
     }
 
@@ -705,6 +711,12 @@ internal sealed class DeviceLinkService : IDisposable {
         }
 
         await guard.SendTerminatingStatusAsync(0, string.Empty, null, cancellationToken).ConfigureAwait(false);
+    }
+
+    private void OnPreTransferRequest(string description) {
+        if (!_realTransferStarted) {
+            PreTransferRequest?.Invoke(this, description);
+        }
     }
 
     private void OnSendFileError(DictionaryNode errorReport, string fileName) {
@@ -1237,6 +1249,7 @@ internal sealed class DeviceLinkService : IDisposable {
             _logger.LogInformation(
                 "DlLoop exchange #{Seq}: command={Command} status={Status} elements={Count} elapsedMs={ElapsedMs:0.#}",
                 ++dlLoopSeq, command, dlLoopStatus, message.Count, dlLoopElapsedMs);
+            OnPreTransferRequest(DescribePlist(message));
 
             // #2199 (P2-3): future-iOS resilience. An unknown command (a new/renamed DeviceLink message a
             // future iOS introduces) must NOT kill the whole backup. The old code fell into the default
