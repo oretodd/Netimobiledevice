@@ -131,7 +131,8 @@ internal static class PairRecords
         }
         catch (Exception ex) {
             // These are expected and if we get them can be ignored
-            if (ex is not NotPairedException && ex is not UsbmuxException) {
+            // UsbmuxConnectionException (no mux running) is not a UsbmuxException; the on-disk records below still apply.
+            if (ex is not NotPairedException && ex is not UsbmuxException && ex is not UsbmuxConnectionException) {
                 throw;
             }
         }
