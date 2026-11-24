@@ -4,6 +4,7 @@ using Netimobiledevice.Usbmuxd.Responses;
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.Net.Sockets;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Threading;
@@ -23,7 +24,7 @@ public sealed class UsbmuxdConnectionMonitor(Action<Exception>? errorCallback = 
     /// </summary>
     private readonly ILogger? _logger = logger;
 
-    private CancellationTokenSource _cancellationTokenSource = new CancellationTokenSource();
+    private CancellationTokenSource? _cancellationTokenSource;
 
     private Task? _connectionMonitorTask;
 
@@ -32,23 +33,10 @@ public sealed class UsbmuxdConnectionMonitor(Action<Exception>? errorCallback = 
         await _events.Writer.WriteAsync(new UsbmuxdConnectionEvent(usbmuxdDevice, UsbmuxdConnectionEventType.Add), cancellationToken);
     }
 
-    private async Task ConnectionListener() {
-        CancellationToken ct = _cancellationTokenSource.Token;
+    private async Task ConnectionListener(CancellationToken ct) {
         do {
-            UsbmuxConnection muxConnection;
             try {
-                muxConnection = UsbmuxConnection.Create(logger: _logger);
-            }
-            catch (UsbmuxConnectionException ex) {
-                _errorCallback?.Invoke(ex);
-                _logger?.LogWarning(ex, "Issue trying to create UsbmuxConnection");
-
-                // Put a delay here so that it doesn't immedietly retry creating the UsbmuxConnection
-                await Task.Delay(500, ct).ConfigureAwait(false);
-                continue;
-            }
-
-            using (muxConnection) {
+                using UsbmuxConnection muxConnection = UsbmuxConnection.Create(logger: _logger);
                 UsbmuxdResult usbmuxError = await muxConnection.ListenAsync(ct).ConfigureAwait(false);
                 if (usbmuxError != UsbmuxdResult.Ok) {
                     continue;
@@ -68,6 +56,13 @@ public sealed class UsbmuxdConnectionMonitor(Action<Exception>? errorCallback = 
                         break;
                     }
                 }
+            }
+            catch (Exception ex) when (ex is NetimobiledeviceException or SocketException) {
+                _errorCallback?.Invoke(ex);
+                _logger?.LogWarning(ex, "Issue trying to create or listen on UsbmuxConnection");
+
+                // Put a delay here so that it doesn't immedietly retry creating the UsbmuxConnection
+                await Task.Delay(500, ct).ConfigureAwait(false);
             }
         } while (!ct.IsCancellationRequested);
     }
@@ -175,10 +170,7 @@ public sealed class UsbmuxdConnectionMonitor(Action<Exception>? errorCallback = 
         }
     }
 
-    public async ValueTask DisposeAsync() {
-        await StopAsync();
-        _cancellationTokenSource.Dispose();
-    }
+    public ValueTask DisposeAsync() => new(StopAsync());
 
     public void Start() {
         lock (_lock) {
@@ -187,24 +179,31 @@ public sealed class UsbmuxdConnectionMonitor(Action<Exception>? errorCallback = 
             }
 
             _cancellationTokenSource = new CancellationTokenSource();
-            _connectionMonitorTask = ConnectionListener();
+            _connectionMonitorTask = ConnectionListener(_cancellationTokenSource.Token);
         }
-    }
-
-    public void Stop() {
-        _cancellationTokenSource.Cancel();
-        _connectionMonitorTask = null;
     }
 
     public async Task StopAsync() {
-        _cancellationTokenSource.Cancel();
-        if (_connectionMonitorTask is { } task) {
-            try {
-                await task.ConfigureAwait(false);
-            }
-            catch (OperationCanceledException) { }
+        CancellationTokenSource? cts;
+        Task? task;
+        lock (_lock) {
+            cts = _cancellationTokenSource;
+            task = _connectionMonitorTask;
+            _cancellationTokenSource = null;
+            _connectionMonitorTask = null;
         }
-        _connectionMonitorTask = null;
+        if (cts is null) {
+            return;
+        }
+
+        cts.Cancel();
+        try {
+            await task!.ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) { }
+        finally {
+            cts.Dispose();
+        }
     }
 
     public async IAsyncEnumerable<UsbmuxdConnectionEvent> WatchAsync([EnumeratorCancellation] CancellationToken cancellationToken = default) {
