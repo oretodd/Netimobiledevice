@@ -4,6 +4,7 @@ using Netimobiledevice.Usbmuxd.Responses;
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.Net.Sockets;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Threading;
@@ -34,20 +35,8 @@ public sealed class UsbmuxdConnectionMonitor(Action<Exception>? errorCallback = 
 
     private async Task ConnectionListener(CancellationToken ct) {
         do {
-            UsbmuxConnection muxConnection;
             try {
-                muxConnection = UsbmuxConnection.Create(logger: _logger);
-            }
-            catch (UsbmuxConnectionException ex) {
-                _errorCallback?.Invoke(ex);
-                _logger?.LogWarning(ex, "Issue trying to create UsbmuxConnection");
-
-                // Put a delay here so that it doesn't immedietly retry creating the UsbmuxConnection
-                await Task.Delay(500, ct).ConfigureAwait(false);
-                continue;
-            }
-
-            using (muxConnection) {
+                using UsbmuxConnection muxConnection = UsbmuxConnection.Create(logger: _logger);
                 UsbmuxdResult usbmuxError = await muxConnection.ListenAsync(ct).ConfigureAwait(false);
                 if (usbmuxError != UsbmuxdResult.Ok) {
                     continue;
@@ -67,6 +56,13 @@ public sealed class UsbmuxdConnectionMonitor(Action<Exception>? errorCallback = 
                         break;
                     }
                 }
+            }
+            catch (Exception ex) when (ex is NetimobiledeviceException or SocketException) {
+                _errorCallback?.Invoke(ex);
+                _logger?.LogWarning(ex, "Issue trying to create or listen on UsbmuxConnection");
+
+                // Put a delay here so that it doesn't immedietly retry creating the UsbmuxConnection
+                await Task.Delay(500, ct).ConfigureAwait(false);
             }
         } while (!ct.IsCancellationRequested);
     }
