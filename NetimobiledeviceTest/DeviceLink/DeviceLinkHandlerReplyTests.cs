@@ -185,6 +185,75 @@ public class DeviceLinkHandlerReplyTests
         Assert.IsFalse(File.Exists(Path.Combine(_root, "b.bin")));
     }
 
+    [TestMethod]
+    [Timeout(15000)]
+    [DataRow(false, DisplayName = "error before any data")]
+    [DataRow(true, DisplayName = "error after data")]
+    public async Task UploadFiles_DiscardedFileEndingInRemoteError_LeavesAnEmptyFile(bool dataBeforeError)
+    {
+        using SocketPair pair = SocketPair.CreateConnected();
+        using DeviceLinkService dl = CreateService(pair);
+        dl.ShouldDiscardFile = _ => true;
+        byte[] data = dataBeforeError ? Frame([(byte)ResultCode.FileData, 1, 2, 3]) : [];
+        pair.Server.Send([
+            .. Frame(Encoding.UTF8.GetBytes("dev/a")), .. Frame(Encoding.UTF8.GetBytes("a.bin")),
+            .. data, .. Frame([(byte)ResultCode.RemoteError, .. Encoding.UTF8.GetBytes("No such file")]),
+            .. BigEndian(0)]);
+
+        await InvokeHandler(dl, DeviceLinkMessage.UploadFiles,
+            [new StringNode(DeviceLinkMessage.UploadFiles), new DictionaryNode(), new IntegerNode(0), new IntegerNode(0)]);
+
+        Assert.AreEqual(0L, new FileInfo(Path.Combine(_root, "a.bin")).Length);
+    }
+
+    [TestMethod]
+    [Timeout(15000)]
+    public async Task UploadFiles_KeptFileEndingInRemoteError_KeepsItsBytes_ClosesIt_AndTheNextFileGetsItsOwnPath()
+    {
+        using SocketPair pair = SocketPair.CreateConnected();
+        using DeviceLinkService dl = new(CreateServiceConnection(pair.Client), _root, new Version(17, 0),
+            ignoreTransferErrors: false, logger: NullLogger.Instance);
+        List<string> errors = [];
+        dl.FileTransferError += (_, e) => errors.Add(e.Details);
+        pair.Server.Send([
+            .. Frame(Encoding.UTF8.GetBytes("dev/a")), .. Frame(Encoding.UTF8.GetBytes("a.bin")),
+            .. Frame([(byte)ResultCode.FileData, 1, 2, 3]),
+            .. Frame([(byte)ResultCode.RemoteError, .. Encoding.UTF8.GetBytes("Input/output error")]),
+            .. Frame(Encoding.UTF8.GetBytes("dev/b")), .. Frame(Encoding.UTF8.GetBytes("b.bin")),
+            .. Frame([(byte)ResultCode.FileData, 9, 9]), .. Frame([(byte)ResultCode.Success]),
+            .. BigEndian(0)]);
+
+        await InvokeHandler(dl, DeviceLinkMessage.UploadFiles,
+            [new StringNode(DeviceLinkMessage.UploadFiles), new DictionaryNode(), new IntegerNode(0), new IntegerNode(0)]);
+
+        string a = Path.Combine(_root, "a.bin");
+        using (new FileStream(a, FileMode.Open, FileAccess.ReadWrite, FileShare.None)) { }
+        CollectionAssert.AreEqual(new byte[] { 1, 2, 3 }, File.ReadAllBytes(a));
+        CollectionAssert.AreEqual(new byte[] { 9, 9 }, File.ReadAllBytes(Path.Combine(_root, "b.bin")));
+        StringAssert.Contains(Assert.ContainsSingle(errors), "Input/output error");
+    }
+
+    [TestMethod]
+    [Timeout(15000)]
+    public async Task ProcessMessage_WithADeviceErrorCode_ThrowsCarryingTheCode()
+    {
+        using SocketPair pair = SocketPair.CreateConnected();
+        using DeviceLinkService dl = CreateService(pair);
+        ServiceConnection device = CreateServiceConnection(pair.Server);
+        Task<ResultCode> loop = dl.DlLoop();
+
+        await device.SendPlistAsync(new ArrayNode {
+            new StringNode(DeviceLinkMessage.ProcessMessage),
+            new DictionaryNode {
+                { "ErrorCode", new IntegerNode(205) },
+                { "ErrorDescription", new StringNode("Manifest references files not in backup") }
+            }
+        }, PlistFormat.Binary);
+
+        DeviceLinkException ex = await Assert.ThrowsExactlyAsync<DeviceLinkException>(() => loop);
+        Assert.AreEqual(205UL, ex.DeviceErrorCode);
+    }
+
     private static byte[] Frame(byte[] payload) => [.. BigEndian(payload.Length), .. payload];
 
     private static byte[] BigEndian(int value)

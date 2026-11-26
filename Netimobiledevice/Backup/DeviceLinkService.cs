@@ -1033,12 +1033,14 @@ internal sealed class DeviceLinkService : IDisposable {
                 ResultCode code = await ReadCode(cancellationToken).ConfigureAwait(false);
                 size -= sizeof(ResultCode);
 
-                // ScribeHold fork: classify once per file (at first chunk). If discarding, skip
-                // File.OpenWrite and drain all chunks without writing. _fileStream stays null for
-                // discarded files.
+                // ScribeHold fork: classify once per file (at first chunk). A discarded file is created
+                // empty up front, as libimobiledevice does, then its chunks are drained unwritten.
                 if (_fileStream is null && !_discarding) {
                     _discarding = ShouldDiscardFile?.Invoke(backupFile.DevicePath) ?? false;
-                    if (!_discarding) {
+                    if (_discarding) {
+                        using (File.Create(backupFile.LocalPath)) { }
+                    }
+                    else {
                         RemoveExpiredFile(backupFile.LocalPath);
                         _fileStream = File.OpenWrite(backupFile.LocalPath);
                         _fileStream.Seek(0, SeekOrigin.End);
@@ -1080,7 +1082,7 @@ internal sealed class DeviceLinkService : IDisposable {
                     string errorMessage = Encoding.UTF8.GetString(msgBuffer);
 
                     _logger.LogWarning("Failed to fully upload {localPath}. Device file name {devicePath}. Reason: {errorMessage}", backupFile.LocalPath, backupFile.DevicePath, errorMessage);
-                    OnFileTransferError(backupFile, $"{code}: {msg} [ExpectedSize: {backupFile.ExpectedFileSize}, ActualReceived: {backupFile.FileSize} ]");
+                    OnFileTransferError(backupFile, $"{code}: {errorMessage} [ExpectedSize: {backupFile.ExpectedFileSize}, ActualReceived: {backupFile.FileSize} ]");
                     _discarding = false;
 
                     continue;
@@ -1092,10 +1094,7 @@ internal sealed class DeviceLinkService : IDisposable {
                     throw new DeviceLinkException($"Unexpected code {code} (size {size}) while receiving {backupFile.DevicePath}");
                 }
 
-                if (_discarding) {
-                    using (File.Create(backupFile.LocalPath)) { }
-                    _discarding = false;
-                }
+                _discarding = false;
                 OnFileReceived(backupFile);
             }
             else if (_service.IsConnected) {
@@ -1277,8 +1276,11 @@ internal sealed class DeviceLinkService : IDisposable {
 
             switch (command) {
                 case DeviceLinkMessage.ProcessMessage: {
-                    if (message[1].AsDictionaryNode()["ErrorCode"].AsIntegerNode().Value != (ulong) ResultCode.Success) {
-                        throw new DeviceLinkException($"Device link error: {PropertyList.SaveAsString(message[1], PlistFormat.Xml)}");
+                    ulong deviceErrorCode = message[1].AsDictionaryNode()["ErrorCode"].AsIntegerNode().Value;
+                    if (deviceErrorCode != (ulong) ResultCode.Success) {
+                        throw new DeviceLinkException($"Device link error: {PropertyList.SaveAsString(message[1], PlistFormat.Xml)}") {
+                            DeviceErrorCode = deviceErrorCode
+                        };
                     }
                     Completed?.Invoke(this, new BackupResultEventArgs(FailedFiles, false, false));
                     return ResultCode.Success;
